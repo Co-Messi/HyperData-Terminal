@@ -1,0 +1,9 @@
+# Generated with pip freeze — do not edit manually
+# Pinned versions for reproducible installs
+# To install: pip install -r requirements.lock
+aiohttp==3.13.3
+numpy==2.4.3
+pandas==3.0.1
+pyfiglet==1.0.4
+python-dotenv==1.2.2
+rich==14.3.3
