@@ -14,7 +14,13 @@ dependencies = [
 ]
 
 [project.scripts]
-hyperdata = "run_dashboard:main"
+hyperdata = "src.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["src*", "config*"]
+
+[tool.setuptools.package-data]
+"*" = ["*.json"]
 
 [tool.ruff]
 line-length = 120
