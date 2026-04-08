@@ -15,32 +15,28 @@ Live data from Hyperliquid, Binance, Bybit, OKX, and Deribit — streamed via We
 ## Quick Start
 
 ```bash
-# Clone
-git clone https://github.com/your-username/hyperdata-terminal.git
-cd hyperdata-terminal
+# Clone and install
+git clone https://github.com/Co-Messi/HyperData-Terminal.git
+cd HyperData-Terminal
+pip install -e .
 
-# Install
-pip install -r requirements.txt
-
-# Run (live data from exchanges)
-python run_dashboard.py
+# Run
+hyperdata
 ```
+
+That's it. Live data from 5 exchanges, rendered in your terminal.
 
 ## Dashboards
 
 ```bash
-# Combined view (all panels)
-python run_dashboard.py
-
-# Individual dashboards
-python run_dashboard.py -d liq        # Liquidation watch — positions near liquidation
-python run_dashboard.py -d stream     # Liquidation stream — real-time liquidation feed
-python run_dashboard.py -d cvd        # Order flow — CVD, buy/sell volume, signals
-python run_dashboard.py -d market     # Market overview — prices, funding, OI
-python run_dashboard.py -d whale      # Whale tracker — largest positions on Hyperliquid
-
-# Demo mode (synthetic data, no exchange connections)
-python run_dashboard.py --demo
+hyperdata                  # All dashboards (live data)
+hyperdata -d liq           # Liquidation watch — positions near liquidation
+hyperdata -d stream        # Liquidation stream — real-time feed
+hyperdata -d cvd           # Order flow — CVD, buy/sell volume
+hyperdata -d market        # Market overview — prices, funding, OI
+hyperdata -d whale         # Whale tracker — largest Hyperliquid positions
+hyperdata --demo           # Demo mode (synthetic data)
+hyperdata --list           # Show available dashboards
 ```
 
 ## REST API
