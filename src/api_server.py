@@ -16,14 +16,11 @@ Usage:
 from __future__ import annotations
 
 import asyncio
-import csv
 import dataclasses
 import json
 import logging
 import math
-import sqlite3
 import time
-from pathlib import Path
 from typing import Any
 
 from aiohttp import web, WSMsgType
