@@ -23,7 +23,6 @@ from src.data_layer.hub import HyperDataHub
 def main():
     parser = argparse.ArgumentParser(description="HyperData headless API server")
     parser.add_argument("--port", type=int, default=8420)
-    parser.add_argument("--demo", action="store_true")
     args = parser.parse_args()
 
     log_dir = Path(_ROOT) / "data" / "logs"
@@ -36,7 +35,7 @@ def main():
     logging.basicConfig(level=logging.DEBUG, handlers=[fh])
 
     async def run():
-        hub = HyperDataHub(demo=args.demo, api_port=args.port)
+        hub = HyperDataHub(demo=False, api_port=args.port)
         await hub.start()
         logging.getLogger(__name__).info("HyperData API running on port %d (headless)", args.port)
         try:

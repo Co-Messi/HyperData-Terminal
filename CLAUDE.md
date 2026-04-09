@@ -14,11 +14,8 @@ python -m pytest tests/ -v --live
 # Lint
 ruff check src/
 
-# Start terminal dashboard (live data)
+# Start terminal dashboard (live data from 5 exchanges)
 python3 run_dashboard.py
-
-# Start in demo mode (synthetic data)
-python3 run_dashboard.py --demo
 
 # Start headless API server
 python3 run_api.py --port 8420
@@ -59,7 +56,7 @@ Components: liquidation_feed (4 exchanges), orderflow_engine (CVD), position_sca
 
 - **Persistent aiohttp sessions**: Components create `aiohttp.ClientSession()` in `start()`, close in `stop()`. Never create sessions per-request.
 - **WebSocket broadcast**: `_broadcast()` iterates client list copy, uses `_safe_send()` with 2-second timeout. Dead clients removed immediately.
-- **Demo mode**: When `hub.demo=True`, real exchange connections are skipped. Demo generators produce synthetic data.
+- **Live only**: All data comes from real exchange WebSocket feeds. No synthetic/demo mode.
 - **Symbol normalization**: `normalize_symbol()` strips USDT/USD/PERP suffixes.
 
 ## External Data Sources

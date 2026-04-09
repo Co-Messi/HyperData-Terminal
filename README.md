@@ -71,7 +71,6 @@ hyperdata -d stream        # Liquidation stream — real-time feed
 hyperdata -d cvd           # Order flow — CVD, buy/sell volume
 hyperdata -d market        # Market overview — prices, funding, OI
 hyperdata -d whale         # Whale tracker — largest Hyperliquid positions
-hyperdata --demo           # Demo mode (synthetic data, no exchange connections)
 hyperdata --list           # Show available dashboards
 ```
 
