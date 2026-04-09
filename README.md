@@ -4,6 +4,7 @@
 
 **Real-time crypto market intelligence, right in your terminal.**
 
+[![CI](https://github.com/Co-Messi/HyperData-Terminal/actions/workflows/ci.yml/badge.svg)](https://github.com/Co-Messi/HyperData-Terminal/actions)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Python 3.12+](https://img.shields.io/badge/Python-3.12+-green.svg)](https://python.org)
 [![Exchanges](https://img.shields.io/badge/Exchanges-5-orange.svg)](#data-sources)
