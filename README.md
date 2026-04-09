@@ -1,6 +1,6 @@
 <div align="center">
 
-# HyperData Terminal
+<img src="assets/logo.png" alt="HyperData Terminal" width="400" />
 
 **Real-time crypto market intelligence, right in your terminal.**
 
