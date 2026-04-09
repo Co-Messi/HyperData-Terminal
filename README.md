@@ -1,24 +1,50 @@
+<div align="center">
+
 # HyperData Terminal
 
-Open-source crypto market data terminal with real-time dashboards, REST API, and a pluggable paper trading engine.
+**Real-time crypto market intelligence, right in your terminal.**
 
-Live data from Hyperliquid, Binance, Bybit, OKX, and Deribit — streamed via WebSocket, rendered in your terminal.
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Python 3.12+](https://img.shields.io/badge/Python-3.12+-green.svg)](https://python.org)
+[![Exchanges](https://img.shields.io/badge/Exchanges-5-orange.svg)](#data-sources)
 
-<p align="center">
-  <img width="720" alt="HyperData Terminal — Combined Dashboard" src="https://github.com/user-attachments/assets/74fd120a-5468-436f-9d51-0d5a6e7d35a3" />
-</p>
+Stream live data from Hyperliquid, Binance, Bybit, OKX, and Deribit. Track whale positions, monitor liquidation cascades, analyze order flow, and paper trade your own strategies — all from one command.
 
-<p align="center">
-  <img width="720" alt="HyperData Terminal — Market Overview" src="https://github.com/user-attachments/assets/51d800fb-c484-48cd-8a53-27cbd37662d0" />
-</p>
+<img width="720" alt="HyperData Terminal — Combined Dashboard" src="https://github.com/user-attachments/assets/74fd120a-5468-436f-9d51-0d5a6e7d35a3" />
+
+<img width="720" alt="HyperData Terminal — Market Overview" src="https://github.com/user-attachments/assets/51d800fb-c484-48cd-8a53-27cbd37662d0" />
+
+</div>
+
+---
+
+## What is HyperData Terminal?
+
+HyperData Terminal is an open-source crypto market data platform that connects to 5 exchanges via WebSocket and renders everything in a beautiful Rich terminal UI. No browser needed — just your terminal.
+
+It comes with:
+
+- **5 live dashboards** that update in real-time
+- **A REST API** so you can build your own tools on top
+- **A paper trading engine** where you plug in your own strategies and trade with fake money on real prices
+- **An LLM agent** that asks any AI model (GPT, Ollama, Groq) whether to buy or sell based on live market conditions
+
+Zero API keys required to get started. All exchange data comes from public WebSocket feeds.
+
+---
 
 ## Features
 
-- **5 Terminal Dashboards** — Liquidation watch, liquidation stream, order flow (CVD), market overview, whale tracker
-- **14 Data Components** — Liquidations from 4 exchanges, CVD orderflow, whale positions, funding rates, open interest, orderbook depth, DVOL implied volatility, long/short ratios, spot prices, smart money signals
-- **REST API** — 17+ endpoints for market data, WebSocket streaming for real-time events
-- **Paper Trading** — Pluggable strategy engine with fake money on real prices. Write your own strategy in ~30 lines.
-- **LLM Agent** — Optional AI-powered trading decisions via any OpenAI-compatible API (GPT, Ollama, Groq, etc.)
+| | Feature | Description |
+|---|---|---|
+| :chart_with_upwards_trend: | **5 Terminal Dashboards** | Liquidation watch, liquidation stream, order flow (CVD), market overview, whale tracker |
+| :satellite: | **14 Data Components** | Liquidations from 4 exchanges, CVD orderflow, whale positions, funding rates, open interest, orderbook depth, DVOL IV, long/short ratios, spot prices, smart money signals |
+| :globe_with_meridians: | **REST API + WebSocket** | 17+ endpoints for market data, real-time event streaming |
+| :moneybag: | **Paper Trading** | Pluggable strategy engine — real market data, fake money. Write your own strategy in ~30 lines. |
+| :robot: | **LLM Agent** | AI-powered trading decisions via any OpenAI-compatible API (GPT-4o, Llama 3, Mixtral, etc.) |
+| :zap: | **Zero Config** | No API keys needed for basic functionality. `pip install` and go. |
+
+---
 
 ## Quick Start
 
@@ -34,6 +60,8 @@ hyperdata
 
 That's it. Live data from 5 exchanges, rendered in your terminal.
 
+---
+
 ## Dashboards
 
 ```bash
@@ -43,32 +71,54 @@ hyperdata -d stream        # Liquidation stream — real-time feed
 hyperdata -d cvd           # Order flow — CVD, buy/sell volume
 hyperdata -d market        # Market overview — prices, funding, OI
 hyperdata -d whale         # Whale tracker — largest Hyperliquid positions
-hyperdata --demo           # Demo mode (synthetic data)
+hyperdata --demo           # Demo mode (synthetic data, no exchange connections)
 hyperdata --list           # Show available dashboards
 ```
 
+### Dashboard Descriptions
+
+| Dashboard | What it shows |
+|---|---|
+| **Liquidation Watch** | BTC positions closest to liquidation on Hyperliquid. Tracks distance-to-liquidation in real time so you can see which whales are about to get wiped. |
+| **Liquidation Stream** | Multi-exchange real-time liquidation feed from Hyperliquid, Binance, Bybit, and OKX. Every liquidation event as it happens, with size, price, and exchange. |
+| **CVD Order Flow** | Cumulative Volume Delta for BTC — see whether buyers or sellers are in control. Tracks buy volume vs sell volume from Binance WebSocket trades. |
+| **Market Overview** | Funding rates, open interest, and prices for 50 assets across exchanges. Spot divergences and funding extremes at a glance. |
+| **Whale Tracker** | Largest open positions on Hyperliquid. See what the biggest players are doing — their size, entry price, PnL, and liquidation price. |
+
+---
+
 ## REST API
 
+Start the API server alongside or instead of the terminal:
+
 ```bash
-# Start the API server
 python run_api.py --port 8420
-
-# Health check
-curl http://localhost:8420/v1/health
-
-# Market data
-curl http://localhost:8420/v1/market
-curl http://localhost:8420/v1/market/BTC
-curl http://localhost:8420/v1/liquidations
-curl http://localhost:8420/v1/orderflow?symbol=BTC&period=1h
-curl http://localhost:8420/v1/funding-rates
-curl http://localhost:8420/v1/whales
-curl http://localhost:8420/v1/danger-zone
-curl http://localhost:8420/v1/smart-money/signals
-
-# WebSocket streaming
-wscat -c ws://localhost:8420/v1/ws
 ```
+
+### Endpoints
+
+| Endpoint | Description |
+|---|---|
+| `GET /v1/health` | Server status and uptime |
+| `GET /v1/market` | All assets — prices, OI, funding |
+| `GET /v1/market/{symbol}` | Single asset detail |
+| `GET /v1/liquidations` | Recent liquidation events |
+| `GET /v1/liquidation-stats` | Aggregate liquidation statistics |
+| `GET /v1/orderflow?symbol=BTC&period=1h` | CVD snapshots |
+| `GET /v1/funding-rates` | Funding rates across exchanges |
+| `GET /v1/whales` | Top whale positions |
+| `GET /v1/danger-zone` | Positions closest to liquidation |
+| `GET /v1/smart-money/signals` | Smart money activity signals |
+| `GET /v1/orderbook?symbol=BTC` | Orderbook snapshot |
+| `GET /v1/deribit-iv` | DVOL implied volatility |
+| `WS /v1/ws` | Real-time event stream (liquidations, trades, signals) |
+
+```bash
+# Example
+curl http://localhost:8420/v1/market/BTC | python -m json.tool
+```
+
+---
 
 ## Paper Trading
 
@@ -108,18 +158,20 @@ class MyStrategy(Strategy):
         return None
 ```
 
-### Included Examples
+That's the entire interface. One class, one method, one return type.
+
+### Included Example Strategies
 
 | Strategy | Data Source | Logic |
-|----------|-----------|-------|
-| `CVDMomentum` | `hub.orderflow` | Buy on positive CVD, sell on negative |
-| `FundingRateArb` | `hub.funding` | Short when funding high, long when negative |
-| `LiquidationCascade` | `hub.liquidations` | Buy the dip after large liquidation events |
-| `WhaleFollow` | `hub.positions` | Follow whale position changes |
+|---|---|---|
+| `CVDMomentum` | `hub.orderflow` | Buy when order flow is strongly positive, sell when negative |
+| `FundingRateArb` | `hub.funding` | Short when funding rate is high, long when negative |
+| `LiquidationCascade` | `hub.liquidations` | Buy the dip after large liquidation cascades |
+| `WhaleFollow` | `hub.positions` | Mirror the direction of the largest whale positions |
 
 ### LLM Agent
 
-The LLM agent sends market data to any OpenAI-compatible API and asks for trading decisions:
+The LLM agent sends a market data summary to any OpenAI-compatible API and asks for trading decisions:
 
 ```bash
 # Set up in .env
@@ -128,44 +180,46 @@ LLM_MODEL=gpt-4o                           # or llama3, mixtral, etc.
 LLM_API_KEY=sk-...
 ```
 
-The agent automatically constructs a market summary (price, CVD, funding rate, recent liquidations) and asks the model whether to buy, sell, or hold. You can customize the prompt in `src/strategies/llm_agent.py`.
+Works with OpenAI, Ollama (local), LM Studio, Groq, Together, or any provider with an OpenAI-compatible API. Customize the prompt in `src/strategies/llm_agent.py`.
+
+---
 
 ## Configuration
-
-Copy `.env.example` to `.env`:
 
 ```bash
 cp .env.example .env
 ```
 
 | Variable | Required | Description |
-|----------|----------|-------------|
+|---|---|---|
 | `LLM_BASE_URL` | For LLM agent | OpenAI-compatible API endpoint |
 | `LLM_MODEL` | For LLM agent | Model name (gpt-4o, llama3, etc.) |
 | `LLM_API_KEY` | For LLM agent | API key |
 | `BINANCE_API_KEY` | No | Enhances market data quality |
-| `TELEGRAM_BOT_TOKEN` | No | For alert notifications |
-| `DISCORD_WEBHOOK_URL` | No | For alert notifications |
+| `TELEGRAM_BOT_TOKEN` | No | Alert notifications via Telegram |
+| `DISCORD_WEBHOOK_URL` | No | Alert notifications via Discord |
+
+---
 
 ## Data Sources
 
-All data is fetched live from public exchange APIs:
+All data is fetched live from public exchange APIs. No keys required.
 
 | Source | Data | Connection |
-|--------|------|------------|
-| Hyperliquid | Positions, liquidations, funding | WebSocket + REST |
-| Binance | Trades, liquidations, orderbook | WebSocket |
-| Bybit | Liquidations | WebSocket |
-| OKX | Liquidations | WebSocket |
-| Deribit | DVOL implied volatility | REST |
+|---|---|---|
+| **Hyperliquid** | Positions, liquidations, funding, whale tracking | WebSocket + REST |
+| **Binance** | Trades, liquidations, orderbook | WebSocket |
+| **Bybit** | Liquidations | WebSocket |
+| **OKX** | Liquidations | WebSocket |
+| **Deribit** | DVOL implied volatility | REST |
 
-No API keys required for basic functionality. All exchanges provide public WebSocket feeds.
+---
 
 ## Architecture
 
 ```
 Exchanges (Hyperliquid, Binance, Bybit, OKX, Deribit)
-    |  WebSocket + REST
+    |  WebSocket + REST (public feeds, no keys needed)
     v
 HyperDataHub (14 data components)
     |
@@ -174,18 +228,19 @@ HyperDataHub (14 data components)
     +---> Paper Trading Engine (pluggable strategies)
 ```
 
+The hub owns all data components and manages their async lifecycles. Dashboards and API both read from the same hub — zero duplication.
+
+---
+
 ## Tests
 
 ```bash
-# Run all tests
-python -m pytest tests/ -v
-
-# Skip live exchange tests
-python -m pytest tests/ -v --ignore=tests/test_position_scanner.py
-
-# Single test
-python -m pytest tests/test_orderflow.py -v
+python -m pytest tests/ -v                                    # All tests
+python -m pytest tests/ -v --ignore=tests/test_position_scanner.py  # Skip live exchange tests
+python -m pytest tests/test_orderflow.py -v                   # Single test
 ```
+
+---
 
 ## Contributing
 
@@ -196,6 +251,8 @@ python -m pytest tests/test_orderflow.py -v
 5. Run linter (`ruff check src/`)
 6. Commit and push
 7. Open a Pull Request
+
+---
 
 ## License
 
