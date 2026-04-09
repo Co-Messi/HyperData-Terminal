@@ -1,12 +1,16 @@
 # HyperData Terminal
 
-<img width="1432" height="776" alt="image" src="https://github.com/user-attachments/assets/74fd120a-5468-436f-9d51-0d5a6e7d35a3" />
-<img width="1428" height="781" alt="image" src="https://github.com/user-attachments/assets/51d800fb-c484-48cd-8a53-27cbd37662d0" />
-
-
 Open-source crypto market data terminal with real-time dashboards, REST API, and a pluggable paper trading engine.
 
 Live data from Hyperliquid, Binance, Bybit, OKX, and Deribit — streamed via WebSocket, rendered in your terminal.
+
+<p align="center">
+  <img width="720" alt="HyperData Terminal — Combined Dashboard" src="https://github.com/user-attachments/assets/74fd120a-5468-436f-9d51-0d5a6e7d35a3" />
+</p>
+
+<p align="center">
+  <img width="720" alt="HyperData Terminal — Market Overview" src="https://github.com/user-attachments/assets/51d800fb-c484-48cd-8a53-27cbd37662d0" />
+</p>
 
 ## Features
 
