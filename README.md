@@ -65,14 +65,21 @@ That's it. Live data from 5 exchanges, rendered in your terminal.
 ## Dashboards
 
 ```bash
-hyperdata                  # All dashboards (live data)
-hyperdata -d liq           # Liquidation watch — positions near liquidation
-hyperdata -d stream        # Liquidation stream — real-time feed
-hyperdata -d heatmap       # Liquidation heatmap — price-level risk visualization
-hyperdata -d cvd           # Order flow — CVD, buy/sell volume
-hyperdata -d market        # Market overview — prices, funding, OI
-hyperdata -d whale         # Whale tracker — largest Hyperliquid positions
-hyperdata --list           # Show available dashboards
+hyperdata
+```
+
+That's it. An interactive menu lets you pick which dashboard to view:
+
+```
+  [1]  Liquidation Watch       BTC positions closest to liquidation
+  [2]  Liquidation Stream      Multi-exchange liquidation feed
+  [3]  Liquidation Heatmap     Price-level liquidation risk (all cryptos)
+  [4]  CVD Order Flow          BTC cumulative volume delta & signals
+  [5]  Market Overview         Funding rates, OI, prices for all assets
+  [6]  Whale Tracker           Largest open positions on Hyperliquid
+  [0]  All Dashboards          Combined view — everything at once
+
+  Press Ctrl+C to return to menu.
 ```
 
 ### Dashboard Descriptions
