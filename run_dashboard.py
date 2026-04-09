@@ -39,7 +39,7 @@ async def run_single(hub: HyperDataHub, name: str) -> None:
     dashboard_map = {
         "liq": lambda: LiquidationWatchDashboard(scanner=hub.positions, refresh_rate=5),
         "stream": lambda: LiquidationStreamDashboard(feed=hub.liquidations, refresh_rate=5),
-        "heatmap": lambda: LiquidationHeatmapDashboard(scanner=hub.positions, refresh_rate=5, symbol="BTC"),
+        "heatmap": lambda: LiquidationHeatmapDashboard(scanner=hub.positions, refresh_rate=5),
         "cvd": lambda: CVDDashboard(engine=hub.orderflow, market_data=hub.market, symbol="BTC"),
         "market": lambda: MarketOverviewDashboard(market_data=hub.market, refresh_rate=10),
         "whale": lambda: WhaleTrackerDashboard(scanner=hub.positions, refresh_rate=15),

@@ -132,164 +132,212 @@ def _format_usd(value: float) -> str:
 
 
 class LiquidationHeatmapDashboard:
-    """Full-screen liquidation heatmap with live updates."""
+    """Full-screen multi-asset liquidation heatmap with live updates.
+
+    Displays heatmaps for all assets with tracked positions.
+    Auto-discovers assets from live data — not hardcoded to BTC.
+    """
+
+    # Assets to always show (even with 0 positions) if price exists
+    PRIORITY_ASSETS = ["BTC", "ETH", "SOL"]
 
     def __init__(
         self,
         scanner: PositionScanner | None = None,
         refresh_rate: int = 5,
-        symbol: str = "BTC",
-        n_buckets: int = 35,
+        symbol: str | None = None,
+        n_buckets: int = 30,
         range_pct: float = 12.0,
     ):
         self.console = Console()
         self.scanner = scanner
         self.refresh_rate = refresh_rate
-        self.symbol = symbol
+        self.single_symbol = symbol  # None = show all assets
         self.n_buckets = n_buckets
         self.range_pct = range_pct
         self.positions: list[TrackedPosition] = []
-        self.current_price: float = 0.0
+        self.market_prices: dict[str, float] = {}
         self.cycle = 0
+
+    def _discover_assets(self) -> list[str]:
+        """Find all assets that have tracked positions, plus priority assets."""
+        assets_with_positions = set()
+        for p in self.positions:
+            assets_with_positions.add(p.symbol.upper())
+
+        # Priority assets first, then others sorted by position count
+        result = []
+        for a in self.PRIORITY_ASSETS:
+            if a in assets_with_positions or self.market_prices.get(a, 0) > 0:
+                result.append(a)
+                assets_with_positions.discard(a)
+        for a in sorted(assets_with_positions):
+            result.append(a)
+        return result
 
     async def update_data(self) -> None:
         """Fetch latest positions from scanner."""
         if self.scanner:
             self.positions = list(self.scanner.positions)
-            self.current_price = self.scanner.market_prices.get(self.symbol, 0.0)
+            self.market_prices = dict(self.scanner.market_prices)
+
+    def _build_asset_heatmap(self, symbol: str, current_price: float, n_buckets: int, bar_width: int = 18) -> Table | None:
+        """Build a heatmap table for a single asset."""
+        buckets = compute_heatmap_buckets(
+            self.positions, current_price,
+            symbol=symbol, n_buckets=n_buckets, range_pct=self.range_pct,
+        )
+        if not buckets or current_price <= 0:
+            return None
+
+        max_long = max((b.long_usd for b in buckets), default=1)
+        max_short = max((b.short_usd for b in buckets), default=1)
+        max_val = max(max_long, max_short, 1)
+
+        total_long = sum(b.long_usd for b in buckets)
+        total_short = sum(b.short_usd for b in buckets)
+        long_count = sum(b.long_count for b in buckets)
+        short_count = sum(b.short_count for b in buckets)
+
+        # Header with asset name and stats
+        header = Text()
+        header.append(f"  {symbol} ", style="bold bright_white")
+        header.append(f"${current_price:,.0f}", style=CURRENT_STYLE)
+        header.append(f"  │  ", style="dim")
+        header.append(f"L: {_format_usd(total_long)}({long_count})", style=LONG_STYLE)
+        header.append(f"  ", style="dim")
+        header.append(f"S: {_format_usd(total_short)}({short_count})", style=SHORT_STYLE)
+
+        table = Table(
+            box=None, show_header=False, padding=(0, 1), expand=True,
+            title=header, title_style="",
+        )
+        table.add_column("Price", justify="right", width=10)
+        table.add_column("Longs ↓", justify="right", width=bar_width + 6)
+        table.add_column("", justify="center", width=2)
+        table.add_column("Shorts ↑", justify="left", width=bar_width + 6)
+
+        for bucket in buckets:
+            is_current = bucket.price_low <= current_price <= bucket.price_high
+            price_style = CURRENT_STYLE if is_current else "dim"
+
+            # Price — use appropriate formatting
+            if current_price > 1000:
+                price_str = f"${bucket.mid:,.0f}"
+            elif current_price > 10:
+                price_str = f"${bucket.mid:,.1f}"
+            else:
+                price_str = f"${bucket.mid:.3f}"
+
+            # Long bar
+            long_text = Text()
+            if bucket.long_usd > 0:
+                n = max(1, int(bucket.long_usd / max_val * bar_width))
+                label = _format_usd(bucket.long_usd)
+                if label:
+                    long_text.append(f"{label} ", style="dim red")
+                long_text.append("█" * n, style=LONG_STYLE)
+
+            marker = Text("◄►", style=CURRENT_STYLE) if is_current else Text("│", style="dim")
+
+            # Short bar
+            short_text = Text()
+            if bucket.short_usd > 0:
+                n = max(1, int(bucket.short_usd / max_val * bar_width))
+                short_text.append("█" * n, style=SHORT_STYLE)
+                label = _format_usd(bucket.short_usd)
+                if label:
+                    short_text.append(f" {label}", style="dim green")
+
+            table.add_row(Text(price_str, style=price_style), long_text, marker, short_text)
+
+        return table
 
     def build_heatmap(self) -> Panel:
-        """Build the text-based heatmap visualization."""
-        buckets = compute_heatmap_buckets(
-            self.positions, self.current_price,
-            symbol=self.symbol, n_buckets=self.n_buckets, range_pct=self.range_pct,
-        )
+        """Build multi-asset heatmap visualization."""
+        from rich.console import Group
 
-        if not buckets or self.current_price <= 0:
+        assets = [self.single_symbol] if self.single_symbol else self._discover_assets()
+
+        if not assets:
             return Panel(
                 Text("Waiting for position data...", style="dim"),
                 title="Liquidation Heatmap",
                 border_style="bright_cyan",
             )
 
-        # Find max values for intensity scaling
-        max_long = max((b.long_usd for b in buckets), default=1)
-        max_short = max((b.short_usd for b in buckets), default=1)
-        max_val = max(max_long, max_short, 1)
+        sections: list = []
+        for symbol in assets[:6]:  # Max 6 assets to fit terminal
+            price = self.market_prices.get(symbol, 0.0)
+            if price <= 0:
+                continue
 
-        # Heatmap bar width
-        bar_width = 20
+            # Fewer buckets per asset when showing multiple
+            n = self.n_buckets if self.single_symbol else max(10, self.n_buckets // len(assets))
+            table = self._build_asset_heatmap(symbol, price, n_buckets=n)
+            if table:
+                sections.append(table)
+                sections.append(Text(""))  # spacer
 
-        # Build table
-        table = Table(
-            box=None, show_header=True, header_style="bold bright_white",
-            padding=(0, 1), expand=True,
-        )
-        table.add_column("Price", style="bright_white", justify="right", width=10)
-        table.add_column("Longs (liquidated if ↓)", justify="right", width=bar_width + 8)
-        table.add_column("", justify="center", width=3)  # marker column
-        table.add_column("Shorts (liquidated if ↑)", justify="left", width=bar_width + 8)
-
-        for bucket in buckets:
-            price = bucket.mid
-            is_current = bucket.price_low <= self.current_price <= bucket.price_high
-
-            # Price label
-            price_str = f"${price:,.0f}"
-            price_style = CURRENT_STYLE if is_current else "dim"
-
-            # Long bar (right-aligned, red)
-            long_chars = ""
-            if max_long > 0 and bucket.long_usd > 0:
-                n_blocks = max(1, int(bucket.long_usd / max_val * bar_width))
-                long_chars = "█" * n_blocks
-            long_label = _format_usd(bucket.long_usd)
-            long_text = Text()
-            if long_label:
-                long_text.append(f"{long_label} ", style="dim red")
-            long_text.append(long_chars, style=LONG_STYLE)
-
-            # Center marker
-            marker = Text("◄►", style=CURRENT_STYLE) if is_current else Text("│", style="dim")
-
-            # Short bar (left-aligned, green)
-            short_chars = ""
-            if max_short > 0 and bucket.short_usd > 0:
-                n_blocks = max(1, int(bucket.short_usd / max_val * bar_width))
-                short_chars = "█" * n_blocks
-            short_text = Text()
-            short_text.append(short_chars, style=SHORT_STYLE)
-            short_label = _format_usd(bucket.short_usd)
-            if short_label:
-                short_text.append(f" {short_label}", style="dim green")
-
-            table.add_row(
-                Text(price_str, style=price_style),
-                long_text,
-                marker,
-                short_text,
+        if not sections:
+            return Panel(
+                Text("Waiting for position data...", style="dim"),
+                title="Liquidation Heatmap",
+                border_style="bright_cyan",
             )
 
-        # Summary stats
-        total_long = sum(b.long_usd for b in buckets)
-        total_short = sum(b.short_usd for b in buckets)
-        long_count = sum(b.long_count for b in buckets)
-        short_count = sum(b.short_count for b in buckets)
-
-        footer = Text()
-        footer.append(f"\n  {self.symbol} ", style="bold bright_white")
-        footer.append(f"${self.current_price:,.0f}", style=CURRENT_STYLE)
-        footer.append(f"  │  ", style="dim")
-        footer.append(f"Longs at risk: ", style="dim")
-        footer.append(f"{_format_usd(total_long)} ({long_count})", style=LONG_STYLE)
-        footer.append(f"  │  ", style="dim")
-        footer.append(f"Shorts at risk: ", style="dim")
-        footer.append(f"{_format_usd(total_short)} ({short_count})", style=SHORT_STYLE)
-        footer.append(f"  │  ", style="dim")
-        footer.append(f"Range: ±{self.range_pct:.0f}%", style="dim")
-
-        from rich.console import Group
-        content = Group(table, footer)
-
+        asset_label = assets[0] if self.single_symbol else f"{len(assets)} assets"
         return Panel(
-            content,
-            title=f"[bold bright_cyan]Liquidation Heatmap — {self.symbol}[/]",
-            subtitle=f"[dim]Live from Hyperliquid │ Cycle {self.cycle}[/]",
+            Group(*sections),
+            title=f"[bold bright_cyan]Liquidation Heatmap — {asset_label}[/]",
+            subtitle=f"[dim]Live from Hyperliquid │ ◄Red=Long risk  Green=Short risk► │ Cycle {self.cycle}[/]",
             border_style="bright_cyan",
             box=box.DOUBLE_EDGE,
-            padding=(1, 2),
+            padding=(1, 1),
         )
 
     def build_compact(self) -> Panel:
-        """Compact version for combined dashboard."""
-        buckets = compute_heatmap_buckets(
-            self.positions, self.current_price,
-            symbol=self.symbol, n_buckets=15, range_pct=10.0,
-        )
-
-        if not buckets or self.current_price <= 0:
-            return Panel("Waiting...", title="Liq Heatmap", border_style="bright_cyan")
-
-        max_val = max(max(b.total_usd for b in buckets), 1)
-        bar_w = 12
-
+        """Compact version for combined dashboard — shows top 3 assets."""
+        assets = [self.single_symbol] if self.single_symbol else self._discover_assets()[:3]
         lines = Text()
-        for bucket in buckets:
-            is_current = bucket.price_low <= self.current_price <= bucket.price_high
-            price_style = CURRENT_STYLE if is_current else "dim"
 
-            lines.append(f"${bucket.mid:>8,.0f} ", style=price_style)
+        for symbol in assets:
+            price = self.market_prices.get(symbol, 0.0)
+            if price <= 0:
+                continue
 
-            if bucket.long_usd > 0:
-                n = max(1, int(bucket.long_usd / max_val * bar_w))
-                lines.append("█" * n, style=LONG_STYLE)
-            if bucket.short_usd > 0:
-                n = max(1, int(bucket.short_usd / max_val * bar_w))
-                lines.append("█" * n, style=SHORT_STYLE)
+            buckets = compute_heatmap_buckets(
+                self.positions, price, symbol=symbol, n_buckets=8, range_pct=8.0,
+            )
+            if not buckets:
+                continue
 
-            if is_current:
-                lines.append(" ◄", style=CURRENT_STYLE)
+            max_val = max(max(b.total_usd for b in buckets), 1)
+            bar_w = 10
+
+            lines.append(f" {symbol} ${price:,.0f}\n", style="bold bright_white")
+            for bucket in buckets:
+                is_current = bucket.price_low <= price <= bucket.price_high
+                style = CURRENT_STYLE if is_current else "dim"
+
+                if price > 1000:
+                    lines.append(f"${bucket.mid:>7,.0f} ", style=style)
+                else:
+                    lines.append(f"${bucket.mid:>7,.1f} ", style=style)
+
+                if bucket.long_usd > 0:
+                    n = max(1, int(bucket.long_usd / max_val * bar_w))
+                    lines.append("█" * n, style=LONG_STYLE)
+                if bucket.short_usd > 0:
+                    n = max(1, int(bucket.short_usd / max_val * bar_w))
+                    lines.append("█" * n, style=SHORT_STYLE)
+                if is_current:
+                    lines.append(" ◄", style=CURRENT_STYLE)
+                lines.append("\n")
             lines.append("\n")
+
+        if not lines.plain.strip():
+            lines.append("Waiting...", style="dim")
 
         return Panel(
             lines,
