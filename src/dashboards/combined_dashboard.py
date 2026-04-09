@@ -23,6 +23,7 @@ from src.dashboards.hub_panels import (
     HubStatusPanel,
     HubWhales,
 )
+from src.dashboards.liquidation_heatmap import LiquidationHeatmapDashboard
 
 
 class CombinedDashboard:
@@ -36,6 +37,7 @@ class CombinedDashboard:
 
         self.liq_watch = HubLiqWatch(hub)
         self.liq_stream = HubLiqStream(hub)
+        self.heatmap = LiquidationHeatmapDashboard(scanner=hub.positions)
         self.cvd = HubCVD(hub)
         self.hlp = HubHLP(hub)
         self.market = HubMarket(hub)
@@ -48,6 +50,11 @@ class CombinedDashboard:
         self.cycle += 1
         for panel in [self.liq_watch, self.liq_stream, self.cvd, self.hlp, self.market, self.smart_money, self.whales, self.market_intel]:
             panel.cycle = self.cycle
+        self.heatmap.cycle = self.cycle
+        # Update heatmap data from scanner
+        if self.hub.positions:
+            self.heatmap.positions = list(self.hub.positions.positions)
+            self.heatmap.market_prices = dict(self.hub.positions.market_prices)
 
         layout = Layout()
         layout.split_column(
@@ -61,8 +68,7 @@ class CombinedDashboard:
         header.append("  |  ", style="dim")
         header.append(f"Cycle #{self.cycle}", style="bright_white")
         header.append("  |  ", style="dim")
-        mode = self.hub.status.mode.upper()
-        header.append(mode, style="bold bright_green" if mode == "DEMO" else "bold bright_red")
+        header.append("LIVE", style="bold bright_green")
         header.append("  |  ", style="dim")
         header.append(f"Liqs: {self.hub.status.total_liquidations:,}", style="bright_yellow")
         header.append("  |  ", style="dim")
@@ -81,9 +87,11 @@ class CombinedDashboard:
         layout["left"].split_column(
             Layout(name="liq_watch", ratio=1),
             Layout(name="liq_stream", ratio=1),
+            Layout(name="heatmap", ratio=1),
         )
         layout["liq_watch"].update(self.liq_watch.build_compact())
         layout["liq_stream"].update(self.liq_stream.build_compact())
+        layout["heatmap"].update(self.heatmap.build_compact())
 
         layout["center"].split_column(
             Layout(name="cvd", ratio=2),
