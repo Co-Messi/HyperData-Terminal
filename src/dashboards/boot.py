@@ -14,11 +14,12 @@ from rich.text import Text
 from src.data_layer.hub import HyperDataHub
 
 DASHBOARD_INFO = {
-    "liq":    {"name": "Liquidation Watch",  "desc": "BTC positions closest to liquidation",     "color": "bright_cyan"},
-    "stream": {"name": "Liquidation Stream", "desc": "Multi-exchange liquidation feed",          "color": "bright_cyan"},
-    "cvd":    {"name": "CVD Order Flow",     "desc": "BTC cumulative volume delta & signals",    "color": "bright_green"},
-    "market": {"name": "Market Overview",    "desc": "Funding rates, OI, prices for all assets", "color": "bright_magenta"},
-    "whale":  {"name": "Whale Tracker",      "desc": "Largest open positions on Hyperliquid",    "color": "bright_cyan"},
+    "liq":     {"name": "Liquidation Watch",   "desc": "BTC positions closest to liquidation",     "color": "bright_cyan"},
+    "stream":  {"name": "Liquidation Stream",  "desc": "Multi-exchange liquidation feed",          "color": "bright_cyan"},
+    "heatmap": {"name": "Liquidation Heatmap", "desc": "Price-level liquidation risk visualization","color": "bright_red"},
+    "cvd":     {"name": "CVD Order Flow",      "desc": "BTC cumulative volume delta & signals",    "color": "bright_green"},
+    "market":  {"name": "Market Overview",     "desc": "Funding rates, OI, prices for all assets", "color": "bright_magenta"},
+    "whale":   {"name": "Whale Tracker",       "desc": "Largest open positions on Hyperliquid",    "color": "bright_cyan"},
 }
 
 

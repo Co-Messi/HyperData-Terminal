@@ -37,7 +37,7 @@ Zero API keys required to get started. All exchange data comes from public WebSo
 
 | | Feature | Description |
 |---|---|---|
-| :chart_with_upwards_trend: | **5 Terminal Dashboards** | Liquidation watch, liquidation stream, order flow (CVD), market overview, whale tracker |
+| :chart_with_upwards_trend: | **6 Terminal Dashboards** | Liquidation watch, liquidation stream, liquidation heatmap, order flow (CVD), market overview, whale tracker |
 | :satellite: | **14 Data Components** | Liquidations from 4 exchanges, CVD orderflow, whale positions, funding rates, open interest, orderbook depth, DVOL IV, long/short ratios, spot prices, smart money signals |
 | :globe_with_meridians: | **REST API + WebSocket** | 17+ endpoints for market data, real-time event streaming |
 | :moneybag: | **Paper Trading** | Pluggable strategy engine — real market data, fake money. Write your own strategy in ~30 lines. |
@@ -68,6 +68,7 @@ That's it. Live data from 5 exchanges, rendered in your terminal.
 hyperdata                  # All dashboards (live data)
 hyperdata -d liq           # Liquidation watch — positions near liquidation
 hyperdata -d stream        # Liquidation stream — real-time feed
+hyperdata -d heatmap       # Liquidation heatmap — price-level risk visualization
 hyperdata -d cvd           # Order flow — CVD, buy/sell volume
 hyperdata -d market        # Market overview — prices, funding, OI
 hyperdata -d whale         # Whale tracker — largest Hyperliquid positions
@@ -82,6 +83,7 @@ hyperdata --list           # Show available dashboards
 | **Liquidation Stream** | Multi-exchange real-time liquidation feed from Hyperliquid, Binance, Bybit, and OKX. Every liquidation event as it happens, with size, price, and exchange. |
 | **CVD Order Flow** | Cumulative Volume Delta for BTC — see whether buyers or sellers are in control. Tracks buy volume vs sell volume from Binance WebSocket trades. |
 | **Market Overview** | Funding rates, open interest, and prices for 50 assets across exchanges. Spot divergences and funding extremes at a glance. |
+| **Liquidation Heatmap** | Price-level visualization of where liquidations are concentrated. Red bars = long liquidation risk (price drops), green bars = short liquidation risk (price rises). Like Coinglass, but free and in your terminal. |
 | **Whale Tracker** | Largest open positions on Hyperliquid. See what the biggest players are doing — their size, entry price, PnL, and liquidation price. |
 
 ---
