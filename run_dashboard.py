@@ -89,13 +89,19 @@ async def run_interactive(api_port: int | None = None) -> None:
         while True:
             _build_menu(console)
 
-            # Read user choice
+            # Read user choice — use a daemon thread so Ctrl+C exits cleanly
+            import concurrent.futures
+            _input_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            _input_pool._threads = set()  # ensure daemon threads
             try:
                 choice = await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: input("  Enter choice: ").strip().lower()
+                    _input_pool, lambda: input("  Enter choice: ").strip().lower()
                 )
             except (EOFError, KeyboardInterrupt):
+                _input_pool.shutdown(wait=False)
                 break
+            finally:
+                _input_pool.shutdown(wait=False)
 
             if choice in ("q", "quit", "exit"):
                 break

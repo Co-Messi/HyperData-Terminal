@@ -71,8 +71,11 @@ class LLMAgent(Strategy):
             return None
 
         try:
-            # Synchronous LLM call using urllib (works in both sync and async contexts)
-            return self._sync_evaluate(hub)
+            # Run blocking LLM call in a thread so it doesn't stall the async loop
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(self._sync_evaluate, hub)
+                return future.result(timeout=20)
         except Exception:
             logger.exception("LLM agent error")
             return None

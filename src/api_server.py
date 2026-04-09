@@ -122,9 +122,7 @@ class HyperDataAPI:
             ("GET", "/v1/orderbook/{symbol}", self.handle_orderbook),
             ("GET", "/v1/whales", self.handle_whales),
             ("GET", "/v1/positions/danger-zone", self.handle_danger_zone),
-            ("GET", "/v1/copy-trading/signals", self.handle_copy_trading_signals),
-            ("GET", "/v1/copy-trading/clusters", self.handle_copy_trading_clusters),
-            ("GET", "/v1/copy-trading/wallets", self.handle_copy_trading_wallets),
+            # Copy-trading endpoints removed from OSS build (derived trader intelligence)
             ("GET", "/v1/public/metrics", self.handle_public_metrics),
         ]
         for method, path, handler in v1:

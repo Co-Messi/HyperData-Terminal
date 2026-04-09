@@ -164,24 +164,10 @@ class SmartMoneyEngine:
     async def fetch_leaderboard_wallets(self, top_n: int = 50) -> list[str]:
         """Fetch top wallets from on-chain activity. Returns list of 0x addresses.
 
-        In the open-source build, this relies on Hyperliquid position data
-        (large position holders). No external leaderboard APIs are used.
+        In the open-source build, wallets are discovered organically from
+        Hyperliquid position activity. No external leaderboard seeding.
         """
         addresses: list[str] = []
-
-        # Seed from tracked positions (Hyperliquid whales)
-        try:
-            if hasattr(self, "_hub") and self._hub and hasattr(self._hub, "positions"):
-                positions = getattr(self._hub.positions, "positions", [])
-                for pos in positions[:top_n]:
-                    addr = getattr(pos, "address", "") or ""
-                    if isinstance(addr, str) and addr.startswith("0x"):
-                        addresses.append(addr.lower())
-                if addresses:
-                    logger.info("[smart_money] Seeded %d wallets from Hyperliquid positions", len(addresses))
-                    return addresses
-        except Exception:
-            logger.debug("[smart_money] Position-based seeding failed")
 
         # Fallback: HTTP API endpoints
         session = self._session
