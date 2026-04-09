@@ -28,7 +28,7 @@ class WhaleFollow(Strategy):
 
     def evaluate(self, hub) -> Signal | None:
         # Get tracked whale positions from Hyperliquid
-        positions = hub.positions.get_positions() if hub.positions else []
+        positions = getattr(hub.positions, "positions", []) if hub.positions else []
         if not positions:
             return None
 
@@ -38,7 +38,7 @@ class WhaleFollow(Strategy):
 
         for pos in positions:
             sym = getattr(pos, "symbol", "") or ""
-            notional = abs(getattr(pos, "notional_usd", 0) or 0)
+            notional = abs(getattr(pos, "size_usd", 0) or 0)
 
             if sym.upper() == self.symbol.upper() and notional > biggest_size:
                 biggest = pos

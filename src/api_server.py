@@ -118,8 +118,7 @@ class HyperDataAPI:
             ("GET", "/v1/long-short-ratio", self.handle_lsr),
             ("GET", "/v1/basis", self.handle_basis),
             ("GET", "/v1/deribit/iv", self.handle_deribit_iv),
-            ("GET", "/v1/smart-money/rankings", self.handle_smart_money_rankings),
-            ("GET", "/v1/smart-money/signals", self.handle_smart_money_signals),
+            # Smart-money endpoints removed from OSS build (derived trader intelligence)
             ("GET", "/v1/orderbook/{symbol}", self.handle_orderbook),
             ("GET", "/v1/whales", self.handle_whales),
             ("GET", "/v1/positions/danger-zone", self.handle_danger_zone),
@@ -138,7 +137,6 @@ class HyperDataAPI:
         legacy_paths = [
             "/health", "/market", "/liquidations", "/liquidations/stats",
             "/funding-rates", "/long-short-ratio", "/basis", "/deribit/iv",
-            "/smart-money/rankings", "/smart-money/signals",
             "/whales", "/positions/danger-zone",
         ]
         for path in legacy_paths:

@@ -71,22 +71,50 @@ class LLMAgent(Strategy):
             return None
 
         try:
-            # Run the async call from the sync evaluate() method
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # We're inside an async context — create a task
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor() as pool:
-                    result = loop.run_in_executor(pool, self._sync_call, hub)
-                    # Can't await here in sync — fall back to None this tick
-                    # The async paper trader should call _async_evaluate directly
-                    logger.debug("LLM agent: deferring to next tick (async context)")
-                    return None
-            else:
-                return loop.run_until_complete(self._async_evaluate(hub))
+            # Synchronous LLM call using urllib (works in both sync and async contexts)
+            return self._sync_evaluate(hub)
         except Exception:
             logger.exception("LLM agent error")
             return None
+
+    def _sync_evaluate(self, hub) -> Signal | None:
+        """Synchronous LLM call via urllib — no async dependency."""
+        import json as _json
+        import urllib.request
+
+        summary = self._build_market_summary(hub)
+        if summary is None:
+            return None
+
+        url = f"{self.base_url.rstrip('/')}/chat/completions"
+        payload = _json.dumps({
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": (
+                    "You are a crypto trading assistant. Based on the market data provided, "
+                    "respond with exactly one word on the first line: BUY, SELL, or HOLD. "
+                    "On the second line, give a brief reason (under 20 words)."
+                )},
+                {"role": "user", "content": summary},
+            ],
+            "temperature": 0.3,
+            "max_tokens": 60,
+        }).encode()
+
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        req = urllib.request.Request(url, data=payload, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = _json.loads(resp.read())
+            text = data["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            logger.warning("LLM API call failed: %s", e)
+            return None
+
+        return self._parse_response(text)
 
     async def _async_evaluate(self, hub) -> Signal | None:
         """Async version — call this directly from an async paper trader."""
@@ -142,6 +170,32 @@ class LLMAgent(Strategy):
         # Validate action
         if action_word not in ("BUY", "SELL", "HOLD"):
             # Try to find the action word somewhere in the first line
+            for word in ("BUY", "SELL", "HOLD"):
+                if word in action_word:
+                    action_word = word
+                    break
+            else:
+                logger.warning("LLM returned unparseable action: %s", lines[0])
+                return None
+
+        if action_word == "HOLD":
+            return None
+
+        return Signal(
+            symbol=self.symbol,
+            action=action_word,
+            size_usd=100.0,
+            confidence=0.6,
+            reason=f"[LLM] {reason}",
+        )
+
+    def _parse_response(self, text: str) -> Signal | None:
+        """Parse LLM response text into a Signal."""
+        lines = text.split("\n", 1)
+        action_word = lines[0].strip().upper()
+        reason = lines[1].strip() if len(lines) > 1 else ""
+
+        if action_word not in ("BUY", "SELL", "HOLD"):
             for word in ("BUY", "SELL", "HOLD"):
                 if word in action_word:
                     action_word = word

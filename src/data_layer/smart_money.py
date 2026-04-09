@@ -35,10 +35,7 @@ logger = logging.getLogger(__name__)
 DATA_DIR = Path(__file__).resolve().parents[2] / "data"
 ANCHOR_PATH = DATA_DIR / "anchor_wallets.json"
 
-LEADERBOARD_URLS = [
-    "https://data-api.polymarket.com/leaderboard",
-    "https://gamma-api.polymarket.com/leaderboard",
-]
+LEADERBOARD_URLS: list[str] = []  # No external leaderboard in OSS build
 
 
 # ── Data models ────────────────────────────────────────────────────────────
@@ -165,42 +162,26 @@ class SmartMoneyEngine:
     # ── Leaderboard seeding ────────────────────────────────────────────
 
     async def fetch_leaderboard_wallets(self, top_n: int = 50) -> list[str]:
-        """Fetch top wallets from Polymarket leaderboard. Returns list of 0x addresses."""
-        import subprocess
+        """Fetch top wallets from on-chain activity. Returns list of 0x addresses.
 
+        In the open-source build, this relies on Hyperliquid position data
+        (large position holders). No external leaderboard APIs are used.
+        """
         addresses: list[str] = []
 
-        # Primary: polymarket CLI (reliable, uses authenticated endpoint)
+        # Seed from tracked positions (Hyperliquid whales)
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "polymarket", "-o", "json", "data", "leaderboard",
-                "--period", "all", "--order-by", "pnl",
-                "--limit", str(top_n),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
-            if proc.returncode == 0 and stdout.strip():
-                rows = json.loads(stdout)
-                if isinstance(rows, list):
-                    for row in rows:
-                        addr = (
-                            row.get("proxy_wallet")
-                            or row.get("address")
-                            or row.get("wallet")
-                            or row.get("user")
-                            or ""
-                        )
-                        if isinstance(addr, str) and addr.startswith("0x"):
-                            addresses.append(addr.lower())
+            if hasattr(self, "_hub") and self._hub and hasattr(self._hub, "positions"):
+                positions = getattr(self._hub.positions, "positions", [])
+                for pos in positions[:top_n]:
+                    addr = getattr(pos, "address", "") or ""
+                    if isinstance(addr, str) and addr.startswith("0x"):
+                        addresses.append(addr.lower())
                 if addresses:
-                    logger.info(
-                        "[smart_money] Fetched %d leaderboard wallets via CLI",
-                        len(addresses),
-                    )
+                    logger.info("[smart_money] Seeded %d wallets from Hyperliquid positions", len(addresses))
                     return addresses
         except Exception:
-            logger.debug("[smart_money] CLI leaderboard fetch failed")
+            logger.debug("[smart_money] Position-based seeding failed")
 
         # Fallback: HTTP API endpoints
         session = self._session
@@ -251,7 +232,7 @@ class SmartMoneyEngine:
         return addresses
 
     async def seed_from_leaderboard(self) -> int:
-        """Seed wallets from anchor file + Polymarket leaderboard."""
+        """Seed wallets from anchor file + on-chain leaderboard."""
         now = time.time()
         seed_addrs: list[str] = []  # ordered, deduped later
 

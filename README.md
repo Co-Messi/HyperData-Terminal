@@ -103,19 +103,25 @@ python run_api.py --port 8420
 | `GET /v1/market` | All assets — prices, OI, funding |
 | `GET /v1/market/{symbol}` | Single asset detail |
 | `GET /v1/liquidations` | Recent liquidation events |
-| `GET /v1/liquidation-stats` | Aggregate liquidation statistics |
-| `GET /v1/orderflow?symbol=BTC&period=1h` | CVD snapshots |
+| `GET /v1/liquidations/stats` | Aggregate liquidation statistics |
+| `GET /v1/orderflow/{symbol}` | CVD snapshots for a symbol |
 | `GET /v1/funding-rates` | Funding rates across exchanges |
+| `GET /v1/funding-rates/{symbol}` | Single asset funding rate |
+| `GET /v1/long-short-ratio` | Long/short ratio |
+| `GET /v1/basis` | Basis spread |
+| `GET /v1/deribit/iv` | DVOL implied volatility |
+| `GET /v1/orderbook/{symbol}` | Orderbook snapshot |
 | `GET /v1/whales` | Top whale positions |
-| `GET /v1/danger-zone` | Positions closest to liquidation |
-| `GET /v1/smart-money/signals` | Smart money activity signals |
-| `GET /v1/orderbook?symbol=BTC` | Orderbook snapshot |
-| `GET /v1/deribit-iv` | DVOL implied volatility |
+| `GET /v1/positions/danger-zone` | Positions closest to liquidation |
+| `GET /v1/public/metrics` | Server metrics and component health |
 | `WS /v1/ws` | Real-time event stream (liquidations, trades, signals) |
 
 ```bash
-# Example
+# Examples
 curl http://localhost:8420/v1/market/BTC | python -m json.tool
+curl http://localhost:8420/v1/orderflow/BTC
+curl http://localhost:8420/v1/liquidations/stats
+curl http://localhost:8420/v1/positions/danger-zone
 ```
 
 ---
