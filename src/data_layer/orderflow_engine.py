@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -27,6 +27,9 @@ WS_URL = "wss://api.hyperliquid.xyz/ws"
 # venue for this long the order-flow feed is treated as stale rather than
 # letting frozen CVD/OFI numbers read as live.
 STALE_AFTER_SECONDS = 30.0
+
+# Upper bound on remembered trade IDs per venue (oldest evicted first).
+MAX_SEEN_IDS = 100_000
 
 TIMEFRAME_WINDOWS: dict[str, int] = {
     "1m": 60,
@@ -113,7 +116,13 @@ class TimeframeBucket:
         self._expire_old(trade.timestamp)
 
     def _expire_old(self, now: float | None = None) -> None:
-        """Remove trades whose timestamp is older than *now - window*."""
+        """Remove trades whose timestamp is older than *now - window*.
+
+        Note: trade.timestamp is exchange event time while the default ``now`` is
+        local wall-clock. The two clock domains differ only by network/clock
+        skew (sub-second in practice), which is negligible against the smallest
+        60s window; callers needing exactness can pass an explicit ``now``.
+        """
         if now is None:
             now = time.time()
         cutoff = now - self.window
@@ -176,8 +185,18 @@ class OrderFlowEngine:
             for sym in self.symbols
         }
 
-        # Running CVD that never resets (cumulative since start).
+        # Running CVD that never resets (cumulative since start). `cumulative_cvd`
+        # is the combined HL+Binance figure (kept for back-compat); the per-venue
+        # series let consumers tell the two apart instead of reading a silent sum.
         self.cumulative_cvd: dict[str, float] = {s: 0.0 for s in self.symbols}
+        self.cumulative_cvd_hl: dict[str, float] = {s: 0.0 for s in self.symbols}
+        self.cumulative_cvd_binance: dict[str, float] = {s: 0.0 for s in self.symbols}
+
+        # Per-venue dedup of trade IDs so a reconnect/resubscribe replay can't
+        # double-count into the cumulative CVD (which never resets). Bounded
+        # like the liquidation feed's _seen_tids.
+        self._seen_hl_tids: OrderedDict = OrderedDict()
+        self._seen_binance_ids: OrderedDict = OrderedDict()
 
         # Last N trades per symbol for display / inspection.
         self.recent_trades: dict[str, deque[Trade]] = {
@@ -324,10 +343,26 @@ class OrderFlowEngine:
         """Current trades-per-second derived from the 1m bucket."""
         return self.get_snapshot(symbol, "1m").trades_per_sec
 
+    def get_cumulative_cvd(self, symbol: str) -> dict[str, float]:
+        """Cumulative CVD broken out by venue so 'BTC CVD' isn't a silent sum.
+
+        Returns the combined figure plus the per-venue Hyperliquid and Binance
+        series.
+        """
+        return {
+            "combined": self.cumulative_cvd.get(symbol, 0.0),
+            "hyperliquid": self.cumulative_cvd_hl.get(symbol, 0.0),
+            "binance": self.cumulative_cvd_binance.get(symbol, 0.0),
+        }
+
     # -- internal: process a single trade -----------------------------------
 
-    def _process_trade(self, trade: Trade) -> None:
-        """Route a trade to all timeframe buckets and bookkeeping."""
+    def _process_trade(self, trade: Trade, venue: str | None = None) -> None:
+        """Route a trade to all timeframe buckets and bookkeeping.
+
+        ``venue`` is 'hyperliquid' or 'binance' so the per-venue cumulative CVD
+        can be tracked separately; None updates only the combined series.
+        """
         sym = trade.symbol
         if sym not in self.buckets:
             return
@@ -336,9 +371,13 @@ class OrderFlowEngine:
         for bucket in self.buckets[sym].values():
             bucket.add_trade(trade)
 
-        # Update running cumulative CVD.
+        # Update running cumulative CVD (combined + per-venue).
         delta = trade.size_usd if trade.side == "buy" else -trade.size_usd
         self.cumulative_cvd[sym] += delta
+        if venue == "hyperliquid":
+            self.cumulative_cvd_hl[sym] = self.cumulative_cvd_hl.get(sym, 0.0) + delta
+        elif venue == "binance":
+            self.cumulative_cvd_binance[sym] = self.cumulative_cvd_binance.get(sym, 0.0) + delta
 
         # Store in recent-trades ring buffer.
         self.recent_trades[sym].append(trade)
@@ -429,18 +468,30 @@ class OrderFlowEngine:
         self.last_hl_message_at = time.time()
         for t in trades_raw:
             try:
+                # Skip trades already seen (a resubscribe on reconnect can replay
+                # them, which would double-count into the never-resetting CVD).
+                tid = t.get("tid")
+                coin = t["coin"]
+                if tid is not None:
+                    key = (coin, tid)
+                    if key in self._seen_hl_tids:
+                        continue
+                    self._seen_hl_tids[key] = None
+                    while len(self._seen_hl_tids) > MAX_SEEN_IDS:
+                        self._seen_hl_tids.popitem(last=False)
+
                 price = float(t["px"])
                 size = float(t["sz"])
                 side = "buy" if t["side"] == "B" else "sell"
                 trade = Trade(
                     timestamp=t["time"] / 1000.0,  # ms -> seconds
-                    symbol=t["coin"],
+                    symbol=coin,
                     side=side,
                     price=price,
                     size=size,
                     size_usd=price * size,
                 )
-                self._process_trade(trade)
+                self._process_trade(trade, venue="hyperliquid")
             except (KeyError, ValueError, TypeError):
                 logger.exception("Failed to parse trade message: %s", t)
 
@@ -510,6 +561,17 @@ class OrderFlowEngine:
             if symbol not in self.buckets:
                 self.add_symbol(symbol)
 
+            # Skip aggTrades already seen (Binance aggTrade IDs are per-symbol),
+            # so a reconnect replay can't double-count into the cumulative CVD.
+            agg_id = data.get("a")
+            if agg_id is not None:
+                key = (symbol, agg_id)
+                if key in self._seen_binance_ids:
+                    return
+                self._seen_binance_ids[key] = None
+                while len(self._seen_binance_ids) > MAX_SEEN_IDS:
+                    self._seen_binance_ids.popitem(last=False)
+
             price = float(data["p"])
             qty = float(data["q"])
             # m=True means buyer is maker → taker is SELLER
@@ -523,7 +585,7 @@ class OrderFlowEngine:
                 size=qty,
                 size_usd=price * qty,
             )
-            self._process_trade(trade)
+            self._process_trade(trade, venue="binance")
         except (KeyError, ValueError, TypeError):
             pass  # Silently skip malformed messages
 
@@ -540,4 +602,6 @@ class OrderFlowEngine:
             for tf, secs in self.timeframes.items()
         }
         self.cumulative_cvd[symbol] = 0.0
+        self.cumulative_cvd_hl[symbol] = 0.0
+        self.cumulative_cvd_binance[symbol] = 0.0
         self.recent_trades[symbol] = deque(maxlen=100)
