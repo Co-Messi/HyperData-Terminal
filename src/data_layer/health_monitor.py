@@ -26,13 +26,16 @@ import aiohttp
 logger = logging.getLogger(__name__)
 
 # External reference endpoints (public, no key).
-BINANCE_SPOT_PRICE = "https://api.binance.com/api/v3/ticker/price"
 BINANCE_PREMIUM_INDEX = "https://fapi.binance.com/fapi/v1/premiumIndex"
 BINANCE_LSR = "https://fapi.binance.com/futures/data/globalLongShortAccountRatio"
 
-# Tolerances for cross-reference checks.
-PRICE_TOLERANCE_PCT = 0.5    # hub BTC price vs Binance spot
-LSR_TOLERANCE_PCT = 20.0     # different venues, generous tolerance
+# Tolerances for cross-reference checks. We compare the hub's perp price against
+# Binance's perp MARK price (apples-to-apples — not spot, which carries a basis),
+# and only flag DRIFT (fail) on a large gap. A small cross-venue gap is normal
+# and stays a 'warn' so it never flips the dashboard badge to DRIFT.
+PRICE_WARN_PCT = 0.5     # above this → warn (informational)
+PRICE_DRIFT_PCT = 2.0    # above this → fail (real feed break, flips badge to DRIFT)
+LSR_TOLERANCE_PCT = 20.0  # different venues, generous tolerance
 
 # Freshness thresholds (seconds). Order flow / orderbook delegate to the engines'
 # own is_stale() (set in the data layer) so the threshold lives in one place.
@@ -111,17 +114,27 @@ class DataHealthMonitor:
         out: list[HealthCheck] = []
         hub = self.hub
 
-        # BTC price: hub vs Binance spot.
+        # BTC price: hub perp vs Binance perp MARK price (premiumIndex). Using
+        # the perp mark — not spot — avoids the perp/spot basis falsely tripping
+        # DRIFT in volatile markets. Small gaps warn; only a large gap fails.
         hub_btc = hub.market.assets.get("BTC")
         hub_price = hub_btc.price if hub_btc else 0.0
-        ext = await _fetch_json(session, BINANCE_SPOT_PRICE, {"symbol": "BTCUSDT"})
-        ext_price = float(ext["price"]) if ext else 0.0
+        ext = await _fetch_json(session, BINANCE_PREMIUM_INDEX, {"symbol": "BTCUSDT"})
+        try:
+            ext_price = float(ext["markPrice"]) if ext else 0.0
+        except (KeyError, TypeError, ValueError):
+            ext_price = 0.0
         if hub_price > 0 and ext_price > 0:
             diff = _pct_diff(hub_price, ext_price)
-            status = "pass" if diff < PRICE_TOLERANCE_PCT else "fail"
+            if diff < PRICE_WARN_PCT:
+                status = "pass"
+            elif diff < PRICE_DRIFT_PCT:
+                status = "warn"
+            else:
+                status = "fail"
             out.append(HealthCheck(
                 "xref", "btc_price", status,
-                f"hub=${hub_price:,.2f} binance=${ext_price:,.2f} diff={diff:.3f}%",
+                f"hub=${hub_price:,.2f} binance_perp=${ext_price:,.2f} diff={diff:.3f}%",
             ))
         else:
             out.append(HealthCheck("xref", "btc_price", "warn", "price unavailable"))
@@ -220,19 +233,24 @@ class DataHealthMonitor:
         out: list[HealthCheck] = []
         hub = self.hub
 
-        # Funding sign vs long/short dominance should usually agree.
-        btc = hub.market.assets.get("BTC")
+        # Funding sign vs long/short dominance should usually agree. Compared
+        # WITHIN Binance (Binance funding vs Binance LSR) so we never mix venues
+        # — HL funding vs Binance LSR would diverge naturally and produce noisy
+        # warnings. Skipped when funding is ~flat (no clear directional bias).
+        binance_fr = hub.funding.rates.get("binance", {}).get("BTC")
         lsr_snap = hub.lsr.get_latest("BTC")
-        if btc and lsr_snap and lsr_snap.long_short_ratio > 0:
-            fr_positive = btc.funding_rate > 0
-            lsr_long_dom = lsr_snap.long_short_ratio > 1.0
-            consistent = fr_positive == lsr_long_dom
-            out.append(HealthCheck(
-                "consistency", "funding_vs_lsr",
-                "pass" if consistent else "warn",
-                f"funding {'+' if fr_positive else '-'}, "
-                f"{'longs' if lsr_long_dom else 'shorts'} dominant",
-            ))
+        if binance_fr and lsr_snap and lsr_snap.long_short_ratio > 0:
+            rate = binance_fr.funding_rate_hourly
+            if abs(rate) >= 1e-6:
+                fr_positive = rate > 0
+                lsr_long_dom = lsr_snap.long_short_ratio > 1.0
+                consistent = fr_positive == lsr_long_dom
+                out.append(HealthCheck(
+                    "consistency", "funding_vs_lsr",
+                    "pass" if consistent else "warn",
+                    f"binance funding {'+' if fr_positive else '-'}, "
+                    f"{'longs' if lsr_long_dom else 'shorts'} dominant",
+                ))
         return out
 
     # ── Summary ───────────────────────────────────────────────────

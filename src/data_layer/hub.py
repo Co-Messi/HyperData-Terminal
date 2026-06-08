@@ -632,9 +632,18 @@ class HyperDataHub:
             # socket so its backoff loop rebuilds it. The Binance loop self-heals
             # via its own heartbeat, and if Binance were still feeding, the
             # combined data_age() would not be stale in the first place.
-            if self.orderflow.data_age() > ORDERFLOW_STALE_AFTER * 2:
+            #
+            # Guarded so it only fires when we HAD data and it stopped (not
+            # during initial connect, where data_age is infinite), and debounced
+            # so a persistent outage can't spam close()/logs every status tick.
+            now = time.time()
+            cooldown = ORDERFLOW_STALE_AFTER * 2
+            had_data = self.orderflow.last_message_at > 0
+            since_last_force = now - getattr(self, "_last_of_force_reconnect", 0.0)
+            if had_data and self.orderflow.data_age() > cooldown and since_last_force > cooldown:
                 ws = self.orderflow._ws
                 if ws is not None and not ws.closed:
+                    self._last_of_force_reconnect = now
                     logger.warning(
                         "[hub] order flow silent %.0fs — forcing HL reconnect",
                         self.orderflow.data_age(),
