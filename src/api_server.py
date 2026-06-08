@@ -471,8 +471,29 @@ class HyperDataAPI:
         s = self.hub.status
         uptime = int(s.uptime_seconds)
         h, m = uptime // 3600, (uptime % 3600) // 60
+
+        # Continuous self-verification result (None until the first run).
+        data_health = None
+        monitor = getattr(self.hub, "health", None)
+        if monitor is not None:
+            data_health = monitor.latest()
+
+        # Per-feed connection/staleness state (see the staleness watchdog).
+        feeds = {
+            "liquidation_feed": s.liquidation_feed,
+            "orderflow_engine": s.orderflow_engine,
+            "orderbook_feed": s.orderbook_feed,
+            "market_data": s.market_data,
+            "hlp": s.hlp_status,
+        }
+
+        # Top-level status reflects data health when available: 'ok' only when
+        # nothing is stale/drifting. 'degraded' otherwise (server is still up).
+        overall = data_health.get("overall") if data_health else None
+        status = "ok" if overall in (None, "ok", "warn") else "degraded"
+
         return web.json_response({
-            "status": "ok",
+            "status": status,
             "version": "1.0.0",
             "mode": s.mode,
             "uptime": f"{h}h {m}m",
@@ -482,6 +503,8 @@ class HyperDataAPI:
             "tracked_assets": s.tracked_assets,
             "tracked_positions": s.tracked_positions,
             "ws_clients": len(self._ws_clients),
+            "feeds": feeds,
+            "data_health": data_health,
             "docs": "https://github.com/siewbrayden/hyperdata-terminal",
         })
 

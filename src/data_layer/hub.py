@@ -48,6 +48,7 @@ from src.data_layer.long_short_ratio import LongShortCollector, LongShortSnapsho
 from src.data_layer.orderbook import OrderBookEngine, OrderBookSnapshot
 from src.data_layer.spot_prices import SpotPriceCollector, SpotPriceSnapshot
 from src.data_layer.deribit import DeribitFeed, DeribitIVSnapshot
+from src.data_layer.health_monitor import DataHealthMonitor
 from src.api_server import HyperDataAPI
 
 logger = logging.getLogger(__name__)
@@ -158,6 +159,7 @@ class HyperDataHub:
         self.spot = SpotPriceCollector()
         self.deribit = DeribitFeed()
         self.store = DataStore()
+        self.health = DataHealthMonitor(self)
 
         # ── Status tracking ──────────────────────────────────────
         self.status = HubStatus()
@@ -267,6 +269,12 @@ class HyperDataHub:
         self._tasks.append(asyncio.create_task(
             self._status_update_loop(), name="status-update"
         ))
+        # Continuous data-integrity verification against external sources.
+        # Live mode only — demo prices would always "drift" from real Binance.
+        if not self.demo:
+            self._tasks.append(asyncio.create_task(
+                self._health_monitor_loop(), name="health-monitor"
+            ))
 
         # Attach persistence layer — saves all events to SQLite
         self.store.attach(self)
@@ -580,6 +588,22 @@ class HyperDataHub:
                 await self._update_feed_staleness()
 
             await asyncio.sleep(1)
+
+    async def _health_monitor_loop(self) -> None:
+        """Run data-integrity checks against external sources on an interval.
+
+        Caches the result on self.health for the REST API (/v1/health) and the
+        dashboard health badge to read via self.health.latest().
+        """
+        await asyncio.sleep(15)  # warm-up so feeds have data before first check
+        while self._running:
+            try:
+                await self.health.run_checks()
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("Health monitor loop error")
+            await asyncio.sleep(30)
 
     async def _update_feed_staleness(self) -> None:
         """Flag silent WS feeds as 'stale' and force-reconnect dead sockets.

@@ -46,6 +46,26 @@ class CombinedDashboard:
         self.status_panel = HubStatusPanel(hub)
         self.market_intel = HubMarketIntel(hub)
 
+    def _health_badge(self) -> tuple[str, str]:
+        """Map the data-health monitor's overall verdict to a header badge.
+
+        Replaces the old hardcoded green 'LIVE' so the terminal never claims
+        live when a feed is frozen (STALE) or disagrees with reference data
+        (DRIFT).
+        """
+        monitor = getattr(self.hub, "health", None)
+        result = monitor.latest() if monitor is not None else None
+        if result is None:
+            return "… STARTING", "bold yellow"
+        overall = result.get("overall")
+        return {
+            "ok":    ("✓ LIVE", "bold bright_green"),
+            "warn":  ("✓ LIVE", "bold bright_green"),
+            "stale": ("⚠ STALE", "bold bright_red"),
+            "drift": ("⚠ DRIFT", "bold yellow"),
+            "fail":  ("⚠ DEGRADED", "bold bright_red"),
+        }.get(overall, ("● LIVE", "bold bright_green"))
+
     def build(self) -> Layout:
         self.cycle += 1
         for panel in [self.liq_watch, self.liq_stream, self.cvd, self.hlp, self.market, self.smart_money, self.whales, self.market_intel]:
@@ -63,12 +83,13 @@ class CombinedDashboard:
         )
 
         now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        badge_label, badge_style = self._health_badge()
         header = Text()
         header.append("  \u26a1 HYPERDATA COMMAND CENTER \u26a1", style="bold bright_cyan")
         header.append("  |  ", style="dim")
         header.append(f"Cycle #{self.cycle}", style="bright_white")
         header.append("  |  ", style="dim")
-        header.append("LIVE", style="bold bright_green")
+        header.append(badge_label, style=badge_style)
         header.append("  |  ", style="dim")
         header.append(f"Liqs: {self.hub.status.total_liquidations:,}", style="bright_yellow")
         header.append("  |  ", style="dim")
