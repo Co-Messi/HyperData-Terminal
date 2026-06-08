@@ -227,17 +227,23 @@ class LiquidationStreamDashboard:
 
         all_exchanges = ["hyperliquid", "binance", "bybit", "okx"]
         by_exchange: dict[str, dict[str, Any]] = stats.get("by_exchange", {})
+        coverage: dict[str, dict[str, str]] = stats.get("coverage", {})
+        # Tags that warn the count is not a complete census.
+        method_tag = {"sampled": " (sampled)", "heuristic": " (est.)"}
 
         for ex_name in all_exchanges:
             ex_data = by_exchange.get(ex_name, {"count": 0, "volume_usd": 0.0})
             color = EXCHANGE_COLORS.get(ex_name, "white")
             icon = EXCHANGE_ICONS.get(ex_name, "")
+            method = coverage.get(ex_name, {}).get("method", "")
             ex_line = Text()
             ex_line.append(f"  {icon} ", style=color)
             ex_line.append(f"{ex_name.capitalize():<15}", style=f"bold {color}")
             ex_line.append(f"{fmt_number(ex_data['count']):>6} liqs", style="white")
             ex_line.append("    ", style="white")
             ex_line.append(fmt_usd(ex_data["volume_usd"]), style=f"bold {color}")
+            if method in method_tag:
+                ex_line.append(method_tag[method], style="dim yellow")
             lines.append(ex_line)
 
         return Panel(
@@ -279,19 +285,32 @@ class LiquidationStreamDashboard:
                 "---",
             )
         else:
+            any_heuristic = False
             for ev in recent:
                 ts_str = datetime.fromtimestamp(ev.timestamp, tz=timezone.utc).strftime("%H:%M:%S")
                 ex_color = EXCHANGE_COLORS.get(ev.exchange, "white")
-                exchange_text = Text(ev.exchange.capitalize(), style=f"bold {ex_color}")
+                confirmed = getattr(ev, "confirmed", True)
 
                 if ev.side == "long":
                     side_text = Text(f"{SIDE_LONG} LONG", style="bold green")
                 else:
                     side_text = Text(f"{SIDE_SHORT} SHORT", style="bold red")
 
-                size_text = Text(fmt_usd(ev.size_usd), style="bold bright_white")
+                if confirmed:
+                    exchange_text = Text(ev.exchange.capitalize(), style=f"bold {ex_color}")
+                    size_text = Text(fmt_usd(ev.size_usd), style="bold bright_white")
+                else:
+                    # Hyperliquid is inferred from large trades, not a confirmed
+                    # liquidation feed — mark it so it isn't read as fact.
+                    any_heuristic = True
+                    exchange_text = Text(f"{ev.exchange.capitalize()} ?", style=ex_color)
+                    size_text = Text(f"~{fmt_usd(ev.size_usd)}", style="bold yellow")
 
                 table.add_row(ts_str, exchange_text, ev.symbol, side_text, size_text)
+
+            if any_heuristic:
+                table.caption = "~ / ? = estimated (Hyperliquid heuristic, not a confirmed liquidation)"
+                table.caption_style = "dim yellow"
 
         return table
 

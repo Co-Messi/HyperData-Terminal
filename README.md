@@ -88,7 +88,7 @@ That's it. An interactive menu lets you pick which dashboard to view:
 | Dashboard | What it shows |
 |---|---|
 | **Liquidation Watch** | BTC positions closest to liquidation on Hyperliquid. Tracks distance-to-liquidation in real time so you can see which whales are about to get wiped. |
-| **Liquidation Stream** | Multi-exchange real-time liquidation feed from Hyperliquid, Binance, Bybit, and OKX. Every liquidation event as it happens, with size, price, and exchange. |
+| **Liquidation Stream** | Multi-exchange liquidation feed from Hyperliquid, Binance, Bybit, and OKX, with size, price, and exchange. Coverage is honest, not a complete census: OKX/Bybit are real feeds (Bybit top-15 symbols), Binance's stream is throttled to ~1 liq/symbol/sec at the source, and Hyperliquid is *inferred* from large trades (flagged as estimated). See [docs/DATA_INTEGRITY.md](docs/DATA_INTEGRITY.md). |
 | **CVD Order Flow** | Cumulative Volume Delta for BTC — see whether buyers or sellers are in control. Tracks buy volume vs sell volume from Binance WebSocket trades. |
 | **Market Overview** | Funding rates, open interest, and prices for 50 assets across exchanges. Spot divergences and funding extremes at a glance. |
 | **Liquidation Heatmap** | Price-level visualization of where liquidations are concentrated. Red bars = long liquidation risk (price drops), green bars = short liquidation risk (price rises). Like Coinglass, but free and in your terminal. |
