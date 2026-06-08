@@ -77,7 +77,18 @@ alongside per-feed `feeds` status.
 SQLite runs in WAL mode and commits on a time interval
 (`COMMIT_INTERVAL_SECONDS`, default 5s) as well as every 50 events, so an
 uncatchable crash (SIGKILL/OOM) loses at most a few seconds of events. A graceful
-exit flushes via an `atexit` handler.
+exit flushes via an `atexit` handler, and the headless server (`run_api.py`)
+installs SIGINT/SIGTERM handlers so `kill <pid>` shuts down cleanly.
+
+Old rows are pruned hourly (`DataStore.prune`, default `RETENTION_DAYS=7`) and
+the WAL is checkpointed, so the DB stays bounded on long-running instances.
+
+## API exposure
+
+The REST/WebSocket API has no authentication and permissive CORS, so it binds to
+**loopback (`127.0.0.1`) by default**. To expose it on the LAN, set
+`HYPERDATA_API_HOST=0.0.0.0` — only do this behind a trusted network. Numeric
+query params are validated (bad values return `400`, not `500`).
 
 ## Timestamps
 
