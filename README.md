@@ -43,6 +43,7 @@ Zero API keys required to get started. All exchange data comes from public WebSo
 | :globe_with_meridians: | **REST API + WebSocket** | 17+ endpoints for market data, real-time event streaming |
 | :moneybag: | **Paper Trading** | Pluggable strategy engine — real market data, fake money. Write your own strategy in ~30 lines. |
 | :robot: | **LLM Agent** | AI-powered trading decisions via any OpenAI-compatible API (GPT-4o, Llama 3, Mixtral, etc.) |
+| :white_check_mark: | **Self-Verifying Data** | Continuously cross-checks live data against Binance/Deribit and flags stale feeds — the dashboard shows ✓ LIVE / ⚠ STALE / ⚠ DRIFT, and `/v1/health` exposes it. See [docs/DATA_INTEGRITY.md](docs/DATA_INTEGRITY.md). |
 | :zap: | **Zero Config** | No API keys needed for basic functionality. `pip install` and go. |
 
 ---

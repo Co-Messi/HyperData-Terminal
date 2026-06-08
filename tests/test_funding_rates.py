@@ -39,10 +39,12 @@ def test_collector_parse_binance_response():
     assert "ETH" in collector.rates["binance"]
     btc = collector.rates["binance"]["BTC"]
     assert btc.exchange == "binance"
-    assert btc.funding_rate_hourly == pytest.approx(0.0001)
-    assert btc.funding_rate_annualized == pytest.approx(0.0001 * 8760)
+    # lastFundingRate is the per-8h rate; the collector normalizes to hourly
+    # (rate / 8) and annualizes that (hourly * 8760).
+    assert btc.funding_rate_hourly == pytest.approx(0.0001 / 8)
+    assert btc.funding_rate_annualized == pytest.approx((0.0001 / 8) * 8760)
     eth = collector.rates["binance"]["ETH"]
-    assert eth.funding_rate_hourly == pytest.approx(-0.00005)
+    assert eth.funding_rate_hourly == pytest.approx(-0.00005 / 8)
 
 
 def test_collector_parse_bybit_response():
@@ -59,7 +61,8 @@ def test_collector_parse_bybit_response():
     assert "BTC" in collector.rates["bybit"]
     btc = collector.rates["bybit"]["BTC"]
     assert btc.exchange == "bybit"
-    assert btc.funding_rate_hourly == pytest.approx(0.00015)
+    # Bybit fundingRate is also a per-8h rate → normalized to hourly.
+    assert btc.funding_rate_hourly == pytest.approx(0.00015 / 8)
 
 
 def test_collector_get_all_for_symbol():

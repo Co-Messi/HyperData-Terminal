@@ -24,9 +24,9 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _ROOT)
 sys.path.insert(0, os.path.join(_ROOT, "src"))
 
-from rich.console import Console
+from rich.console import Console  # noqa: E402  (import after sys.path setup)
 
-from src.data_layer.hub import HyperDataHub
+from src.data_layer.hub import HyperDataHub  # noqa: E402
 
 console = Console()
 

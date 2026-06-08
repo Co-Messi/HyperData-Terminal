@@ -19,7 +19,13 @@ python3 run_dashboard.py
 
 # Start headless API server
 python3 run_api.py --port 8420
+
+# Run the data-integrity verification (cross-checks live data vs Binance/Deribit)
+python3 src/verify_data.py --wait 30
 ```
+
+See `docs/DATA_INTEGRITY.md` for coverage caveats (sampled vs confirmed vs
+heuristic liquidations), the staleness watchdog, and the health checks.
 
 ## Architecture
 
