@@ -12,7 +12,7 @@ import asyncio
 import logging
 import time
 from collections import OrderedDict, deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable
 
 import aiohttp
@@ -213,6 +213,7 @@ class OrderFlowEngine:
         self._session: aiohttp.ClientSession | None = None
         self._running: bool = False
         self._task: asyncio.Task | None = None
+        self._binance_task: asyncio.Task | None = None
 
     # -- public API ---------------------------------------------------------
 
@@ -247,18 +248,15 @@ class OrderFlowEngine:
             await self._ws.close()
         if self._session and not self._session.closed:
             await self._session.close()
-        for task in [self._task, getattr(self, '_binance_task', None)]:
+        for task in [self._task, getattr(self, "_binance_task", None)]:
             if task:
                 task.cancel()
                 try:
                     await task
                 except asyncio.CancelledError:
                     pass
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
-            self._task = None
+        self._task = None
+        self._binance_task = None
         logger.info("OrderFlowEngine stopped")
 
     def on_trade(self, callback: Callable[[Trade], None]) -> None:
