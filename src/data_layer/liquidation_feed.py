@@ -37,8 +37,11 @@ def normalize_symbol(raw: str, exchange: str) -> str:
     return raw
 
 
-# Number of (top) tracked symbols we subscribe to on Bybit's allLiquidation feed.
-BYBIT_SYMBOL_LIMIT = 15
+# Tracked symbols we subscribe to on Bybit's allLiquidation feed. Bybit caps the
+# number of args per subscribe request, so we batch (see BYBIT_MAX_ARGS) rather
+# than truncate the list.
+BYBIT_SYMBOL_LIMIT = 50
+BYBIT_MAX_ARGS = 10
 # Heuristic threshold: HL has no liquidation feed, so we infer liquidations from
 # trades at least this large (USD). These are estimates, not confirmed events.
 HL_LIQUIDATION_MIN_USD = 10_000
@@ -64,8 +67,8 @@ def exchange_coverage() -> dict[str, dict[str, str]]:
         "bybit": {
             "method": "confirmed",
             "note": (
-                f"Real allLiquidation v5 feed, limited to the top "
-                f"{BYBIT_SYMBOL_LIMIT} tracked symbols."
+                f"Real allLiquidation v5 feed across the {BYBIT_SYMBOL_LIMIT} "
+                f"tracked symbols (those with a Bybit linear perp)."
             ),
         },
         "okx": {
@@ -184,7 +187,11 @@ class BybitConnection(ExchangeConnection):
 
     async def _on_connected(self, ws: aiohttp.ClientWebSocketResponse) -> None:
         topics = [f"allLiquidation.{s}USDT" for s in DEFAULT_SYMBOLS[:BYBIT_SYMBOL_LIMIT]]
-        await ws.send_json({"op": "subscribe", "args": topics})
+        # Bybit v5 limits args per subscribe request — send in chunks so we can
+        # cover the full tracked set instead of only the first handful. Topics
+        # for symbols without a Bybit linear perp just get a harmless error reply.
+        for i in range(0, len(topics), BYBIT_MAX_ARGS):
+            await ws.send_json({"op": "subscribe", "args": topics[i:i + BYBIT_MAX_ARGS]})
         logger.info("[bybit] subscribed to %d allLiquidation topics", len(topics))
 
     async def _on_message(self, data: Any) -> None:
