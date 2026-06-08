@@ -339,12 +339,15 @@ class HyperDataAPI:
             "cascade": cascade,
         })
 
-        # Alert: large liquidation cascade check
+        # Alert: large liquidation cascade check. Use CONFIRMED volume only —
+        # blended total_volume_usd is inflated by Hyperliquid's large-trade
+        # heuristic, which would fire false cascade alerts.
         stats = self.hub.liquidations.get_stats(window_minutes=10)
-        if stats.get("total_volume_usd", 0) > 5_000_000:
+        confirmed_vol = stats.get("confirmed_volume_usd", 0)
+        if confirmed_vol > 5_000_000:
             self._broadcast("alert", {
                 "type": "liq_cascade", "asset": ev.symbol,
-                "message": f"Liquidation cascade: ${stats['total_volume_usd']:,.0f} in 10min",
+                "message": f"Liquidation cascade: ${confirmed_vol:,.0f} in 10min (confirmed)",
                 "severity": "HIGH", "action": "REVIEW_POSITIONS",
             })
 

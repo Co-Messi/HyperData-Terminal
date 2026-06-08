@@ -447,6 +447,8 @@ class LiquidationFeed:
         by_symbol: dict[str, _TimeWindow] = {}
         confirmed_count = 0
         heuristic_count = 0
+        confirmed_volume_usd = 0.0
+        heuristic_volume_usd = 0.0
         _coverage = exchange_coverage()
 
         for ev in self.events:
@@ -457,8 +459,10 @@ class LiquidationFeed:
             totals.volume_usd += ev.size_usd
             if getattr(ev, "confirmed", True):
                 confirmed_count += 1
+                confirmed_volume_usd += ev.size_usd
             else:
                 heuristic_count += 1
+                heuristic_volume_usd += ev.size_usd
             if ev.side == "long":
                 totals.long_count += 1
                 totals.long_volume += ev.size_usd
@@ -482,10 +486,14 @@ class LiquidationFeed:
             "short_count": totals.short_count,
             "long_volume_usd": totals.long_volume,
             "short_volume_usd": totals.short_volume,
-            # Liquidation counts are NOT a complete census — see `coverage`.
+            # Liquidation counts/volume are NOT a complete census — see `coverage`.
             # confirmed = from real exchange feeds; heuristic = inferred (HL).
+            # Use the confirmed_* figures for anything that must not be inflated
+            # by ordinary large HL trades (e.g. cascade alerts).
             "confirmed_count": confirmed_count,
             "heuristic_count": heuristic_count,
+            "confirmed_volume_usd": confirmed_volume_usd,
+            "heuristic_volume_usd": heuristic_volume_usd,
             "coverage": _coverage,
             "by_exchange": {
                 k: {

@@ -13,13 +13,14 @@ Configure via environment variables (or .env file):
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 
 import aiohttp
 
-from .base import Strategy, Signal
+from .base import Signal, Strategy
 
 logger = logging.getLogger(__name__)
 
@@ -60,8 +61,6 @@ class LLMAgent(Strategy):
         synchronous, we use asyncio to run the coroutine. If you're
         already in an async context, see _async_evaluate() directly.
         """
-        import asyncio
-
         # If no API key and not using a local model, warn and skip
         if not self.api_key and "localhost" not in self.base_url:
             logger.warning(
@@ -262,5 +261,4 @@ class LLMAgent(Strategy):
 
     def _sync_call(self, hub) -> Signal | None:
         """Synchronous wrapper for threading fallback."""
-        import asyncio
         return asyncio.run(self._async_evaluate(hub))

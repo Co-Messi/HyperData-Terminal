@@ -30,6 +30,10 @@ DB_PATH = Path(__file__).resolve().parents[2] / "data" / "hyperdata.db"
 # 50-event batch counter.
 COMMIT_INTERVAL_SECONDS = 5.0
 
+# Delete rows older than this on prune(); keeps the DB (and the periodic
+# COUNT(*) on the status loop) bounded on long-running instances. 0 disables.
+RETENTION_DAYS = 7.0
+
 
 class DataStore:
     def __init__(self, db_path: str | Path = DB_PATH):
@@ -37,6 +41,10 @@ class DataStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._event_count = 0
+        # Dedicated trade counter for sampling — must NOT share the global
+        # _event_count (which is bumped by 6 unrelated event types), or the
+        # "1-in-N" sample becomes biased and get_trade_summary's xN rescale wrong.
+        self._trade_count = 0
         self._last_commit_at = 0.0
 
         # Use a local handle so the corruption-recovery path can close a
@@ -297,17 +305,55 @@ class DataStore:
     TRADE_SAMPLE_RATE = 2  # keep 1 in N trades
 
     def _save_trade(self, trade) -> None:
-        """Callback: save a trade. Saves 1 in TRADE_SAMPLE_RATE."""
-        self._event_count += 1
-        if self._event_count % self.TRADE_SAMPLE_RATE != 0:
-            return
+        """Callback: persist 1 in TRADE_SAMPLE_RATE trades.
+
+        Sampling is keyed on a dedicated trade counter (not the shared
+        _event_count), so every Nth *trade* is kept regardless of other event
+        streams — making get_trade_summary's xN rescale unbiased. All counter
+        mutation happens under the lock.
+        """
         with self._lock:
+            self._trade_count += 1
+            if self._trade_count % self.TRADE_SAMPLE_RATE != 0:
+                return
             self._conn.execute(
                 "INSERT INTO trades (timestamp, symbol, side, price, size, size_usd, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (trade.timestamp, trade.symbol, trade.side, trade.price,
                  trade.size, trade.size_usd, time.time())
             )
+            self._event_count += 1
             self._maybe_commit()
+
+    # Time-series tables that grow unbounded and are safe to age out.
+    _PRUNABLE_TABLES = (
+        "liquidations", "trades", "snapshots", "smart_money_signals",
+        "hlp_snapshots", "hlp_trades", "funding_rates",
+        "long_short_ratios", "options_data",
+    )
+
+    def prune(self, retention_days: float = RETENTION_DAYS) -> None:
+        """Delete rows older than retention_days and checkpoint the WAL.
+
+        Without this the DB and its -wal file grow forever and the periodic
+        COUNT(*) on the hub status loop becomes an ever-slower full scan under
+        the write lock. retention_days <= 0 keeps everything (WAL is still
+        checkpointed). Table names are hardcoded literals — no injection.
+        """
+        with self._lock:
+            if retention_days and retention_days > 0:
+                cutoff = time.time() - retention_days * 86400
+                for table in self._PRUNABLE_TABLES:
+                    try:
+                        self._conn.execute(f"DELETE FROM {table} WHERE timestamp < ?", (cutoff,))
+                    except sqlite3.Error:
+                        logger.exception("prune failed for %s", table)
+                self._conn.commit()
+                self._last_commit_at = time.time()
+            # Truncate the WAL so it can't grow without bound.
+            try:
+                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except sqlite3.Error:
+                logger.exception("wal_checkpoint failed")
 
     def flush(self) -> None:
         """Force commit any pending writes."""

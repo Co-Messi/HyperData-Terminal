@@ -535,6 +535,13 @@ class HyperDataHub:
             self.store.maybe_save_hlp_snapshot()
 
             _db_tick += 1
+            # Prune old rows + checkpoint the WAL roughly hourly so the DB and
+            # the COUNT(*) below stay bounded on long-running instances.
+            if _db_tick % 3600 == 0:
+                try:
+                    self.store.prune()
+                except Exception:
+                    logger.exception("Error pruning DB")
             # Update persistence stats every 30 seconds
             if _db_tick % 30 == 0:
                 try:
