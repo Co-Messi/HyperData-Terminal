@@ -27,6 +27,11 @@ DEFAULT_DEPTH = 50
 IMBALANCE_DEPTH = 10  # Use top 10 levels for imbalance calculation
 DEFAULT_SYMBOLS = ["BTC", "ETH", "SOL", "DOGE", "XRP", "AVAX", "LINK", "ARB", "WIF", "SUI"]
 
+# Orderbook snapshots are pushed continuously; if we go this long without any
+# l2Book message the feed is considered stale (a half-open socket would
+# otherwise keep serving a frozen book as if it were live).
+STALE_AFTER_SECONDS = 15.0
+
 
 @dataclass
 class OrderBookLevel:
@@ -44,6 +49,7 @@ class OrderBookSnapshot:
     best_bid: float
     best_ask: float
     spread: float
+    stale: bool = False         # True if the book hasn't updated within STALE_AFTER_SECONDS
 
 
 def compute_imbalance(
@@ -73,6 +79,10 @@ class OrderBookEngine:
         }
         # Latest snapshot per symbol
         self.snapshots: dict[str, OrderBookSnapshot] = {}
+
+        # Wall-clock time the last valid l2Book message was processed. Used by
+        # the hub's staleness watchdog; 0.0 means "no data received yet".
+        self.last_message_at: float = 0.0
 
         self._task: asyncio.Task | None = None
         self._snapshot_task: asyncio.Task | None = None
@@ -108,7 +118,21 @@ class OrderBookEngine:
     # ── Public API ───────────────────────────────────────────────
 
     def get_snapshot(self, symbol: str) -> OrderBookSnapshot | None:
-        return self.snapshots.get(symbol.upper())
+        snap = self.snapshots.get(symbol.upper())
+        if snap is not None:
+            # Recompute staleness at read time so the flag keeps tracking age
+            # even when no new books arrive (a frozen feed must read as stale).
+            snap.stale = self.data_age() > STALE_AFTER_SECONDS
+        return snap
+
+    def data_age(self, now: float | None = None) -> float:
+        """Seconds since the last l2Book message (inf if none received yet)."""
+        if self.last_message_at <= 0:
+            return float("inf")
+        return (now if now is not None else time.time()) - self.last_message_at
+
+    def is_stale(self, now: float | None = None) -> bool:
+        return self.data_age(now) > STALE_AFTER_SECONDS
 
     # ── Book update (public for testability) ─────────────────────
 
@@ -132,6 +156,7 @@ class OrderBookEngine:
         self.books[symbol]["bids"] = bids
         self.books[symbol]["asks"] = asks
         self.books[symbol]["updated_at"] = time.time()
+        self.last_message_at = self.books[symbol]["updated_at"]
         self._build_snapshot(symbol)
 
     def _build_snapshot(self, symbol: str) -> None:
@@ -152,6 +177,7 @@ class OrderBookEngine:
             best_bid=best_bid,
             best_ask=best_ask,
             spread=spread,
+            stale=False,
         )
 
     def _handle_message(self, data: dict) -> None:
@@ -180,7 +206,10 @@ class OrderBookEngine:
     async def _connect_and_listen(self) -> None:
         self._session = aiohttp.ClientSession()
         try:
-            self._ws = await self._session.ws_connect(WS_URL)
+            # heartbeat=20 makes aiohttp ping the server and raise on a missing
+            # pong, so a half-open TCP connection triggers reconnect instead of
+            # silently serving a frozen orderbook.
+            self._ws = await self._session.ws_connect(WS_URL, heartbeat=20)
             for sym in self.symbols:
                 await self._ws.send_json({
                     "method": "subscribe",
@@ -205,6 +234,19 @@ class OrderBookEngine:
         """Log imbalance snapshots every 5s (dashboards read from self.snapshots directly)."""
         while self._running:
             try:
+                # Watchdog: if the socket is open but no l2Book message has
+                # arrived for well past the stale threshold, the connection is
+                # likely dead-but-not-erroring — force-close it so _run_forever
+                # re-establishes via its backoff loop. (heartbeat handles most
+                # half-open cases; this covers a live socket that stops sending.)
+                if self.last_message_at > 0 and self.data_age() > STALE_AFTER_SECONDS * 2:
+                    if self._ws is not None and not self._ws.closed:
+                        logger.warning(
+                            "[orderbook] no data for %.0fs — forcing reconnect",
+                            self.data_age(),
+                        )
+                        await self._ws.close()
+
                 for symbol in self.symbols:
                     snap = self.snapshots.get(symbol)
                     if snap:

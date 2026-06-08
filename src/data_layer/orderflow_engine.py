@@ -23,6 +23,11 @@ logger = logging.getLogger(__name__)
 
 WS_URL = "wss://api.hyperliquid.xyz/ws"
 
+# Liquid majors trade many times per second; if no trade arrives from either
+# venue for this long the order-flow feed is treated as stale rather than
+# letting frozen CVD/OFI numbers read as live.
+STALE_AFTER_SECONDS = 30.0
+
 TIMEFRAME_WINDOWS: dict[str, int] = {
     "1m": 60,
     "5m": 300,
@@ -179,6 +184,11 @@ class OrderFlowEngine:
             s: deque(maxlen=100) for s in self.symbols
         }
 
+        # Wall-clock time of the last trade processed from each venue. Used by
+        # the staleness watchdog; 0.0 means "nothing received yet".
+        self.last_hl_message_at: float = 0.0
+        self.last_binance_message_at: float = 0.0
+
         self._callbacks: list[Callable[[Trade], None]] = []
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._session: aiohttp.ClientSession | None = None
@@ -186,6 +196,20 @@ class OrderFlowEngine:
         self._task: asyncio.Task | None = None
 
     # -- public API ---------------------------------------------------------
+
+    @property
+    def last_message_at(self) -> float:
+        """Most recent trade time across both venues (HL + Binance)."""
+        return max(self.last_hl_message_at, self.last_binance_message_at)
+
+    def data_age(self, now: float | None = None) -> float:
+        """Seconds since the last trade from any venue (inf if none yet)."""
+        if self.last_message_at <= 0:
+            return float("inf")
+        return (now if now is not None else time.time()) - self.last_message_at
+
+    def is_stale(self, now: float | None = None) -> bool:
+        return self.data_age(now) > STALE_AFTER_SECONDS
 
     async def start(self) -> None:
         """Open WebSocket(s), subscribe, and begin processing in background."""
@@ -361,7 +385,9 @@ class OrderFlowEngine:
         """Single connection lifecycle: connect, subscribe, read messages."""
         self._session = aiohttp.ClientSession()
         try:
-            self._ws = await self._session.ws_connect(WS_URL)
+            # heartbeat=20 so a half-open HL socket raises instead of silently
+            # freezing the CVD buckets (the other venue/socket already does this).
+            self._ws = await self._session.ws_connect(WS_URL, heartbeat=20)
             logger.info("WebSocket connected to %s", WS_URL)
 
             # Subscribe to trades for every symbol.
@@ -400,6 +426,7 @@ class OrderFlowEngine:
         if not trades_raw:
             return
 
+        self.last_hl_message_at = time.time()
         for t in trades_raw:
             try:
                 price = float(t["px"])
@@ -472,6 +499,7 @@ class OrderFlowEngine:
         if not data:
             return
 
+        self.last_binance_message_at = time.time()
         try:
             binance_sym = data.get("s", "")
             symbol = self._BINANCE_SYMBOL_MAP.get(binance_sym)
