@@ -79,6 +79,9 @@ class SpotPriceCollector:
     # ── Parsing (public for testability) ────────────────────────
 
     def _parse_response(self, data: list[dict], perp_prices: dict[str, float]) -> None:
+        # Binance's /api/v3/ticker/price returns only {symbol, price} — no event
+        # time — so this stamp is local fetch time by necessity, not exchange
+        # time. (Funding/liquidation/orderflow paths use real exchange time.)
         now = time.time()
         binance_to_sym = {v: k for k, v in SYMBOL_TO_BINANCE.items()}
         for item in data:

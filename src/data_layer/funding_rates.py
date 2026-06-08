@@ -100,8 +100,11 @@ class FundingRateCollector:
                     continue
                 rate = float(item["lastFundingRate"])
                 hourly = rate / 8.0  # Binance rate is per 8h interval
+                # Prefer the exchange's event time; fall back to local clock.
+                ev_ms = item.get("time")
+                ts = float(ev_ms) / 1000.0 if ev_ms else now
                 self.rates["binance"][symbol] = FundingRateSnapshot(
-                    timestamp=now,
+                    timestamp=ts,
                     exchange="binance",
                     symbol=symbol,
                     funding_rate_hourly=hourly,
@@ -112,6 +115,10 @@ class FundingRateCollector:
 
     def _parse_bybit(self, data: dict) -> None:
         now = time.time()
+        # Bybit v5 puts server time (ms) on the response envelope; per-ticker
+        # entries have no timestamp, so use the envelope time for all of them.
+        env_ms = data.get("time")
+        ts = float(env_ms) / 1000.0 if env_ms else now
         items = data.get("result", {}).get("list", [])
         for item in items:
             try:
@@ -121,7 +128,7 @@ class FundingRateCollector:
                 rate = float(item["fundingRate"])
                 hourly = rate / 8.0  # Bybit rate is per 8h interval
                 self.rates["bybit"][symbol] = FundingRateSnapshot(
-                    timestamp=now,
+                    timestamp=ts,
                     exchange="bybit",
                     symbol=symbol,
                     funding_rate_hourly=hourly,
