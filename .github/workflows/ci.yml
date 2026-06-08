@@ -46,3 +46,7 @@ jobs:
           python -c "from src.strategies import Strategy, Signal, PaperTrader; print('strategies: OK')"
           python -c "from src.strategies.llm_agent import LLMAgent; print('llm: OK')"
           python -c "from src.dashboards.liquidation_heatmap import LiquidationHeatmapDashboard; print('heatmap: OK')"
+
+      - name: Run tests
+        # test_position_scanner.py needs a live exchange connection — skip in CI.
+        run: python -m pytest tests/ -q --ignore=tests/test_position_scanner.py

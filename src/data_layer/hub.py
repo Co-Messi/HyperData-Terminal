@@ -254,7 +254,10 @@ class HyperDataHub:
         # Start REST API server if port is configured (both modes)
         if self._api_port:
             try:
-                self._api_server = HyperDataAPI(self, port=self._api_port)
+                # Loopback by default; set HYPERDATA_API_HOST=0.0.0.0 to expose
+                # on the LAN (no auth — only do this behind a trusted network).
+                api_host = os.environ.get("HYPERDATA_API_HOST", "127.0.0.1")
+                self._api_server = HyperDataAPI(self, host=api_host, port=self._api_port)
                 await self._api_server.start()
             except Exception:
                 logger.exception("Failed to start API server")

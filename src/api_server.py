@@ -91,7 +91,10 @@ class _WSClient:
 class HyperDataAPI:
     """REST API v1 + WebSocket streaming, backed by a live HyperDataHub."""
 
-    def __init__(self, hub, host: str = "0.0.0.0", port: int = 8420) -> None:
+    def __init__(self, hub, host: str = "127.0.0.1", port: int = 8420) -> None:
+        # Bind to loopback by default: the API has no auth and CORS is open, so
+        # it must not be reachable from the LAN unless the operator opts in
+        # (HYPERDATA_API_HOST=0.0.0.0). See docs/DATA_INTEGRITY.md / README.
         self.hub = hub
         self.host = host
         self.port = port
@@ -793,7 +796,8 @@ class HyperDataAPI:
         """GET /v1/public/metrics — server status and data component health."""
         return web.json_response({
             "status": "ok",
-            "uptime_seconds": time.time() - self._start_time if hasattr(self, "_start_time") else 0,
+            # self._start_time was never set — use the hub's tracked uptime.
+            "uptime_seconds": self.hub.status.uptime_seconds,
             "components": {
                 "liquidations": self.hub.liquidations is not None,
                 "orderflow": self.hub.orderflow is not None,

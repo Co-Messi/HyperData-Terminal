@@ -244,8 +244,9 @@ class LLMAgent(Strategy):
         # Recent liquidations
         try:
             liq_stats = hub.liquidations.get_stats(window_minutes=5)
-            parts.append(f"5min Liquidations: {liq_stats.get('count', 0)}")
-            parts.append(f"5min Liq Volume: ${liq_stats.get('volume_usd', 0):,.0f}")
+            # get_stats returns total_count / total_volume_usd (not count/volume_usd).
+            parts.append(f"5min Liquidations: {liq_stats.get('total_count', 0)}")
+            parts.append(f"5min Liq Volume: ${liq_stats.get('total_volume_usd', 0):,.0f}")
         except Exception:
             pass
 
