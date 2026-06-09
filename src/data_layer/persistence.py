@@ -12,6 +12,7 @@ Usage:
     store.get_liquidation_stats(hours=24)
 """
 
+import atexit
 import sqlite3
 import time
 import threading
@@ -23,6 +24,16 @@ logger = logging.getLogger(__name__)
 
 DB_PATH = Path(__file__).resolve().parents[2] / "data" / "hyperdata.db"
 
+# Commit at least this often (seconds) regardless of event count. Bounds the
+# worst-case data loss on an uncatchable crash (SIGKILL/OOM) to this window,
+# and ensures low-frequency tables don't sit uncommitted behind the shared
+# 50-event batch counter.
+COMMIT_INTERVAL_SECONDS = 5.0
+
+# Delete rows older than this on prune(); keeps the DB (and the periodic
+# COUNT(*) on the status loop) bounded on long-running instances. 0 disables.
+RETENTION_DAYS = 7.0
+
 
 class DataStore:
     def __init__(self, db_path: str | Path = DB_PATH):
@@ -30,16 +41,26 @@ class DataStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._event_count = 0
+        # Dedicated trade counter for sampling — must NOT share the global
+        # _event_count (which is bumped by 6 unrelated event types), or the
+        # "1-in-N" sample becomes biased and get_trade_summary's xN rescale wrong.
+        self._trade_count = 0
+        self._last_commit_at = 0.0
 
+        # Use a local handle so the corruption-recovery path can close a
+        # half-opened connection without assuming self._conn was ever assigned.
+        conn = None
         try:
-            self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False, timeout=10)
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA synchronous=NORMAL")
-            self._conn.execute("PRAGMA integrity_check")
+            conn = sqlite3.connect(str(self.db_path), check_same_thread=False, timeout=10)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA integrity_check")
+            self._conn = conn
             self._init_tables()
         except sqlite3.DatabaseError:
             logger.warning("Database corrupted at %s — recreating", self.db_path)
-            self._conn.close()
+            if conn is not None:
+                conn.close()
             # Remove corrupted db and WAL/SHM files
             for suffix in ("", "-wal", "-shm"):
                 p = Path(str(self.db_path) + suffix)
@@ -49,6 +70,30 @@ class DataStore:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
             self._init_tables()
+
+        # Safety net for graceful exits (normal return, unhandled exception,
+        # Ctrl-C → KeyboardInterrupt unwinds to interpreter exit). The
+        # time-based commit above covers uncatchable kills.
+        atexit.register(self._atexit_flush)
+
+    def _maybe_commit(self) -> None:
+        """Commit when 50 events have accrued OR COMMIT_INTERVAL has elapsed.
+
+        Caller MUST already hold ``self._lock`` (threading.Lock is not
+        reentrant). Replaces the old fixed every-50-events commit so a slow
+        table is still flushed within COMMIT_INTERVAL_SECONDS.
+        """
+        now = time.time()
+        if self._event_count % 50 == 0 or (now - self._last_commit_at) >= COMMIT_INTERVAL_SECONDS:
+            self._conn.commit()
+            self._last_commit_at = now
+
+    def _atexit_flush(self) -> None:
+        """Best-effort flush registered with atexit; never raises."""
+        try:
+            self.flush()
+        except Exception:
+            pass
 
     def _init_tables(self):
         """Create tables if they don't exist."""
@@ -255,29 +300,66 @@ class DataStore:
             )
             self._event_count += 1
             # Batch commit every 50 events for performance
-            if self._event_count % 50 == 0:
-                self._conn.commit()
+            self._maybe_commit()
 
     TRADE_SAMPLE_RATE = 2  # keep 1 in N trades
 
     def _save_trade(self, trade) -> None:
-        """Callback: save a trade. Saves 1 in TRADE_SAMPLE_RATE."""
-        self._event_count += 1
-        if self._event_count % self.TRADE_SAMPLE_RATE != 0:
-            return
+        """Callback: persist 1 in TRADE_SAMPLE_RATE trades.
+
+        Sampling is keyed on a dedicated trade counter (not the shared
+        _event_count), so every Nth *trade* is kept regardless of other event
+        streams — making get_trade_summary's xN rescale unbiased. All counter
+        mutation happens under the lock.
+        """
         with self._lock:
+            self._trade_count += 1
+            if self._trade_count % self.TRADE_SAMPLE_RATE != 0:
+                return
             self._conn.execute(
                 "INSERT INTO trades (timestamp, symbol, side, price, size, size_usd, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (trade.timestamp, trade.symbol, trade.side, trade.price,
                  trade.size, trade.size_usd, time.time())
             )
-            if self._event_count % 50 == 0:
+            self._event_count += 1
+            self._maybe_commit()
+
+    # Time-series tables that grow unbounded and are safe to age out.
+    _PRUNABLE_TABLES = (
+        "liquidations", "trades", "snapshots", "smart_money_signals",
+        "hlp_snapshots", "hlp_trades", "funding_rates",
+        "long_short_ratios", "options_data",
+    )
+
+    def prune(self, retention_days: float = RETENTION_DAYS) -> None:
+        """Delete rows older than retention_days and checkpoint the WAL.
+
+        Without this the DB and its -wal file grow forever and the periodic
+        COUNT(*) on the hub status loop becomes an ever-slower full scan under
+        the write lock. retention_days <= 0 keeps everything (WAL is still
+        checkpointed). Table names are hardcoded literals — no injection.
+        """
+        with self._lock:
+            if retention_days and retention_days > 0:
+                cutoff = time.time() - retention_days * 86400
+                for table in self._PRUNABLE_TABLES:
+                    try:
+                        self._conn.execute(f"DELETE FROM {table} WHERE timestamp < ?", (cutoff,))
+                    except sqlite3.Error:
+                        logger.exception("prune failed for %s", table)
                 self._conn.commit()
+                self._last_commit_at = time.time()
+            # Truncate the WAL so it can't grow without bound.
+            try:
+                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except sqlite3.Error:
+                logger.exception("wal_checkpoint failed")
 
     def flush(self) -> None:
         """Force commit any pending writes."""
         with self._lock:
             self._conn.commit()
+            self._last_commit_at = time.time()
 
     def close(self) -> None:
         """Close the database connection."""
@@ -379,8 +461,7 @@ class DataStore:
                  signal.signal_type, time.time()),
             )
             self._event_count += 1
-            if self._event_count % 50 == 0:
-                self._conn.commit()
+            self._maybe_commit()
 
     def save_wallet(self, profile) -> None:
         """Save or update a wallet profile."""
@@ -475,8 +556,7 @@ class DataStore:
                  time.time()),
             )
             self._event_count += 1
-            if self._event_count % 50 == 0:
-                self._conn.commit()
+            self._maybe_commit()
 
     def save_hlp_snapshot(self, snapshot) -> None:
         """Save an HLP snapshot (call periodically, e.g. every 5th snapshot)."""
@@ -597,8 +677,7 @@ class DataStore:
                  snap.funding_rate_hourly, snap.funding_rate_annualized, time.time()),
             )
             self._event_count += 1
-            if self._event_count % 50 == 0:
-                self._conn.commit()
+            self._maybe_commit()
 
     def get_funding_rates(self, exchange: str | None = None, symbol: str | None = None,
                           hours: float = 24, limit: int = 500) -> list[dict]:
@@ -629,8 +708,7 @@ class DataStore:
                 (snap.timestamp, snap.symbol, snap.long_ratio, snap.short_ratio, snap.long_short_ratio, time.time()),
             )
             self._event_count += 1
-            if self._event_count % 50 == 0:
-                self._conn.commit()
+            self._maybe_commit()
 
     def get_long_short_ratios(self, symbol: str | None = None, hours: float = 24, limit: int = 200) -> list[dict]:
         cutoff = time.time() - (hours * 3600)
@@ -657,8 +735,7 @@ class DataStore:
                 (snap.timestamp, snap.underlying, snap.mark_iv, snap.bid_iv, snap.ask_iv, snap.oi_usd, snap.index_price, time.time()),
             )
             self._event_count += 1
-            if self._event_count % 50 == 0:
-                self._conn.commit()
+            self._maybe_commit()
 
     def get_options_data(self, underlying: str | None = None, hours: float = 24, limit: int = 200) -> list[dict]:
         """Get historical Deribit IV snapshots."""

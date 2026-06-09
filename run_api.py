@@ -5,11 +5,12 @@ Usage:
     python3 run_api.py              # default port 8420
     python3 run_api.py --port 8420  # explicit port
 """
-import asyncio
 import argparse
+import asyncio
 import logging
 import logging.handlers
 import os
+import signal
 import sys
 from pathlib import Path
 
@@ -17,7 +18,7 @@ _ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _ROOT)
 sys.path.insert(0, os.path.join(_ROOT, "src"))
 
-from src.data_layer.hub import HyperDataHub
+from src.data_layer.hub import HyperDataHub  # noqa: E402  (import after sys.path setup)
 
 
 def main():
@@ -38,10 +39,20 @@ def main():
         hub = HyperDataHub(demo=False, api_port=args.port)
         await hub.start()
         logging.getLogger(__name__).info("HyperData API running on port %d (headless)", args.port)
+
+        # Wait for SIGINT/SIGTERM so `kill <pid>` (what process managers send)
+        # triggers a clean hub.stop() — flushing persistence and closing
+        # sockets — instead of dropping unflushed writes on default SIGTERM.
+        stop = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, stop.set)
+            except NotImplementedError:
+                pass  # add_signal_handler is unavailable on Windows
         try:
-            while True:
-                await asyncio.sleep(60)
-        except (KeyboardInterrupt, asyncio.CancelledError):
+            await stop.wait()
+        except asyncio.CancelledError:
             pass
         finally:
             await hub.stop()

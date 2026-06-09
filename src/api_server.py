@@ -75,6 +75,40 @@ async def cors_middleware(request: web.Request, handler):
     return resp
 
 
+def _int_param(request: web.Request, name: str, default: int,
+               minimum: int | None = None, maximum: int | None = None) -> int:
+    """Parse an int query param → 400 on garbage (not an uncaught 500), clamped."""
+    raw = request.query.get(name)
+    if raw is None:
+        return default
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        raise web.HTTPBadRequest(reason=f"'{name}' must be an integer")
+    if minimum is not None:
+        val = max(val, minimum)
+    if maximum is not None:
+        val = min(val, maximum)
+    return val
+
+
+def _float_param(request: web.Request, name: str, default: float,
+                 minimum: float | None = None, maximum: float | None = None) -> float:
+    """Parse a float query param → 400 on garbage, clamped."""
+    raw = request.query.get(name)
+    if raw is None:
+        return default
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        raise web.HTTPBadRequest(reason=f"'{name}' must be a number")
+    if minimum is not None:
+        val = max(val, minimum)
+    if maximum is not None:
+        val = min(val, maximum)
+    return val
+
+
 # ── WebSocket client tracker ─────────────────────────────────────────────
 
 class _WSClient:
@@ -91,7 +125,10 @@ class _WSClient:
 class HyperDataAPI:
     """REST API v1 + WebSocket streaming, backed by a live HyperDataHub."""
 
-    def __init__(self, hub, host: str = "0.0.0.0", port: int = 8420) -> None:
+    def __init__(self, hub, host: str = "127.0.0.1", port: int = 8420) -> None:
+        # Bind to loopback by default: the API has no auth and CORS is open, so
+        # it must not be reachable from the LAN unless the operator opts in
+        # (HYPERDATA_API_HOST=0.0.0.0). See docs/DATA_INTEGRITY.md / README.
         self.hub = hub
         self.host = host
         self.port = port
@@ -336,12 +373,15 @@ class HyperDataAPI:
             "cascade": cascade,
         })
 
-        # Alert: large liquidation cascade check
+        # Alert: large liquidation cascade check. Use CONFIRMED volume only —
+        # blended total_volume_usd is inflated by Hyperliquid's large-trade
+        # heuristic, which would fire false cascade alerts.
         stats = self.hub.liquidations.get_stats(window_minutes=10)
-        if stats.get("total_volume_usd", 0) > 5_000_000:
+        confirmed_vol = stats.get("confirmed_volume_usd", 0)
+        if confirmed_vol > 5_000_000:
             self._broadcast("alert", {
                 "type": "liq_cascade", "asset": ev.symbol,
-                "message": f"Liquidation cascade: ${stats['total_volume_usd']:,.0f} in 10min",
+                "message": f"Liquidation cascade: ${confirmed_vol:,.0f} in 10min (confirmed)",
                 "severity": "HIGH", "action": "REVIEW_POSITIONS",
             })
 
@@ -471,8 +511,29 @@ class HyperDataAPI:
         s = self.hub.status
         uptime = int(s.uptime_seconds)
         h, m = uptime // 3600, (uptime % 3600) // 60
+
+        # Continuous self-verification result (None until the first run).
+        data_health = None
+        monitor = getattr(self.hub, "health", None)
+        if monitor is not None:
+            data_health = monitor.latest()
+
+        # Per-feed connection/staleness state (see the staleness watchdog).
+        feeds = {
+            "liquidation_feed": s.liquidation_feed,
+            "orderflow_engine": s.orderflow_engine,
+            "orderbook_feed": s.orderbook_feed,
+            "market_data": s.market_data,
+            "hlp": s.hlp_status,
+        }
+
+        # Top-level status reflects data health when available: 'ok' only when
+        # nothing is stale/drifting. 'degraded' otherwise (server is still up).
+        overall = data_health.get("overall") if data_health else None
+        status = "ok" if overall in (None, "ok", "warn") else "degraded"
+
         return web.json_response({
-            "status": "ok",
+            "status": status,
             "version": "1.0.0",
             "mode": s.mode,
             "uptime": f"{h}h {m}m",
@@ -482,11 +543,13 @@ class HyperDataAPI:
             "tracked_assets": s.tracked_assets,
             "tracked_positions": s.tracked_positions,
             "ws_clients": len(self._ws_clients),
+            "feeds": feeds,
+            "data_health": data_health,
             "docs": "https://github.com/siewbrayden/hyperdata-terminal",
         })
 
     async def handle_market(self, request: web.Request) -> web.Response:
-        limit = int(request.query.get("limit", "50"))
+        limit = _int_param(request, "limit", 50, minimum=1, maximum=1000)
         assets = self.hub.get_all_assets()[:limit]
         data = []
         for a in assets:
@@ -534,9 +597,9 @@ class HyperDataAPI:
         })
 
     async def handle_liquidations(self, request: web.Request) -> web.Response:
-        limit = int(request.query.get("limit", "100"))
+        limit = _int_param(request, "limit", 100, minimum=1, maximum=1000)
         exchange = request.query.get("exchange")
-        minutes = int(request.query.get("minutes", "60"))
+        minutes = _int_param(request, "minutes", 60, minimum=1, maximum=10080)
         events = self.hub.liquidations.get_recent(minutes=minutes, exchange=exchange)[:limit]
         data = []
         for ev in events:
@@ -549,7 +612,7 @@ class HyperDataAPI:
         return web.json_response({"count": len(data), "events": data})
 
     async def handle_liquidation_stats(self, request: web.Request) -> web.Response:
-        minutes = int(request.query.get("minutes", "60"))
+        minutes = _int_param(request, "minutes", 60, minimum=1, maximum=10080)
         stats = self.hub.liquidations.get_stats(window_minutes=minutes)
         return web.json_response(stats)
 
@@ -612,7 +675,7 @@ class HyperDataAPI:
         return web.json_response(data)
 
     async def handle_smart_money_rankings(self, request: web.Request) -> web.Response:
-        n = int(request.query.get("limit", "20"))
+        n = _int_param(request, "limit", 20, minimum=1, maximum=500)
         smart = self.hub.get_smart_money(n)
         dumb = self.hub.get_dumb_money(n)
         stats = self.hub.smart_money.get_stats()
@@ -639,7 +702,7 @@ class HyperDataAPI:
         })
 
     async def handle_smart_money_signals(self, request: web.Request) -> web.Response:
-        n = int(request.query.get("limit", "50"))
+        n = _int_param(request, "limit", 50, minimum=1, maximum=500)
         signals = self.hub.get_smart_money_signals(n)
         return web.json_response({
             "count": len(signals),
@@ -661,8 +724,8 @@ class HyperDataAPI:
         })
 
     async def handle_whales(self, request: web.Request) -> web.Response:
-        min_size = float(request.query.get("min_size", "50000"))
-        limit = int(request.query.get("limit", "20"))
+        min_size = _float_param(request, "min_size", 50000.0, minimum=0.0)
+        limit = _int_param(request, "limit", 20, minimum=1, maximum=500)
         whales = self.hub.get_whale_positions(min_size_usd=min_size)[:limit]
         return web.json_response({
             "count": len(whales),
@@ -670,7 +733,7 @@ class HyperDataAPI:
         })
 
     async def handle_danger_zone(self, request: web.Request) -> web.Response:
-        threshold = float(request.query.get("threshold", "5.0"))
+        threshold = _float_param(request, "threshold", 5.0, minimum=0.0, maximum=100.0)
         positions = self.hub.positions.get_danger_zone(threshold_pct=threshold)
         return web.json_response({
             "threshold_pct": threshold,
@@ -770,7 +833,8 @@ class HyperDataAPI:
         """GET /v1/public/metrics — server status and data component health."""
         return web.json_response({
             "status": "ok",
-            "uptime_seconds": time.time() - self._start_time if hasattr(self, "_start_time") else 0,
+            # self._start_time was never set — use the hub's tracked uptime.
+            "uptime_seconds": self.hub.status.uptime_seconds,
             "components": {
                 "liquidations": self.hub.liquidations is not None,
                 "orderflow": self.hub.orderflow is not None,

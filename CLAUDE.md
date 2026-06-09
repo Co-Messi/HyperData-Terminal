@@ -19,7 +19,13 @@ python3 run_dashboard.py
 
 # Start headless API server
 python3 run_api.py --port 8420
+
+# Run the data-integrity verification (cross-checks live data vs Binance/Deribit)
+python3 src/verify_data.py --wait 30
 ```
+
+See `docs/DATA_INTEGRITY.md` for coverage caveats (sampled vs confirmed vs
+heuristic liquidations), the staleness watchdog, and the health checks.
 
 ## Architecture
 
@@ -56,7 +62,7 @@ Components: liquidation_feed (4 exchanges), orderflow_engine (CVD), position_sca
 
 - **Persistent aiohttp sessions**: Components create `aiohttp.ClientSession()` in `start()`, close in `stop()`. Never create sessions per-request.
 - **WebSocket broadcast**: `_broadcast()` iterates client list copy, uses `_safe_send()` with 2-second timeout. Dead clients removed immediately.
-- **Live only**: All data comes from real exchange WebSocket feeds. No synthetic/demo mode.
+- **Live by default**: Both product entry points (`run_dashboard.py`, `run_api.py`) run `HyperDataHub(demo=False)` — all data comes from real exchange feeds. A `demo=True` path (synthetic generators in `hub.py`) and the standalone dashboard scripts' `--live`-off mock mode exist only as offline dev/preview tools; they are not part of the shipped product and the health monitor is disabled under demo.
 - **Symbol normalization**: `normalize_symbol()` strips USDT/USD/PERP suffixes.
 
 ## External Data Sources

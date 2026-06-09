@@ -37,6 +37,55 @@ def normalize_symbol(raw: str, exchange: str) -> str:
     return raw
 
 
+# Tracked symbols we subscribe to on Bybit's allLiquidation feed. Bybit caps the
+# number of args per subscribe request, so we batch (see BYBIT_MAX_ARGS) rather
+# than truncate the list.
+BYBIT_SYMBOL_LIMIT = 50
+BYBIT_MAX_ARGS = 10
+# Heuristic threshold: HL has no liquidation feed, so we infer liquidations from
+# trades at least this large (USD). These are estimates, not confirmed events.
+HL_LIQUIDATION_MIN_USD = 10_000
+
+
+def exchange_coverage() -> dict[str, dict[str, str]]:
+    """Per-exchange description of HOW liquidations are collected, so consumers
+    never mistake a throttled/heuristic sample for a complete census.
+
+    method:
+      - "confirmed": real exchange liquidation feed (may be scope-limited)
+      - "sampled":   real feed, but throttled/undercounted at the source
+      - "heuristic": inferred (not a real liquidation feed)
+    """
+    return {
+        "binance": {
+            "method": "sampled",
+            "note": (
+                "Binance !forceOrder stream is throttled to ~1 liquidation per "
+                "symbol per second; large cascades are undercounted at the source."
+            ),
+        },
+        "bybit": {
+            "method": "confirmed",
+            "note": (
+                f"Real allLiquidation v5 feed across the {BYBIT_SYMBOL_LIMIT} "
+                f"tracked symbols (those with a Bybit linear perp)."
+            ),
+        },
+        "okx": {
+            "method": "confirmed",
+            "note": "Real liquidation-orders feed across all SWAP instruments.",
+        },
+        "hyperliquid": {
+            "method": "heuristic",
+            "note": (
+                f"Hyperliquid has no liquidation feed; events are inferred from "
+                f"trades >= ${HL_LIQUIDATION_MIN_USD:,.0f} and may include "
+                f"non-liquidation fills."
+            ),
+        },
+    }
+
+
 class ExchangeConnection:
     MAX_BACKOFF = 60.0
 
@@ -137,8 +186,12 @@ class BybitConnection(ExchangeConnection):
         )
 
     async def _on_connected(self, ws: aiohttp.ClientWebSocketResponse) -> None:
-        topics = [f"allLiquidation.{s}USDT" for s in DEFAULT_SYMBOLS[:15]]
-        await ws.send_json({"op": "subscribe", "args": topics})
+        topics = [f"allLiquidation.{s}USDT" for s in DEFAULT_SYMBOLS[:BYBIT_SYMBOL_LIMIT]]
+        # Bybit v5 limits args per subscribe request — send in chunks so we can
+        # cover the full tracked set instead of only the first handful. Topics
+        # for symbols without a Bybit linear perp just get a harmless error reply.
+        for i in range(0, len(topics), BYBIT_MAX_ARGS):
+            await ws.send_json({"op": "subscribe", "args": topics[i:i + BYBIT_MAX_ARGS]})
         logger.info("[bybit] subscribed to %d allLiquidation topics", len(topics))
 
     async def _on_message(self, data: Any) -> None:
@@ -214,7 +267,7 @@ class HyperliquidConnection:
     appear as counterparties. Also uses large trade heuristics.
     """
     API_URL = "https://api.hyperliquid.xyz/info"
-    LARGE_TRADE_USD = 10_000  # Min size to flag as potential liquidation
+    LARGE_TRADE_USD = HL_LIQUIDATION_MIN_USD  # Min size to flag as potential liquidation
     POLL_INTERVAL = 5.0
 
     def __init__(self, feed: LiquidationFeed):
@@ -352,10 +405,10 @@ class LiquidationFeed:
         logger.info("starting liquidation feed")
         self._running = True
         self._connections = [
-            BinanceConnection(self),       # Confirmed: real forceOrder feed
-            BybitConnection(self),         # Confirmed: real allLiquidation v5 feed
-            OKXConnection(self),           # Confirmed: real liquidation-orders feed
-            HyperliquidConnection(self),   # Heuristic: large trades >$10K (estimated, not confirmed)
+            BinanceConnection(self),       # Sampled: forceOrder feed throttled to ~1/symbol/sec by Binance
+            BybitConnection(self),         # Confirmed: allLiquidation v5 feed, top-N symbols only
+            OKXConnection(self),           # Confirmed: liquidation-orders feed, all SWAP
+            HyperliquidConnection(self),   # Heuristic: inferred from large trades (not confirmed)
         ]
         for conn in self._connections:
             await conn.start()
@@ -392,6 +445,11 @@ class LiquidationFeed:
         totals = _TimeWindow()
         by_exchange: dict[str, _TimeWindow] = {}
         by_symbol: dict[str, _TimeWindow] = {}
+        confirmed_count = 0
+        heuristic_count = 0
+        confirmed_volume_usd = 0.0
+        heuristic_volume_usd = 0.0
+        _coverage = exchange_coverage()
 
         for ev in self.events:
             if ev.timestamp < cutoff:
@@ -399,6 +457,12 @@ class LiquidationFeed:
 
             totals.count += 1
             totals.volume_usd += ev.size_usd
+            if getattr(ev, "confirmed", True):
+                confirmed_count += 1
+                confirmed_volume_usd += ev.size_usd
+            else:
+                heuristic_count += 1
+                heuristic_volume_usd += ev.size_usd
             if ev.side == "long":
                 totals.long_count += 1
                 totals.long_volume += ev.size_usd
@@ -422,8 +486,21 @@ class LiquidationFeed:
             "short_count": totals.short_count,
             "long_volume_usd": totals.long_volume,
             "short_volume_usd": totals.short_volume,
+            # Liquidation counts/volume are NOT a complete census — see `coverage`.
+            # confirmed = from real exchange feeds; heuristic = inferred (HL).
+            # Use the confirmed_* figures for anything that must not be inflated
+            # by ordinary large HL trades (e.g. cascade alerts).
+            "confirmed_count": confirmed_count,
+            "heuristic_count": heuristic_count,
+            "confirmed_volume_usd": confirmed_volume_usd,
+            "heuristic_volume_usd": heuristic_volume_usd,
+            "coverage": _coverage,
             "by_exchange": {
-                k: {"count": v.count, "volume_usd": v.volume_usd}
+                k: {
+                    "count": v.count,
+                    "volume_usd": v.volume_usd,
+                    "method": _coverage.get(k, {}).get("method", "unknown"),
+                }
                 for k, v in sorted(by_exchange.items())
             },
             "by_symbol": {

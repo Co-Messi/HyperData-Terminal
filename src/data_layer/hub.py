@@ -33,7 +33,12 @@ from config.settings import DEFAULT_SYMBOLS
 from src.data_layer.alerts import AlertManager
 from src.data_layer.liquidation_feed import LiquidationFeed, LiquidationEvent
 from src.data_layer.position_scanner import PositionScanner, TrackedPosition
-from src.data_layer.orderflow_engine import OrderFlowEngine, Trade, CVDSnapshot
+from src.data_layer.orderflow_engine import (
+    OrderFlowEngine,
+    Trade,
+    CVDSnapshot,
+    STALE_AFTER_SECONDS as ORDERFLOW_STALE_AFTER,
+)
 from src.data_layer.market_data import MarketData, AssetInfo
 from src.data_layer.persistence import DataStore
 from src.data_layer.smart_money import SmartMoneyEngine, SmartMoneySignal, WalletProfile
@@ -43,6 +48,7 @@ from src.data_layer.long_short_ratio import LongShortCollector, LongShortSnapsho
 from src.data_layer.orderbook import OrderBookEngine, OrderBookSnapshot
 from src.data_layer.spot_prices import SpotPriceCollector, SpotPriceSnapshot
 from src.data_layer.deribit import DeribitFeed, DeribitIVSnapshot
+from src.data_layer.health_monitor import DataHealthMonitor
 from src.api_server import HyperDataAPI
 
 logger = logging.getLogger(__name__)
@@ -59,10 +65,11 @@ class HubStatus:
     uptime_seconds: float = 0.0
     mode: str = "offline"  # 'live', 'demo', 'offline'
 
-    # Component health
-    liquidation_feed: str = "offline"   # 'connected', 'reconnecting', 'offline'
+    # Component health: 'connected', 'stale', 'reconnecting', 'offline', 'error'
+    liquidation_feed: str = "offline"
     position_scanner: str = "offline"
     orderflow_engine: str = "offline"
+    orderbook_feed: str = "offline"
     market_data: str = "offline"
 
     # Counters
@@ -152,6 +159,7 @@ class HyperDataHub:
         self.spot = SpotPriceCollector()
         self.deribit = DeribitFeed()
         self.store = DataStore()
+        self.health = DataHealthMonitor(self)
 
         # ── Status tracking ──────────────────────────────────────
         self.status = HubStatus()
@@ -246,7 +254,10 @@ class HyperDataHub:
         # Start REST API server if port is configured (both modes)
         if self._api_port:
             try:
-                self._api_server = HyperDataAPI(self, port=self._api_port)
+                # Loopback by default; set HYPERDATA_API_HOST=0.0.0.0 to expose
+                # on the LAN (no auth — only do this behind a trusted network).
+                api_host = os.environ.get("HYPERDATA_API_HOST", "127.0.0.1")
+                self._api_server = HyperDataAPI(self, host=api_host, port=self._api_port)
                 await self._api_server.start()
             except Exception:
                 logger.exception("Failed to start API server")
@@ -261,6 +272,12 @@ class HyperDataHub:
         self._tasks.append(asyncio.create_task(
             self._status_update_loop(), name="status-update"
         ))
+        # Continuous data-integrity verification against external sources.
+        # Live mode only — demo prices would always "drift" from real Binance.
+        if not self.demo:
+            self._tasks.append(asyncio.create_task(
+                self._health_monitor_loop(), name="health-monitor"
+            ))
 
         # Attach persistence layer — saves all events to SQLite
         self.store.attach(self)
@@ -321,8 +338,10 @@ class HyperDataHub:
 
         try:
             await self.orderbook.start()
+            self.status.orderbook_feed = "connected"
             logger.info("OrderBook engine: started")
         except Exception:
+            self.status.orderbook_feed = "error"
             logger.exception("Failed to start orderbook engine")
 
         try:
@@ -516,6 +535,13 @@ class HyperDataHub:
             self.store.maybe_save_hlp_snapshot()
 
             _db_tick += 1
+            # Prune old rows + checkpoint the WAL roughly hourly so the DB and
+            # the COUNT(*) below stay bounded on long-running instances.
+            if _db_tick % 3600 == 0:
+                try:
+                    self.store.prune()
+                except Exception:
+                    logger.exception("Error pruning DB")
             # Update persistence stats every 30 seconds
             if _db_tick % 30 == 0:
                 try:
@@ -563,8 +589,76 @@ class HyperDataHub:
             eth_iv = self.deribit.get_latest("ETH")
             self.status.deribit_btc_iv = btc_iv.mark_iv if btc_iv else 0.0
             self.status.deribit_eth_iv = eth_iv.mark_iv if eth_iv else 0.0
+            # ── Staleness watchdog ──────────────────────────────────
+            # Flag WS feeds that have stopped delivering data as 'stale' so the
+            # UI/API never present frozen numbers as live, and force a reconnect
+            # on a socket that's alive-but-silent (heartbeat only catches
+            # half-open connections, not a venue that quietly stops sending).
+            if not self.demo:
+                await self._update_feed_staleness()
 
             await asyncio.sleep(1)
+
+    async def _health_monitor_loop(self) -> None:
+        """Run data-integrity checks against external sources on an interval.
+
+        Caches the result on self.health for the REST API (/v1/health) and the
+        dashboard health badge to read via self.health.latest().
+        """
+        await asyncio.sleep(15)  # warm-up so feeds have data before first check
+        while self._running:
+            try:
+                await self.health.run_checks()
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("Health monitor loop error")
+            await asyncio.sleep(30)
+
+    async def _update_feed_staleness(self) -> None:
+        """Flag silent WS feeds as 'stale' and force-reconnect dead sockets.
+
+        Live mode only. A feed already in 'error'/'offline' is left alone — that
+        is a connection failure, not a data-flow stall. Liquidations are
+        intentionally NOT aged out (they are sporadic; a quiet market is not a
+        broken feed).
+        """
+        # Order flow (Hyperliquid + Binance trades).
+        if self.status.orderflow_engine in ("connected", "stale"):
+            self.status.orderflow_engine = (
+                "stale" if self.orderflow.is_stale() else "connected"
+            )
+            # Both venues silent for well past the threshold → kick the HL
+            # socket so its backoff loop rebuilds it. The Binance loop self-heals
+            # via its own heartbeat, and if Binance were still feeding, the
+            # combined data_age() would not be stale in the first place.
+            #
+            # Guarded so it only fires when we HAD data and it stopped (not
+            # during initial connect, where data_age is infinite), and debounced
+            # so a persistent outage can't spam close()/logs every status tick.
+            now = time.time()
+            cooldown = ORDERFLOW_STALE_AFTER * 2
+            had_data = self.orderflow.last_message_at > 0
+            since_last_force = now - getattr(self, "_last_of_force_reconnect", 0.0)
+            if had_data and self.orderflow.data_age() > cooldown and since_last_force > cooldown:
+                ws = self.orderflow._ws
+                if ws is not None and not ws.closed:
+                    self._last_of_force_reconnect = now
+                    logger.warning(
+                        "[hub] order flow silent %.0fs — forcing HL reconnect",
+                        self.orderflow.data_age(),
+                    )
+                    try:
+                        await ws.close()
+                    except Exception:
+                        pass
+
+        # Orderbook (HL l2Book) — the engine's own watchdog forces reconnects,
+        # so here we only reflect freshness into the status.
+        if self.status.orderbook_feed in ("connected", "stale"):
+            self.status.orderbook_feed = (
+                "stale" if self.orderbook.is_stale() else "connected"
+            )
 
     # ── Demo data generators ──────────────────────────────────────
 
