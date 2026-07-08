@@ -46,6 +46,10 @@ BYBIT_MAX_ARGS = 10
 # trades at least this large (USD). These are estimates, not confirmed events.
 HL_LIQUIDATION_MIN_USD = 10_000
 
+# Deadline for REST polls (price context); a hung endpoint must not wedge the
+# poll loop. Split connect/read so a slow handshake can't eat the budget.
+HTTP_TIMEOUT = aiohttp.ClientTimeout(total=10, connect=3, sock_connect=3, sock_read=5)
+
 
 def exchange_coverage() -> dict[str, dict[str, str]]:
     """Per-exchange description of HOW liquidations are collected, so consumers
@@ -88,6 +92,12 @@ def exchange_coverage() -> dict[str, dict[str, str]]:
 
 class ExchangeConnection:
     MAX_BACKOFF = 60.0
+    # After this many consecutive failed connections, escalate once to ERROR
+    # and demote further reconnect chatter to debug. We deliberately keep
+    # retrying (at MAX_BACKOFF) rather than stopping: a market-data feed that
+    # permanently kills itself during a long venue outage never recovers,
+    # and one handshake per minute is negligible load.
+    FAILURE_ESCALATION_THRESHOLD = 20
 
     def __init__(self, name: str, ws_url: str, feed: LiquidationFeed):
         self.name = name
@@ -98,6 +108,7 @@ class ExchangeConnection:
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._running = False
         self._backoff = 1.0
+        self.consecutive_failures = 0
 
     async def start(self) -> None:
         self._running = True
@@ -124,6 +135,7 @@ class ExchangeConnection:
                 async with self._session.ws_connect(self.ws_url, heartbeat=20) as ws:
                     self._ws = ws
                     self._backoff = 1.0
+                    self.consecutive_failures = 0
                     logger.info("[%s] connected", self.name)
                     await self._on_connected(ws)
                     async for msg in ws:
@@ -135,10 +147,22 @@ class ExchangeConnection:
             except asyncio.CancelledError:
                 return
             except Exception:
-                logger.exception("[%s] connection error", self.name)
+                self.consecutive_failures += 1
+                if self.consecutive_failures == self.FAILURE_ESCALATION_THRESHOLD:
+                    logger.error(
+                        "[%s] %d consecutive connection failures — endpoint looks "
+                        "dead/deprecated; will keep retrying every %.0fs quietly",
+                        self.name, self.consecutive_failures, self.MAX_BACKOFF,
+                    )
+                elif self.consecutive_failures < self.FAILURE_ESCALATION_THRESHOLD:
+                    logger.exception("[%s] connection error", self.name)
+                else:
+                    logger.debug("[%s] connection error (%d consecutive)",
+                                 self.name, self.consecutive_failures)
 
             if self._running:
-                logger.info("[%s] reconnecting in %.1fs", self.name, self._backoff)
+                if self.consecutive_failures < self.FAILURE_ESCALATION_THRESHOLD:
+                    logger.info("[%s] reconnecting in %.1fs", self.name, self._backoff)
                 await asyncio.sleep(self._backoff)
                 self._backoff = min(self._backoff * 2, self.MAX_BACKOFF)
 
@@ -158,20 +182,32 @@ class BinanceConnection(ExchangeConnection):
         )
 
     async def _on_message(self, data: Any) -> None:
-        if isinstance(data, dict) and data.get("e") == "forceOrder":
-            o = data["o"]
-            price = float(o["p"])
-            qty = float(o["q"])
-            side_raw = o["S"].upper()
-            event = LiquidationEvent(
-                timestamp=o["T"] / 1000.0,
-                exchange="binance",
-                symbol=normalize_symbol(o["s"], "binance"),
-                side="long" if side_raw == "SELL" else "short",
-                size_usd=price * qty,
-                price=price,
-                quantity=qty,
-            )
+        # `!forceOrder@arr` frames normally carry one object, but the `@arr`
+        # family can batch events into a JSON array — handle both shapes so
+        # an array frame is parsed instead of silently failing a dict check.
+        records = data if isinstance(data, list) else [data]
+        for rec in records:
+            if not isinstance(rec, dict) or rec.get("e") != "forceOrder":
+                continue
+            # Exchange payloads are untrusted: one malformed record must not
+            # raise out of the connection loop and trigger a reconnect.
+            try:
+                o = rec["o"]
+                price = float(o["p"])
+                qty = float(o["q"])
+                side_raw = str(o["S"]).upper()
+                event = LiquidationEvent(
+                    timestamp=float(o["T"]) / 1000.0,
+                    exchange="binance",
+                    symbol=normalize_symbol(str(o["s"]), "binance"),
+                    side="long" if side_raw == "SELL" else "short",
+                    size_usd=price * qty,
+                    price=price,
+                    quantity=qty,
+                )
+            except (KeyError, TypeError, ValueError, AttributeError):
+                self.feed.record_parse_error("binance", rec)
+                continue
             await self.feed.emit(event)
 
 
@@ -197,28 +233,36 @@ class BybitConnection(ExchangeConnection):
     async def _on_message(self, data: Any) -> None:
         if not isinstance(data, dict) or "data" not in data:
             return
-        if not data.get("topic", "").startswith("allLiquidation."):
+        if not str(data.get("topic", "")).startswith("allLiquidation."):
             return
-        d = data["data"]
-        try:
-            price = float(d.get("price", 0))
-            qty = float(d.get("qty", 0) or d.get("size", 0))
-            side_raw = d.get("side", "")  # "Sell" = long liquidated; "Buy" = short liquidated
-            symbol_raw = d.get("symbol", "")
-            ts_ms = int(d.get("updatedTime", 0))
-            event = LiquidationEvent(
-                timestamp=ts_ms / 1000.0,
-                exchange="bybit",
-                symbol=normalize_symbol(symbol_raw, "bybit"),
-                side="long" if side_raw == "Sell" else "short",
-                size_usd=price * qty,
-                price=price,
-                quantity=qty,
-                confirmed=True,
-            )
+        # Bybit v5 sends `data` as a list of records (older topics used a
+        # single dict) — accept both, and drop malformed records individually
+        # so schema drift can never raise out of the WS loop and reconnect.
+        payload = data["data"]
+        records = payload if isinstance(payload, list) else [payload]
+        for d in records:
+            try:
+                # v5 allLiquidation uses short keys (p/v/S/s/T); the long
+                # names cover the legacy `liquidation` topic shape.
+                price = float(d.get("price") or d.get("p") or 0)
+                qty = float(d.get("qty") or d.get("size") or d.get("v") or 0)
+                side_raw = d.get("side") or d.get("S") or ""  # "Sell" = long liquidated
+                symbol_raw = d.get("symbol") or d.get("s") or ""
+                ts_ms = int(d.get("updatedTime") or d.get("T") or 0)
+                event = LiquidationEvent(
+                    timestamp=ts_ms / 1000.0,
+                    exchange="bybit",
+                    symbol=normalize_symbol(str(symbol_raw), "bybit"),
+                    side="long" if side_raw == "Sell" else "short",
+                    size_usd=price * qty,
+                    price=price,
+                    quantity=qty,
+                    confirmed=True,
+                )
+            except (KeyError, TypeError, ValueError, AttributeError):
+                self.feed.record_parse_error("bybit", d)
+                continue
             await self.feed.emit(event)
-        except Exception:
-            logger.debug("[bybit] failed to parse liquidation: %s", d)
 
 
 class OKXConnection(ExchangeConnection):
@@ -239,24 +283,40 @@ class OKXConnection(ExchangeConnection):
     async def _on_message(self, data: Any) -> None:
         if not isinstance(data, dict) or "data" not in data:
             return
+        if not isinstance(data["data"], list):
+            self.feed.record_parse_error("okx", data)
+            return
 
         for d in data["data"]:
-            details = d.get("details", [])
-            inst_id = d.get("instId", "")
+            # Drop malformed records individually — one bad detail must not
+            # kill the whole message or the connection loop.
+            try:
+                details = d.get("details", [])
+                inst_id = d.get("instId", "")
+                if not isinstance(details, list):
+                    self.feed.record_parse_error("okx", d)
+                    continue
+            except AttributeError:
+                self.feed.record_parse_error("okx", d)
+                continue
             for det in details:
-                price = float(det.get("bkPx", 0))
-                qty = float(det.get("sz", 0))
-                side_raw = det.get("side", "").lower()
-                ts_raw = det.get("ts", "0")
-                event = LiquidationEvent(
-                    timestamp=int(ts_raw) / 1000.0,
-                    exchange="okx",
-                    symbol=normalize_symbol(inst_id, "okx"),
-                    side="long" if side_raw == "sell" else "short",
-                    size_usd=price * qty,
-                    price=price,
-                    quantity=qty,
-                )
+                try:
+                    price = float(det.get("bkPx", 0) or 0)
+                    qty = float(det.get("sz", 0) or 0)
+                    side_raw = str(det.get("side", "")).lower()
+                    ts_raw = det.get("ts", "0") or "0"
+                    event = LiquidationEvent(
+                        timestamp=int(ts_raw) / 1000.0,
+                        exchange="okx",
+                        symbol=normalize_symbol(inst_id, "okx"),
+                        side="long" if side_raw == "sell" else "short",
+                        size_usd=price * qty,
+                        price=price,
+                        quantity=qty,
+                    )
+                except (KeyError, TypeError, ValueError, AttributeError):
+                    self.feed.record_parse_error("okx", det)
+                    continue
                 await self.feed.emit(event)
 
 
@@ -302,17 +362,25 @@ class HyperliquidConnection:
 
     async def _price_poll(self) -> None:
         """Poll mid prices to have context for liquidation detection."""
+        consecutive_failures = 0
         while self._running:
             try:
                 async with self._session.post(
-                    self.API_URL, json={"type": "allMids"}
+                    self.API_URL, json={"type": "allMids"}, timeout=HTTP_TIMEOUT
                 ) as resp:
                     if resp.status == 200:
                         self._mid_prices = {k: float(v) for k, v in (await resp.json()).items()}
+                        consecutive_failures = 0
             except asyncio.CancelledError:
                 return
             except Exception:
-                pass
+                consecutive_failures += 1
+                # Silent-pass hid outages for hours; warn once it looks real.
+                if consecutive_failures in (3, 10) or consecutive_failures % 100 == 0:
+                    logger.warning(
+                        "[hyperliquid] price poll failing (%d consecutive)",
+                        consecutive_failures, exc_info=True,
+                    )
             await asyncio.sleep(self.POLL_INTERVAL)
 
     async def _ws_loop(self) -> None:
@@ -351,18 +419,23 @@ class HyperliquidConnection:
         Heuristic: Large trades that move price aggressively are likely liquidations.
         """
         for t in trades:
-            tid = t.get("tid", 0)
-            if tid in self._seen_tids:
-                continue
-            self._seen_tids[tid] = None
-            while len(self._seen_tids) > 100_000:
-                self._seen_tids.popitem(last=False)  # Remove oldest
+            try:
+                tid = t.get("tid", 0)
+                if tid in self._seen_tids:
+                    continue
+                self._seen_tids[tid] = None
+                while len(self._seen_tids) > 100_000:
+                    self._seen_tids.popitem(last=False)  # Remove oldest
 
-            coin = t.get("coin", "")
-            price = float(t.get("px", 0))
-            qty = float(t.get("sz", 0))
+                coin = t.get("coin", "")
+                price = float(t.get("px", 0) or 0)
+                qty = float(t.get("sz", 0) or 0)
+                ts_ms = int(t.get("time", 0) or 0)
+                side = t.get("side", "")  # "B" = buyer taker, "A" = seller taker
+            except (TypeError, ValueError, AttributeError):
+                self.feed.record_parse_error("hyperliquid", t)
+                continue
             size_usd = price * qty
-            side = t.get("side", "")  # "B" = buyer taker, "A" = seller taker
 
             # Only flag large trades as potential liquidations
             if size_usd < self.LARGE_TRADE_USD:
@@ -371,7 +444,7 @@ class HyperliquidConnection:
             # Side logic: "A" (ask/sell taker) = someone is aggressively selling = long liquidation
             # "B" (bid/buy taker) = someone aggressively buying = short liquidation
             event = LiquidationEvent(
-                timestamp=int(t.get("time", 0)) / 1000.0,
+                timestamp=ts_ms / 1000.0,
                 exchange="hyperliquid",
                 symbol=coin,
                 side="long" if side == "A" else "short",
@@ -400,6 +473,21 @@ class LiquidationFeed:
         self._connections: list[ExchangeConnection | HyperliquidConnection] = []
         self._lock = asyncio.Lock()
         self._running = False
+        # Per-exchange count of records dropped at the parse boundary.
+        # Surfaced via get_stats() so schema drift is visible, not silent.
+        self.parse_errors: dict[str, int] = {}
+
+    def record_parse_error(self, exchange: str, payload: Any = None) -> None:
+        """Count a malformed record dropped at the parse boundary."""
+        count = self.parse_errors.get(exchange, 0) + 1
+        self.parse_errors[exchange] = count
+        # Log the first few and then sample, so a schema change is visible
+        # without a malformed-message flood drowning the logs.
+        if count <= 3 or count % 1000 == 0:
+            logger.warning(
+                "[%s] dropped malformed record (%d total): %.300s",
+                exchange, count, payload,
+            )
 
     async def start(self) -> None:
         logger.info("starting liquidation feed")
@@ -494,6 +582,7 @@ class LiquidationFeed:
             "heuristic_count": heuristic_count,
             "confirmed_volume_usd": confirmed_volume_usd,
             "heuristic_volume_usd": heuristic_volume_usd,
+            "parse_errors": dict(self.parse_errors),
             "coverage": _coverage,
             "by_exchange": {
                 k: {

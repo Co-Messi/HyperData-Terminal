@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import time
+
 import pytest
-from data_layer.deribit import DeribitIVSnapshot, DeribitFeed
+
+from data_layer.deribit import DeribitFeed, DeribitIVSnapshot
 
 
 def test_snapshot_fields():

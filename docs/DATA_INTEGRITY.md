@@ -85,10 +85,16 @@ the WAL is checkpointed, so the DB stays bounded on long-running instances.
 
 ## API exposure
 
-The REST/WebSocket API has no authentication and permissive CORS, so it binds to
-**loopback (`127.0.0.1`) by default**. To expose it on the LAN, set
-`HYPERDATA_API_HOST=0.0.0.0` — only do this behind a trusted network. Numeric
-query params are validated (bad values return `400`, not `500`).
+The REST/WebSocket API binds to **loopback (`127.0.0.1`) by default**. A
+non-loopback bind (`HYPERDATA_API_HOST=0.0.0.0`) is refused at startup unless
+either `HYPERDATA_API_KEY` is set — all non-health routes then require
+`Authorization: Bearer <key>` or `X-API-Key: <key>` — or
+`HYPERDATA_UNSAFE_PUBLIC_API=1` explicitly acknowledges the exposure. CORS is
+wildcard only on loopback; non-loopback binds send CORS headers only for
+origins allowlisted in `HYPERDATA_CORS_ORIGINS` (comma-separated). REST
+requests are rate-limited per client IP, and WebSocket clients get bounded
+per-client send queues plus inbound message size/rate limits. Numeric query
+params are validated (bad values return `400`, not `500`).
 
 ## Timestamps
 

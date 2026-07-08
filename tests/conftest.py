@@ -1,8 +1,8 @@
 """Pytest configuration and shared fixtures for HyperData tests."""
 from __future__ import annotations
 
-import sys
 import os
+import sys
 
 # Ensure project root and src/ are importable
 _PROJECT_ROOT = os.path.join(os.path.dirname(__file__), "..")

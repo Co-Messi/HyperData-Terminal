@@ -13,7 +13,7 @@ import asyncio
 import logging
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import aiohttp
 
@@ -185,7 +185,8 @@ class HLPTracker:
             # Current price from position data
             current_price = float(pos_info.get("positionValue", 0))
             if abs(size_raw) > 0:
-                current_price = abs(float(pos_info.get("positionValue", 0)) / size_raw) if size_raw != 0 else entry_price
+                current_price = (abs(float(pos_info.get("positionValue", 0)) / size_raw)
+                                 if size_raw != 0 else entry_price)
 
             unrealized_pnl = float(pos_info.get("unrealizedPnl", 0))
             leverage_info = pos_info.get("leverage", {})

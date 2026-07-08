@@ -13,12 +13,12 @@ Usage:
 """
 
 import atexit
-import sqlite3
-import time
-import threading
 import logging
+import shutil
+import sqlite3
+import threading
+import time
 from pathlib import Path
-from dataclasses import asdict
 
 logger = logging.getLogger(__name__)
 
@@ -57,19 +57,56 @@ class DataStore:
             conn.execute("PRAGMA integrity_check")
             self._conn = conn
             self._init_tables()
-        except sqlite3.DatabaseError:
-            logger.warning("Database corrupted at %s — recreating", self.db_path)
+        except sqlite3.DatabaseError as exc:
             if conn is not None:
                 conn.close()
-            # Remove corrupted db and WAL/SHM files
+            # Lock/busy contention is NOT corruption: another process (a
+            # dashboard, a verification run) holding the DB must not get the
+            # healthy database quarantined out from under it.
+            if "lock" in str(exc).lower() or "busy" in str(exc).lower():
+                logger.error(
+                    "Database at %s is locked/busy — failing startup rather "
+                    "than quarantining a healthy DB: %s", self.db_path, exc,
+                )
+                raise
+            # Quarantine, never delete: move the corrupted DB (and WAL/SHM)
+            # aside with a timestamp so history survives for postmortem and
+            # possible `.recover`, then start fresh.
+            quarantine_dir = self.db_path.parent / "corrupted"
+            quarantine_dir.mkdir(parents=True, exist_ok=True)
+            stamp = time.strftime("%Y%m%d-%H%M%S")
             for suffix in ("", "-wal", "-shm"):
                 p = Path(str(self.db_path) + suffix)
                 if p.exists():
-                    p.unlink()
-            self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False, timeout=10)
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA synchronous=NORMAL")
-            self._init_tables()
+                    dest = quarantine_dir / f"{p.name}.{stamp}"
+                    try:
+                        shutil.move(str(p), str(dest))  # handles cross-device
+                    except OSError:
+                        logger.exception("Failed to quarantine %s", p)
+                        try:
+                            p.unlink()  # last resort so we can still start
+                        except OSError:
+                            logger.exception("Could not remove %s either", p)
+            logger.error(
+                "Database corrupted at %s — quarantined to %s and recreated. "
+                "Historical data is preserved there for recovery.",
+                self.db_path, quarantine_dir,
+            )
+            try:
+                self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False, timeout=10)
+                self._conn.execute("PRAGMA journal_mode=WAL")
+                self._conn.execute("PRAGMA synchronous=NORMAL")
+                self._init_tables()
+            except sqlite3.DatabaseError:
+                # The corrupted file could not be moved OR removed (held
+                # handle, read-only mount). Run on an in-memory DB so the
+                # terminal stays alive; persistence is lost for this session.
+                logger.critical(
+                    "Could not recreate database at %s — falling back to an "
+                    "in-memory store (NO persistence this session)", self.db_path,
+                )
+                self._conn = sqlite3.connect(":memory:", check_same_thread=False)
+                self._init_tables()
 
         # Safety net for graceful exits (normal return, unhandled exception,
         # Ctrl-C → KeyboardInterrupt unwinds to interpreter exit). The
@@ -263,17 +300,53 @@ class DataStore:
                 CREATE INDEX IF NOT EXISTS idx_options_ts ON options_data(timestamp);
                 CREATE INDEX IF NOT EXISTS idx_options_underlying ON options_data(underlying);
             """)
-            # Migration: add new columns to existing tables if not present
-            for table, col, col_type in [
-                ("snapshots", "premium_pct", "REAL DEFAULT 0.0"),
-                ("snapshots", "basis_pct", "REAL DEFAULT 0.0"),
-                ("paper_trades", "funding_collected", "REAL DEFAULT 0.0"),
-            ]:
-                try:
-                    self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
-                except Exception:
-                    pass  # Column already exists
+            self._run_migrations()
             self._conn.commit()
+
+    # Bump when adding a migration below. The schema_version table lets a
+    # future release tell an old DB from a new one instead of guessing from
+    # ALTER TABLE failures.
+    SCHEMA_VERSION = 2
+
+    def _run_migrations(self) -> None:
+        """Versioned, idempotent migrations. Caller holds the lock.
+
+        Only "duplicate column" is treated as already-applied; any other
+        migration failure is a real error and is raised so the app doesn't
+        keep running against a half-migrated schema.
+        """
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS schema_version "
+            "(version INTEGER NOT NULL, applied_at REAL NOT NULL)"
+        )
+        row = self._conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
+        current = row[0] or 0
+
+        # v1: original schema (implicit for pre-versioning DBs).
+        # v2: extra columns on snapshots / paper_trades.
+        for table, col, col_type in [
+            ("snapshots", "premium_pct", "REAL DEFAULT 0.0"),
+            ("snapshots", "basis_pct", "REAL DEFAULT 0.0"),
+            ("paper_trades", "funding_collected", "REAL DEFAULT 0.0"),
+        ]:
+            try:
+                self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc).lower():
+                    logger.error("Migration failed for %s.%s: %s", table, col, exc)
+                    raise
+
+        if current < self.SCHEMA_VERSION:
+            self._conn.execute(
+                "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
+                (self.SCHEMA_VERSION, time.time()),
+            )
+
+    def get_schema_version(self) -> int:
+        """Highest applied schema version (0 for a brand-new/legacy DB)."""
+        with self._lock:
+            row = self._conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
+        return row[0] or 0
 
     def attach(self, hub) -> None:
         """Attach to a HyperDataHub — automatically persists all events."""
@@ -292,7 +365,8 @@ class DataStore:
         """Callback: save a liquidation event."""
         with self._lock:
             self._conn.execute(
-                "INSERT INTO liquidations (timestamp, exchange, symbol, side, size_usd, price, quantity, confirmed, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO liquidations (timestamp, exchange, symbol, side, size_usd, "
+                "price, quantity, confirmed, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (event.timestamp, event.exchange, event.symbol, event.side,
                  event.size_usd, event.price, event.quantity,
                  1 if getattr(event, 'confirmed', True) else 0,
@@ -317,7 +391,8 @@ class DataStore:
             if self._trade_count % self.TRADE_SAMPLE_RATE != 0:
                 return
             self._conn.execute(
-                "INSERT INTO trades (timestamp, symbol, side, price, size, size_usd, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO trades (timestamp, symbol, side, price, size, size_usd, "
+                "created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (trade.timestamp, trade.symbol, trade.side, trade.price,
                  trade.size, trade.size_usd, time.time())
             )
@@ -372,7 +447,8 @@ class DataStore:
                          symbol: str | None = None, limit: int = 1000) -> list[dict]:
         """Get historical liquidation events."""
         cutoff = time.time() - (since_hours * 3600)
-        query = "SELECT timestamp, exchange, symbol, side, size_usd, price, quantity, confirmed FROM liquidations WHERE timestamp > ?"
+        query = ("SELECT timestamp, exchange, symbol, side, size_usd, price, quantity, "
+                 "confirmed FROM liquidations WHERE timestamp > ?")
         params: list = [cutoff]
         if exchange:
             query += " AND exchange = ?"
@@ -455,7 +531,8 @@ class DataStore:
         """Callback: save a smart money signal."""
         with self._lock:
             self._conn.execute(
-                "INSERT INTO smart_money_signals (timestamp, address, tier, action, symbol, size_usd, wallet_rank, signal_type, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO smart_money_signals (timestamp, address, tier, action, symbol, "
+                "size_usd, wallet_rank, signal_type, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (signal.timestamp, signal.address, signal.tier, signal.action,
                  signal.symbol, signal.size_usd, signal.wallet_rank,
                  signal.signal_type, time.time()),
@@ -672,7 +749,8 @@ class DataStore:
         """Save a funding rate snapshot."""
         with self._lock:
             self._conn.execute(
-                "INSERT INTO funding_rates (timestamp, exchange, symbol, funding_rate_hourly, funding_rate_annualized, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO funding_rates (timestamp, exchange, symbol, funding_rate_hourly, "
+                "funding_rate_annualized, created_at) VALUES (?, ?, ?, ?, ?, ?)",
                 (snap.timestamp, snap.exchange, snap.symbol,
                  snap.funding_rate_hourly, snap.funding_rate_annualized, time.time()),
             )
@@ -683,7 +761,8 @@ class DataStore:
                           hours: float = 24, limit: int = 500) -> list[dict]:
         """Get historical funding rate snapshots."""
         cutoff = time.time() - (hours * 3600)
-        query = "SELECT timestamp, exchange, symbol, funding_rate_hourly, funding_rate_annualized FROM funding_rates WHERE timestamp > ?"
+        query = ("SELECT timestamp, exchange, symbol, funding_rate_hourly, "
+                 "funding_rate_annualized FROM funding_rates WHERE timestamp > ?")
         params: list = [cutoff]
         if exchange:
             query += " AND exchange = ?"
@@ -704,7 +783,8 @@ class DataStore:
     def save_long_short_ratio(self, snap) -> None:
         with self._lock:
             self._conn.execute(
-                "INSERT INTO long_short_ratios (timestamp, symbol, long_ratio, short_ratio, long_short_ratio, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO long_short_ratios (timestamp, symbol, long_ratio, short_ratio, "
+                "long_short_ratio, created_at) VALUES (?, ?, ?, ?, ?, ?)",
                 (snap.timestamp, snap.symbol, snap.long_ratio, snap.short_ratio, snap.long_short_ratio, time.time()),
             )
             self._event_count += 1
@@ -712,7 +792,8 @@ class DataStore:
 
     def get_long_short_ratios(self, symbol: str | None = None, hours: float = 24, limit: int = 200) -> list[dict]:
         cutoff = time.time() - (hours * 3600)
-        query = "SELECT timestamp, symbol, long_ratio, short_ratio, long_short_ratio FROM long_short_ratios WHERE timestamp > ?"
+        query = ("SELECT timestamp, symbol, long_ratio, short_ratio, long_short_ratio "
+                 "FROM long_short_ratios WHERE timestamp > ?")
         params: list = [cutoff]
         if symbol:
             query += " AND symbol = ?"
@@ -731,8 +812,10 @@ class DataStore:
         """Save a Deribit IV snapshot."""
         with self._lock:
             self._conn.execute(
-                "INSERT INTO options_data (timestamp, underlying, mark_iv, bid_iv, ask_iv, oi_usd, index_price, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (snap.timestamp, snap.underlying, snap.mark_iv, snap.bid_iv, snap.ask_iv, snap.oi_usd, snap.index_price, time.time()),
+                "INSERT INTO options_data (timestamp, underlying, mark_iv, bid_iv, ask_iv, "
+                "oi_usd, index_price, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (snap.timestamp, snap.underlying, snap.mark_iv, snap.bid_iv, snap.ask_iv,
+                 snap.oi_usd, snap.index_price, time.time()),
             )
             self._event_count += 1
             self._maybe_commit()
@@ -740,7 +823,8 @@ class DataStore:
     def get_options_data(self, underlying: str | None = None, hours: float = 24, limit: int = 200) -> list[dict]:
         """Get historical Deribit IV snapshots."""
         cutoff = time.time() - (hours * 3600)
-        query = "SELECT timestamp, underlying, mark_iv, bid_iv, ask_iv, oi_usd, index_price FROM options_data WHERE timestamp > ?"
+        query = ("SELECT timestamp, underlying, mark_iv, bid_iv, ask_iv, oi_usd, "
+                 "index_price FROM options_data WHERE timestamp > ?")
         params: list = [cutoff]
         if underlying:
             query += " AND underlying = ?"

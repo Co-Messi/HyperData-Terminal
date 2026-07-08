@@ -76,6 +76,39 @@ async def run_dashboard(hub: HyperDataHub, key: str) -> None:
         await create_fn().run()
 
 
+async def _ainput(prompt: str) -> str:
+    """Read one line of input without blocking the event loop.
+
+    Uses a daemon thread per prompt (human-speed churn only) so a read that
+    is still pending at exit can never wedge interpreter shutdown — the
+    failure mode of parking input() inside a ThreadPoolExecutor, whose
+    non-daemon workers are joined at exit.
+    """
+    import threading
+
+    loop = asyncio.get_running_loop()
+    fut: asyncio.Future[str] = loop.create_future()
+
+    def _set(value=None, exc=None):
+        if fut.done():
+            return
+        if exc is not None:
+            fut.set_exception(exc)
+        else:
+            fut.set_result(value)
+
+    def _worker():
+        try:
+            line = input(prompt)
+        except BaseException as e:  # EOFError / KeyboardInterrupt in the thread
+            loop.call_soon_threadsafe(_set, None, e)
+        else:
+            loop.call_soon_threadsafe(_set, line)
+
+    threading.Thread(target=_worker, daemon=True, name="menu-input").start()
+    return await fut
+
+
 async def run_interactive(api_port: int | None = None) -> None:
     """Boot → menu → pick dashboard → run → back to menu on Ctrl+C."""
     console = Console()
@@ -89,19 +122,10 @@ async def run_interactive(api_port: int | None = None) -> None:
         while True:
             _build_menu(console)
 
-            # Read user choice — use a daemon thread so Ctrl+C exits cleanly
-            import concurrent.futures
-            _input_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-            _input_pool._threads = set()  # ensure daemon threads
             try:
-                choice = await asyncio.get_event_loop().run_in_executor(
-                    _input_pool, lambda: input("  Enter choice: ").strip().lower()
-                )
+                choice = (await _ainput("  Enter choice: ")).strip().lower()
             except (EOFError, KeyboardInterrupt):
-                _input_pool.shutdown(wait=False)
                 break
-            finally:
-                _input_pool.shutdown(wait=False)
 
             if choice in ("q", "quit", "exit"):
                 break

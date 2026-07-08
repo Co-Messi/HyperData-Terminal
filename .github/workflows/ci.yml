@@ -14,35 +14,30 @@ jobs:
         python-version: ["3.12", "3.13"]
 
     steps:
-      - uses: actions/checkout@v4
+      # Actions pinned by commit SHA (not mutable tags) so a compromised tag
+      # can't inject code into CI.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
+        # requirements.lock pins the runtime deps; -e . adds the package
+        # itself; test tooling is pinned so CI is deterministic.
         run: |
-          pip install -e .
-          pip install pytest ruff
+          pip install -r requirements.lock
+          pip install -e . --no-deps
+          pip install pytest==9.1.1 pytest-asyncio==1.4.0 ruff==0.15.20 pip-audit==2.10.1
 
       - name: Lint
-        # Non-blocking for now: the repo has pre-existing ruff debt (mostly
-        # E501/I001/F401) unrelated to current work. Tests below are the real
-        # gate. TODO: clean lint in a focused PR, then drop continue-on-error.
-        continue-on-error: true
-        run: ruff check src/
+        run: ruff check src/ tests/
 
-      - name: Syntax check all Python files
-        run: |
-          find src/ -name "*.py" -exec python -c "
-          import ast, sys
-          try:
-              ast.parse(open(sys.argv[1]).read())
-          except SyntaxError as e:
-              print(f'FAIL: {sys.argv[1]}: {e}')
-              sys.exit(1)
-          " {} \;
+      - name: Dependency vulnerability audit
+        # Blocking: a known CVE in a pinned runtime dep fails CI. Dependabot
+        # (.github/dependabot.yml) keeps the lockfile and action SHAs fresh.
+        run: pip-audit -r requirements.lock
 
       - name: Test imports
         run: |
@@ -52,5 +47,6 @@ jobs:
           python -c "from src.dashboards.liquidation_heatmap import LiquidationHeatmapDashboard; print('heatmap: OK')"
 
       - name: Run tests
-        # test_position_scanner.py needs a live exchange connection — skip in CI.
-        run: python -m pytest tests/ -q --ignore=tests/test_position_scanner.py
+        # The full suite, position scanner included — its network calls are
+        # mocked; only tests marked `live` need real exchange connections.
+        run: python -m pytest tests/ -q

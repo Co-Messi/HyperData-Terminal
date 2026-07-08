@@ -231,6 +231,33 @@ class OrderFlowEngine:
     def is_stale(self, now: float | None = None) -> bool:
         return self.data_age(now) > STALE_AFTER_SECONDS
 
+    def venue_data_age(self, venue: str, now: float | None = None) -> float:
+        """Seconds since the last trade from ONE venue (inf if none yet)."""
+        last = (self.last_hl_message_at if venue == "hyperliquid"
+                else self.last_binance_message_at)
+        if last <= 0:
+            return float("inf")
+        return (now if now is not None else time.time()) - last
+
+    def venue_is_stale(self, venue: str, now: float | None = None) -> bool:
+        return self.venue_data_age(venue, now) > STALE_AFTER_SECONDS
+
+    def venue_freshness(self, now: float | None = None) -> dict[str, dict]:
+        """Per-venue freshness so a dead venue can't hide behind a live one.
+
+        The combined is_stale() uses the freshest venue (intentional: the
+        blended CVD is still moving), but consumers of venue-specific data
+        need to know when THEIR venue went quiet.
+        """
+        out: dict[str, dict] = {}
+        for venue in ("hyperliquid", "binance"):
+            age = self.venue_data_age(venue, now)
+            out[venue] = {
+                "data_age_seconds": None if age == float("inf") else round(age, 1),
+                "stale": age > STALE_AFTER_SECONDS,
+            }
+        return out
+
     async def start(self) -> None:
         """Open WebSocket(s), subscribe, and begin processing in background."""
         if self._running:

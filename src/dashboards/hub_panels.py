@@ -14,7 +14,9 @@ from rich.table import Table
 from rich.text import Text
 
 from src.data_layer.hub import HyperDataHub
-from src.utils.helpers import format_usd as fmt_usd, format_price as fmt_price, format_pct as fmt_pct
+from src.utils.helpers import format_pct as fmt_pct
+from src.utils.helpers import format_price as fmt_price
+from src.utils.helpers import format_usd as fmt_usd
 
 
 class HubLiqWatch:

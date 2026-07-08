@@ -32,11 +32,11 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from src.data_layer.position_scanner import PositionScanner, TrackedPosition  # noqa: E402
-from config.settings import DASHBOARD_REFRESH_RATE  # noqa: E402
-
+from src.utils.helpers import format_pct_value as fmt_pct  # noqa: E402
+from src.utils.helpers import format_price as fmt_price  # noqa: E402
 
 # -- Formatting helpers (imported from central helpers) ---------------------
-from src.utils.helpers import format_usd as fmt_usd, format_price as fmt_price, format_pct_value as fmt_pct
+from src.utils.helpers import format_usd as fmt_usd  # noqa: E402
 
 
 def shorten_addr(address: str) -> str:

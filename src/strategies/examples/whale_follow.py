@@ -10,7 +10,7 @@ Data source: hub.positions — whale position tracking from Hyperliquid.
 """
 from __future__ import annotations
 
-from src.strategies.base import Strategy, Signal
+from src.strategies.base import Signal, Strategy
 
 
 class WhaleFollow(Strategy):

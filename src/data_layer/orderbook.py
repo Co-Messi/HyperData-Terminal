@@ -137,21 +137,34 @@ class OrderBookEngine:
     # ── Book update (public for testability) ─────────────────────
 
     def _update_book(self, symbol: str, data: dict) -> None:
-        """Parse l2Book levels data and update the in-memory book."""
+        """Parse l2Book levels data and update the in-memory book.
+
+        Malformed levels are dropped individually so one bad entry can't
+        raise out of the WS read loop and force a reconnect (or poison the
+        whole book).
+        """
         if symbol not in self.books:
             return
         levels = data.get("levels", [[], []])
+        if not isinstance(levels, list):
+            logger.warning("[orderbook] malformed levels for %s: %.200s", symbol, levels)
+            return
         bids_raw = levels[0] if len(levels) > 0 else []
         asks_raw = levels[1] if len(levels) > 1 else []
 
-        bids = [
-            OrderBookLevel(price=float(b["px"]), size=float(b["sz"]))
-            for b in bids_raw[:self.depth]
-        ]
-        asks = [
-            OrderBookLevel(price=float(a["px"]), size=float(a["sz"]))
-            for a in asks_raw[:self.depth]
-        ]
+        def _parse_side(raw_levels) -> list[OrderBookLevel]:
+            parsed: list[OrderBookLevel] = []
+            if not isinstance(raw_levels, list):
+                return parsed
+            for lvl in raw_levels[:self.depth]:
+                try:
+                    parsed.append(OrderBookLevel(price=float(lvl["px"]), size=float(lvl["sz"])))
+                except (KeyError, TypeError, ValueError):
+                    logger.debug("[orderbook] dropped malformed level for %s: %.100s", symbol, lvl)
+            return parsed
+
+        bids = _parse_side(bids_raw)
+        asks = _parse_side(asks_raw)
 
         self.books[symbol]["bids"] = bids
         self.books[symbol]["asks"] = asks

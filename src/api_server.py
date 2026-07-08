@@ -12,18 +12,31 @@ Usage:
     # WS:    ws://localhost:8420/v1/ws
     #        Send: {"subscribe": ["trade", "liquidation"]}
     #        Recv: {"type": "trade", "data": {...}, "ts": 1234567890.123}
+
+Security model:
+    - Binds to loopback by default; loopback needs no credentials.
+    - A non-loopback bind (HYPERDATA_API_HOST) is refused unless either
+      HYPERDATA_API_KEY is set (all non-health routes then require it) or
+      HYPERDATA_UNSAFE_PUBLIC_API=1 explicitly acknowledges the risk.
+    - CORS is wildcard only on loopback; non-loopback binds must allowlist
+      origins via HYPERDATA_CORS_ORIGINS (comma-separated), else no CORS.
+    - Per-IP REST rate limit + WebSocket per-client send queues.
 """
 from __future__ import annotations
 
 import asyncio
 import dataclasses
+import hmac
+import ipaddress
 import json
 import logging
 import math
+import os
 import time
+from collections import deque
 from typing import Any
 
-from aiohttp import web, WSMsgType
+from aiohttp import WSMsgType, web
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +44,29 @@ logger = logging.getLogger(__name__)
 EVENT_TYPES = {"trade", "liquidation", "signal", "funding_update", "iv_update", "alert", "heartbeat"}
 
 MAX_WS_CONNECTIONS = 10
+# Per-client outbound queue depth. When a slow client's queue is full, new
+# events are dropped for that client (counted) instead of spawning unbounded
+# send tasks that compete with ingestion.
+WS_SEND_QUEUE_SIZE = 200
+# Inbound WebSocket message limits: size cap, rate cap, and how many bad
+# (non-JSON / oversized / too-fast) messages we tolerate before disconnecting.
+WS_MAX_MSG_BYTES = 4096
+WS_MAX_MSGS_PER_10S = 20
+WS_BAD_MSG_LIMIT = 5
+
+# Per-IP REST rate limit (sliding window).
+RATE_LIMIT_REQUESTS = 300
+RATE_LIMIT_WINDOW_S = 60.0
+
+
+def _is_loopback_host(host: str) -> bool:
+    """True if the bind host is loopback-only ('localhost', 127.x, ::1)."""
+    if host in ("localhost",):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def _serialize(obj: Any) -> Any:
@@ -49,30 +85,120 @@ def _serialize(obj: Any) -> Any:
     return obj
 
 
-_CORS_HEADERS = {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": "Authorization, Content-Type",
-}
+def _make_cors_middleware(allowed_origins: set[str] | None):
+    """CORS middleware factory.
+
+    allowed_origins=None means wildcard (loopback binds only); otherwise the
+    request Origin must be in the allowlist to receive CORS headers.
+    """
+
+    def _cors_headers(request: web.Request) -> dict[str, str]:
+        if allowed_origins is None:
+            origin = "*"
+        else:
+            req_origin = request.headers.get("Origin", "")
+            if req_origin not in allowed_origins:
+                return {}
+            origin = req_origin
+        return {
+            "Access-Control-Allow-Origin": origin,
+            "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+            "Access-Control-Allow-Headers": "Authorization, Content-Type, X-API-Key",
+            **({"Vary": "Origin"} if origin != "*" else {}),
+        }
+
+    @web.middleware
+    async def cors_middleware(request: web.Request, handler):
+        headers = _cors_headers(request)
+        if request.method == "OPTIONS":
+            return web.Response(status=200, headers=headers)
+        try:
+            resp = await handler(request)
+        except web.HTTPNotFound:
+            return web.json_response(
+                {"error": "Endpoint not found", "path": request.path},
+                status=404,
+                headers=headers,
+            )
+        except web.HTTPException as exc:
+            exc.headers.update(headers)
+            raise
+        resp.headers.update(headers)
+        return resp
+
+    return cors_middleware
 
 
-@web.middleware
-async def cors_middleware(request: web.Request, handler):
-    if request.method == "OPTIONS":
-        return web.Response(status=200, headers=_CORS_HEADERS)
-    try:
-        resp = await handler(request)
-    except web.HTTPNotFound:
-        return web.json_response(
-            {"error": "Endpoint not found", "path": request.path},
-            status=404,
-            headers=_CORS_HEADERS,
-        )
-    except web.HTTPException as exc:
-        exc.headers.update(_CORS_HEADERS)
-        raise
-    resp.headers.update(_CORS_HEADERS)
-    return resp
+# Paths reachable without an API key. Only the minimal liveness probe is
+# exempt — the detailed /v1/health payload (mode, feed states, counters) is
+# operational recon and requires the key on authenticated deployments.
+_UNAUTHENTICATED_PATHS = {"/v1/live"}
+
+# Paths exempt from per-IP rate limiting: load balancers, uptime monitors,
+# and liveness probes often share one NAT egress IP and poll continuously.
+_RATE_LIMIT_EXEMPT_PATHS = {"/v1/live", "/v1/health", "/health"}
+
+
+def _make_auth_middleware(api_key: str):
+    """Require the API key on every route except health checks.
+
+    Accepts either ``Authorization: Bearer <key>`` or ``X-API-Key: <key>``.
+    """
+
+    @web.middleware
+    async def auth_middleware(request: web.Request, handler):
+        if request.method == "OPTIONS" or request.path in _UNAUTHENTICATED_PATHS:
+            return await handler(request)
+        supplied = request.headers.get("X-API-Key", "")
+        auth = request.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            supplied = supplied or auth[len("Bearer "):]
+        if not supplied or not hmac.compare_digest(supplied, api_key):
+            return web.json_response({"error": "Unauthorized"}, status=401)
+        return await handler(request)
+
+    return auth_middleware
+
+
+class _RateLimiter:
+    """Sliding-window per-IP request limiter for the REST surface."""
+
+    def __init__(self, max_requests: int = RATE_LIMIT_REQUESTS,
+                 window_s: float = RATE_LIMIT_WINDOW_S) -> None:
+        self.max_requests = max_requests
+        self.window_s = window_s
+        self._hits: dict[str, deque[float]] = {}
+
+    def allow(self, key: str, now: float | None = None) -> bool:
+        now = time.time() if now is None else now
+        dq = self._hits.get(key)
+        if dq is None:
+            dq = self._hits.setdefault(key, deque())
+        cutoff = now - self.window_s
+        while dq and dq[0] < cutoff:
+            dq.popleft()
+        if len(dq) >= self.max_requests:
+            return False
+        dq.append(now)
+        # Bound tracked IPs so a scan can't grow this dict forever.
+        if len(self._hits) > 10_000:
+            stale = [k for k, v in self._hits.items() if not v or v[-1] < cutoff]
+            for k in stale:
+                del self._hits[k]
+        return True
+
+
+def _make_rate_limit_middleware(limiter: _RateLimiter):
+    @web.middleware
+    async def rate_limit_middleware(request: web.Request, handler):
+        if request.path in _RATE_LIMIT_EXEMPT_PATHS:
+            return await handler(request)
+        remote = request.remote or "unknown"
+        if not limiter.allow(remote):
+            return web.json_response({"error": "Rate limit exceeded"}, status=429)
+        return await handler(request)
+
+    return rate_limit_middleware
 
 
 def _int_param(request: web.Request, name: str, default: int,
@@ -112,7 +238,8 @@ def _float_param(request: web.Request, name: str, default: float,
 # ── WebSocket client tracker ─────────────────────────────────────────────
 
 class _WSClient:
-    __slots__ = ("ws", "subscriptions", "ping_misses", "connected_at")
+    __slots__ = ("ws", "subscriptions", "ping_misses", "connected_at",
+                 "queue", "writer_task", "dropped_msgs", "msg_times", "bad_msgs")
 
     def __init__(self, ws: web.WebSocketResponse, subscriptions: set[str] | None = None):
         self.ws = ws
@@ -120,15 +247,22 @@ class _WSClient:
         self.subscriptions: set[str] = subscriptions if subscriptions is not None else set()
         self.ping_misses: int = 0
         self.connected_at: float = time.time()
+        # Bounded outbound queue drained by a single writer task per client.
+        self.queue: asyncio.Queue[str] = asyncio.Queue(maxsize=WS_SEND_QUEUE_SIZE)
+        self.writer_task: asyncio.Task | None = None
+        self.dropped_msgs: int = 0
+        # Inbound abuse tracking (message rate + malformed messages).
+        self.msg_times: deque[float] = deque(maxlen=WS_MAX_MSGS_PER_10S)
+        self.bad_msgs: int = 0
 
 
 class HyperDataAPI:
     """REST API v1 + WebSocket streaming, backed by a live HyperDataHub."""
 
     def __init__(self, hub, host: str = "127.0.0.1", port: int = 8420) -> None:
-        # Bind to loopback by default: the API has no auth and CORS is open, so
-        # it must not be reachable from the LAN unless the operator opts in
-        # (HYPERDATA_API_HOST=0.0.0.0). See docs/DATA_INTEGRITY.md / README.
+        # Bind to loopback by default. Non-loopback binds are refused in
+        # start() unless HYPERDATA_API_KEY is set (auth enforced) or
+        # HYPERDATA_UNSAFE_PUBLIC_API=1 explicitly acknowledges the risk.
         self.hub = hub
         self.host = host
         self.port = port
@@ -136,14 +270,58 @@ class HyperDataAPI:
         self._site: web.TCPSite | None = None
         self._ws_clients: list[_WSClient] = []
         self._hooks_installed = False
+        self._rate_limiter = _RateLimiter()
 
     # ── Lifecycle ────────────────────────────────────────────────
 
+    def _resolve_security(self) -> tuple[str, set[str] | None]:
+        """Validate bind/auth/CORS config. Returns (api_key, cors_allowlist).
+
+        Raises RuntimeError for a non-loopback bind with neither an API key
+        nor an explicit unsafe acknowledgment.
+        """
+        api_key = os.environ.get("HYPERDATA_API_KEY", "").strip()
+        unsafe_ack = os.environ.get("HYPERDATA_UNSAFE_PUBLIC_API", "") == "1"
+        origins_raw = os.environ.get("HYPERDATA_CORS_ORIGINS", "").strip()
+        origins: set[str] | None = (
+            {o.strip() for o in origins_raw.split(",") if o.strip()}
+            if origins_raw else None
+        )
+
+        if _is_loopback_host(self.host):
+            # Loopback: wildcard CORS unless an allowlist was configured.
+            return api_key, origins
+
+        if not api_key and not unsafe_ack:
+            raise RuntimeError(
+                f"Refusing to bind API to non-loopback host {self.host!r}: the "
+                "API would expose trading intelligence to the network. Set "
+                "HYPERDATA_API_KEY to require authentication, or set "
+                "HYPERDATA_UNSAFE_PUBLIC_API=1 to explicitly accept the risk."
+            )
+        if not api_key:
+            logger.warning(
+                "SECURITY: API bound to %s WITHOUT authentication "
+                "(HYPERDATA_UNSAFE_PUBLIC_API=1). Anyone on the network can "
+                "read wallet/trading intelligence.", self.host,
+            )
+        # Non-loopback: never wildcard CORS. No allowlist -> no CORS headers.
+        return api_key, (origins or set())
+
     async def start(self) -> None:
-        app = web.Application(middlewares=[cors_middleware])
+        api_key, cors_origins = self._resolve_security()
+        self._api_key = api_key
+        self._cors_origins = cors_origins
+
+        middlewares = [_make_rate_limit_middleware(self._rate_limiter)]
+        if api_key:
+            middlewares.append(_make_auth_middleware(api_key))
+        middlewares.append(_make_cors_middleware(cors_origins))
+        app = web.Application(middlewares=middlewares)
 
         # v1 routes
         v1 = [
+            ("GET", "/v1/live", self.handle_live),
             ("GET", "/v1/health", self.handle_health),
             ("GET", "/v1/market", self.handle_market),
             ("GET", "/v1/market/{symbol}", self.handle_market_symbol),
@@ -200,6 +378,8 @@ class HyperDataAPI:
                 pass
 
         for client in list(self._ws_clients):
+            if client.writer_task:
+                client.writer_task.cancel()
             if not client.ws.closed:
                 await client.ws.close()
         self._ws_clients.clear()
@@ -245,6 +425,7 @@ class HyperDataAPI:
     _DEDUP_MAX = 500
     _CASCADE_WINDOW = 30
     _CASCADE_BYPASS_DURATION = 30
+    _CASCADE_TRACKER_MAX = 200  # entries kept per symbol/side/exchange key
 
     def __init_dedup(self):
         if not hasattr(self, '_liq_seen'):
@@ -253,20 +434,45 @@ class HyperDataAPI:
             self._heartbeat_task: asyncio.Task | None = None
             self._cascade_tracker: dict[str, list] = {}
             self._cascade_bypass: dict[str, float] = {}
+            self._cascade_bypass_started: dict[str, float] = {}
             self._liq_stats = {"received": 0, "broadcast": 0, "deduped": 0, "filtered": 0}
             self._liq_stats_ts = time.time()
 
+    # Plausible epoch-seconds range for exchange event times (2001..5138).
+    # A timestamp outside this range means a connector skipped ms→s
+    # normalization (or sent 0) — such events cannot be safely hashed.
+    _TS_SANE_MIN = 1e9
+    _TS_SANE_MAX = 1e11
+
     def _is_duplicate_liq(self, ev) -> bool:
-        """Check if this liquidation is a duplicate within the 3-second dedup window."""
+        """Duplicate check within the dedup window, keyed per exchange.
+
+        Buckets on the EXCHANGE event timestamp (not local receive time) so
+        two records of the same event dedup identically regardless of local
+        delivery jitter. Events without a plausible exchange timestamp are
+        never deduped — substituting the local clock would collide distinct
+        events that merely arrived together. The hash uses the exact size:
+        replayed duplicates carry identical payloads, while distinct events
+        of similar size must not collapse into one. The cascade bypass is
+        also per-exchange: a Binance cascade must not let Hyperliquid's
+        heuristic events skip dedup.
+        """
         self.__init_dedup()
         now = time.time()
 
-        bypass_key = f"{ev.symbol}_{ev.side}"
+        ev_ts = ev.timestamp
+        if not (self._TS_SANE_MIN < ev_ts < self._TS_SANE_MAX):
+            logger.warning(
+                "[liq] %s event has implausible timestamp %r — skipping dedup",
+                ev.exchange, ev_ts,
+            )
+            return False
+
+        bypass_key = f"{ev.symbol}_{ev.side}_{ev.exchange}"
         if bypass_key in self._cascade_bypass and now < self._cascade_bypass[bypass_key]:
             return False
 
-        size_rounded = round(ev.size_usd, -2)
-        h = f"{ev.symbol}_{ev.side}_{size_rounded}_{ev.exchange}_{int(now // self._DEDUP_WINDOW)}"
+        h = f"{ev.symbol}_{ev.side}_{ev.size_usd:.2f}_{ev.exchange}_{int(ev_ts // self._DEDUP_WINDOW)}"
 
         if len(self._liq_seen) > self._DEDUP_MAX:
             cutoff = now - self._DEDUP_WINDOW * 2
@@ -277,11 +483,16 @@ class HyperDataAPI:
         self._liq_seen[h] = now
         return False
 
-    def _check_cascade(self, symbol: str, side: str, exchange: str, size_usd: float) -> str | None:
-        """Track rapid successive liquidations. Returns cascade label if detected."""
+    def _check_cascade(self, ev) -> str | None:
+        """Track rapid successive liquidations. Returns cascade label if detected.
+
+        Keys on the RAW event fields (symbol/side/exchange) — the same domain
+        _is_duplicate_liq reads its bypass with — so a detected cascade
+        actually lifts dedup for the venue that is cascading.
+        """
         self.__init_dedup()
         now = time.time()
-        key = f"{symbol}_{side}_{exchange}"
+        key = f"{ev.symbol}_{ev.side}_{ev.exchange}"
 
         if key not in self._cascade_tracker:
             self._cascade_tracker[key] = []
@@ -291,14 +502,27 @@ class HyperDataAPI:
             if now - ts < self._CASCADE_WINDOW
         ]
 
-        self._cascade_tracker[key].append((now, size_usd))
+        self._cascade_tracker[key].append((now, ev.size_usd))
+        # Bound per-key memory: only the most recent window entries matter.
+        if len(self._cascade_tracker[key]) > self._CASCADE_TRACKER_MAX:
+            self._cascade_tracker[key] = self._cascade_tracker[key][-self._CASCADE_TRACKER_MAX:]
 
         entries = self._cascade_tracker[key]
         if len(entries) >= 3:
-            bypass_key = f"{symbol}_{side}"
-            self._cascade_bypass[bypass_key] = now + self._CASCADE_BYPASS_DURATION
+            # Bypass dedup only for this exchange's stream: cascades on one
+            # venue say nothing about duplicates on another. The bypass has
+            # an ABSOLUTE cap: without it, events passing dedup during the
+            # bypass re-trigger cascade detection and extend it forever
+            # (replayed duplicates would keep the floodgate open).
+            first = self._cascade_bypass_started.setdefault(key, now)
+            cap = first + 2 * self._CASCADE_BYPASS_DURATION
+            self._cascade_bypass[key] = min(now + self._CASCADE_BYPASS_DURATION, cap)
             total = sum(sz for _, sz in entries)
             return f"cascade ${total:,.0f} ({len(entries)}x in {self._CASCADE_WINDOW}s)"
+
+        # Quiet again: allow a future cascade to start a fresh bypass window.
+        if key in self._cascade_bypass_started and now > self._cascade_bypass.get(key, 0):
+            del self._cascade_bypass_started[key]
 
         return None
 
@@ -360,7 +584,7 @@ class HyperDataAPI:
         ex_map = {"binance": "BIN", "bybit": "BYB", "okx": "OKX", "hyperliquid": "HYP"}
         ex_short = ex_map.get(ev.exchange, ev.exchange[:3].upper())
 
-        cascade = self._check_cascade(symbol, ev.side.upper(), ex_short, ev.size_usd)
+        cascade = self._check_cascade(ev)
 
         self._broadcast("liquidation", {
             "exchange": ex_short,
@@ -386,7 +610,12 @@ class HyperDataAPI:
             })
 
     def _broadcast(self, event_type: str, data: dict) -> None:
-        """Send event to all subscribed WebSocket clients. Bulletproof."""
+        """Enqueue event for all subscribed WebSocket clients.
+
+        Each client has a bounded queue drained by its own writer task, so a
+        slow client drops ITS events (counted) instead of accumulating one
+        send task per client per event on the shared loop.
+        """
         if not self._ws_clients:
             return
         msg = json.dumps({"type": event_type, "data": data, "ts": time.time()})
@@ -398,12 +627,42 @@ class HyperDataAPI:
             if event_type not in client.subscriptions:
                 continue
             try:
-                asyncio.ensure_future(self._safe_send(client, msg))
-            except Exception:
-                dead.append(client)
+                client.queue.put_nowait(msg)
+            except asyncio.QueueFull:
+                client.dropped_msgs += 1
+                if client.dropped_msgs % 100 == 1:
+                    logger.warning(
+                        "[ws] Slow client: %d events dropped (queue full)",
+                        client.dropped_msgs,
+                    )
         for d in dead:
-            if d in self._ws_clients:
-                self._ws_clients.remove(d)
+            self._remove_client(d)
+
+    def _remove_client(self, client: _WSClient) -> None:
+        if client in self._ws_clients:
+            self._ws_clients.remove(client)
+        if client.writer_task and not client.writer_task.done():
+            client.writer_task.cancel()
+
+    async def _writer_loop(self, client: _WSClient) -> None:
+        """Single writer per client: drain the queue with a send timeout."""
+        try:
+            while not client.ws.closed:
+                msg = await client.queue.get()
+                try:
+                    await asyncio.wait_for(client.ws.send_str(msg), timeout=2.0)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # Send failed or timed out — this client is done.
+                    self._remove_client(client)
+                    try:
+                        await client.ws.close()
+                    except Exception:
+                        pass
+                    return
+        except asyncio.CancelledError:
+            pass
 
     async def _heartbeat_loop(self) -> None:
         """Push heartbeat every 10s. Evict clients that miss 3 consecutive pings."""
@@ -429,18 +688,20 @@ class HyperDataAPI:
                         continue
                     if "heartbeat" not in client.subscriptions:
                         continue
+                    # Enqueue through the same bounded queue as broadcasts. A
+                    # full queue means the writer is stuck/slow — count it as
+                    # a missed ping and evict after 3 in a row.
                     try:
-                        await asyncio.wait_for(client.ws.send_str(msg), timeout=2.0)
+                        client.queue.put_nowait(msg)
                         client.ping_misses = 0
-                    except Exception:
+                    except asyncio.QueueFull:
                         client.ping_misses += 1
                         if client.ping_misses >= 3:
                             dead.append(client)
-                            logger.debug("[ws] Evicting client after 3 missed pings")
+                            logger.info("[ws] Evicting client after 3 missed heartbeats")
 
                 for d in dead:
-                    if d in self._ws_clients:
-                        self._ws_clients.remove(d)
+                    self._remove_client(d)
                     try:
                         await d.ws.close()
                     except Exception:
@@ -449,19 +710,9 @@ class HyperDataAPI:
             except asyncio.CancelledError:
                 return
             except Exception:
-                pass
-
-    async def _safe_send(self, client: _WSClient, msg: str) -> None:
-        """Send with timeout. Remove client on any failure."""
-        try:
-            await asyncio.wait_for(client.ws.send_str(msg), timeout=2.0)
-        except Exception:
-            if client in self._ws_clients:
-                self._ws_clients.remove(client)
-            try:
-                await client.ws.close()
-            except Exception:
-                pass
+                # Never die silently: the heartbeat loop is also the WS
+                # liveness janitor, so log and keep going.
+                logger.exception("[ws] Heartbeat loop error")
 
     # ── Redirect helper ──────────────────────────────────────────
 
@@ -473,39 +724,83 @@ class HyperDataAPI:
 
     # ── WebSocket handler ────────────────────────────────────────
 
-    async def handle_ws(self, request: web.Request) -> web.WebSocketResponse:
+    async def handle_ws(self, request: web.Request) -> web.WebSocketResponse | web.Response:
+        # Browser WebSockets are NOT gated by the same-origin policy: any
+        # webpage can open ws://127.0.0.1 and read the stream. An Origin
+        # header means a browser context — reject it unless the origin was
+        # explicitly allowlisted (HYPERDATA_CORS_ORIGINS). Non-browser
+        # clients (curl, bots, SDKs) send no Origin and are unaffected.
+        origin = request.headers.get("Origin")
+        if origin is not None:
+            allowed = getattr(self, "_cors_origins", None) or set()
+            if origin not in allowed:
+                logger.warning("[ws] Rejected cross-origin upgrade from %s", origin)
+                return web.json_response({"error": "Origin not allowed"}, status=403)
+
         if len(self._ws_clients) >= MAX_WS_CONNECTIONS:
             return web.json_response({"error": "Too many connections"}, status=429)
-        ws = web.WebSocketResponse(heartbeat=20)
+        ws = web.WebSocketResponse(heartbeat=20, max_msg_size=WS_MAX_MSG_BYTES)
         await ws.prepare(request)
         client = _WSClient(ws, subscriptions=set())
+        client.writer_task = asyncio.create_task(
+            self._writer_loop(client), name="ws-writer"
+        )
         self._ws_clients.append(client)
         logger.info("[ws] Client connected (%d total)", len(self._ws_clients))
 
         try:
             async for msg in ws:
                 if msg.type == WSMsgType.TEXT:
-                    try:
-                        data = json.loads(msg.data)
-                        subs = data.get("subscribe")
-                        if isinstance(subs, list):
-                            client.subscriptions = {s for s in subs if s in EVENT_TYPES}
-                            await ws.send_json({
-                                "type": "subscribed",
-                                "channels": sorted(client.subscriptions),
-                            })
-                    except json.JSONDecodeError:
-                        pass
+                    if self._ws_msg_violates_limits(client, msg.data):
+                        break
                 elif msg.type in (WSMsgType.CLOSED, WSMsgType.ERROR):
                     break
         finally:
-            if client in self._ws_clients:
-                self._ws_clients.remove(client)
+            self._remove_client(client)
             logger.info("[ws] Client disconnected (%d remaining)", len(self._ws_clients))
 
         return ws
 
+    def _ws_msg_violates_limits(self, client: _WSClient, raw: str) -> bool:
+        """Process one inbound message. Returns True if the client should be
+        disconnected (message flood or too many malformed messages)."""
+        now = time.time()
+        client.msg_times.append(now)
+        if (len(client.msg_times) == client.msg_times.maxlen
+                and now - client.msg_times[0] < 10.0):
+            logger.info("[ws] Disconnecting client: message rate limit exceeded")
+            return True
+
+        if len(raw) > WS_MAX_MSG_BYTES:
+            client.bad_msgs += 1
+        else:
+            try:
+                data = json.loads(raw)
+                subs = data.get("subscribe") if isinstance(data, dict) else None
+                if isinstance(subs, list):
+                    client.subscriptions = {s for s in subs if s in EVENT_TYPES}
+                    client.queue.put_nowait(json.dumps({
+                        "type": "subscribed",
+                        "channels": sorted(client.subscriptions),
+                    }))
+            except (json.JSONDecodeError, asyncio.QueueFull):
+                client.bad_msgs += 1
+
+        if client.bad_msgs >= WS_BAD_MSG_LIMIT:
+            logger.info("[ws] Disconnecting client after %d bad messages", client.bad_msgs)
+            return True
+        return False
+
     # ── REST Handlers ────────────────────────────────────────────
+
+    async def handle_live(self, request: web.Request) -> web.Response:
+        """Minimal liveness probe — safe to expose unauthenticated.
+
+        Deliberately says nothing about mode, feeds, or counters: the
+        detailed /v1/health payload is operational recon and requires the
+        API key on authenticated deployments.
+        """
+        return web.json_response({"status": "ok"})
 
     async def handle_health(self, request: web.Request) -> web.Response:
         s = self.hub.status
@@ -527,13 +822,28 @@ class HyperDataAPI:
             "hlp": s.hlp_status,
         }
 
+        # Per-venue orderflow freshness: the combined status above follows the
+        # freshest venue, so a dead venue is only visible here.
+        orderflow_venues = None
+        try:
+            orderflow_venues = self.hub.orderflow.venue_freshness()
+        except Exception:
+            pass
+
         # Top-level status reflects data health when available: 'ok' only when
         # nothing is stale/drifting. 'degraded' otherwise (server is still up).
+        # Components that failed to start OR whose loops are currently erroring
+        # (position scanner / market data flip to 'error' at runtime without
+        # touching failed_components) also force 'degraded'.
         overall = data_health.get("overall") if data_health else None
         status = "ok" if overall in (None, "ok", "warn") else "degraded"
+        if s.failed_components or any(v == "error" for v in feeds.values()):
+            status = "degraded"
 
         return web.json_response({
             "status": status,
+            "failed_components": list(s.failed_components),
+            "orderflow_venues": orderflow_venues,
             "version": "1.0.0",
             "mode": s.mode,
             "uptime": f"{h}h {m}m",
@@ -636,7 +946,10 @@ class HyperDataAPI:
         for ex_name, ex_rates in self.hub.funding.rates.items():
             snap = ex_rates.get(sym)
             if snap:
-                rates[ex_name] = {"hourly": snap.funding_rate_hourly, "annualized_pct": snap.funding_rate_annualized * 100}
+                rates[ex_name] = {
+                    "hourly": snap.funding_rate_hourly,
+                    "annualized_pct": snap.funding_rate_annualized * 100,
+                }
         if not rates:
             return web.json_response({"error": f"No funding data for {sym}"}, status=404)
         return web.json_response({"symbol": sym, "rates": rates})
@@ -674,41 +987,6 @@ class HyperDataAPI:
                 }
         return web.json_response(data)
 
-    async def handle_smart_money_rankings(self, request: web.Request) -> web.Response:
-        n = _int_param(request, "limit", 20, minimum=1, maximum=500)
-        smart = self.hub.get_smart_money(n)
-        dumb = self.hub.get_dumb_money(n)
-        stats = self.hub.smart_money.get_stats()
-
-        def _fmt_wallet(w):
-            d = _serialize(w)
-            pnl = w.total_realized_pnl
-            if w.total_trades == 0:
-                d["pnl_display"] = "--"
-            elif abs(pnl) >= 1_000_000:
-                d["pnl_display"] = f"${pnl/1_000_000:+.1f}M"
-            elif abs(pnl) >= 1_000:
-                d["pnl_display"] = f"${pnl/1_000:+.1f}K"
-            elif abs(pnl) >= 1:
-                d["pnl_display"] = f"${pnl:+.0f}"
-            else:
-                d["pnl_display"] = "--"
-            return d
-
-        return web.json_response({
-            "stats": stats,
-            "smart": [_fmt_wallet(w) for w in smart],
-            "dumb": [_fmt_wallet(w) for w in dumb],
-        })
-
-    async def handle_smart_money_signals(self, request: web.Request) -> web.Response:
-        n = _int_param(request, "limit", 50, minimum=1, maximum=500)
-        signals = self.hub.get_smart_money_signals(n)
-        return web.json_response({
-            "count": len(signals),
-            "signals": [_serialize(s) for s in signals],
-        })
-
     async def handle_orderbook(self, request: web.Request) -> web.Response:
         sym = request.match_info["symbol"].upper()
         snap = self.hub.get_orderbook(sym)
@@ -741,93 +1019,7 @@ class HyperDataAPI:
             "positions": [_serialize(p) for p in positions],
         })
 
-    # ── Copy-trading endpoints ────────────────────────────────────
-
-    _ct_signals_cache: dict | None = None
-    _ct_signals_cache_ts: float = 0
-
-    async def handle_copy_trading_signals(self, request: web.Request) -> web.Response:
-        """GET /v1/copy-trading/signals — recent copy/fade signals (10s cache)."""
-        try:
-            now = time.time()
-            if (self._ct_signals_cache is not None
-                    and now - self._ct_signals_cache_ts < 10.0):
-                return web.json_response(self._ct_signals_cache)
-
-            wc = getattr(self, '_wallet_cluster', None)
-            if wc is None:
-                return web.json_response({
-                    "signals": [], "active_count": 0,
-                    "suppressed_count": 0, "last_updated": now,
-                })
-
-            signals = wc.get_signals(limit=20)
-            active = [s for s in signals if now - s.get("emitted_at", 0) < 300]
-            result = {
-                "signals": signals,
-                "active_count": len(active),
-                "suppressed_count": len(signals) - len(active),
-                "last_updated": now,
-            }
-            self._ct_signals_cache = result
-            self._ct_signals_cache_ts = now
-            return web.json_response(result)
-        except Exception as e:
-            return web.json_response({
-                "error": str(e), "signals": [], "active_count": 0,
-            })
-
-    _ct_clusters_cache: dict | None = None
-    _ct_clusters_cache_ts: float = 0
-
-    async def handle_copy_trading_clusters(self, request: web.Request) -> web.Response:
-        """GET /v1/copy-trading/clusters — cluster breakdown (60s cache)."""
-        try:
-            now = time.time()
-            if (self._ct_clusters_cache is not None
-                    and now - self._ct_clusters_cache_ts < 60.0):
-                return web.json_response(self._ct_clusters_cache)
-
-            wc = getattr(self, '_wallet_cluster', None)
-            if wc is None:
-                return web.json_response({
-                    "clusters": [], "last_clustered": 0,
-                })
-
-            result = {
-                "clusters": wc.get_clusters(),
-                "last_clustered": wc._last_clustered,
-            }
-            self._ct_clusters_cache = result
-            self._ct_clusters_cache_ts = now
-            return web.json_response(result)
-        except Exception as e:
-            return web.json_response({"error": str(e), "clusters": []})
-
-    _ct_wallets_cache: dict | None = None
-    _ct_wallets_cache_ts: float = 0
-
-    async def handle_copy_trading_wallets(self, request: web.Request) -> web.Response:
-        """GET /v1/copy-trading/wallets — all tracked wallets (60s cache)."""
-        try:
-            now = time.time()
-            if (self._ct_wallets_cache is not None
-                    and now - self._ct_wallets_cache_ts < 60.0):
-                return web.json_response(self._ct_wallets_cache)
-
-            wc = getattr(self, '_wallet_cluster', None)
-            if wc is None:
-                return web.json_response({"wallets": [], "total": 0})
-
-            wallets = wc.get_wallets()
-            result = {"wallets": wallets, "total": len(wallets)}
-            self._ct_wallets_cache = result
-            self._ct_wallets_cache_ts = now
-            return web.json_response(result)
-        except Exception as e:
-            return web.json_response({"error": str(e), "wallets": []})
-
-    # ── Public metrics (live from backtest files + DB, 5-min cache) ──
+    # ── Public metrics ────────────────────────────────────────────
 
     async def handle_public_metrics(self, request: web.Request) -> web.Response:
         """GET /v1/public/metrics — server status and data component health."""

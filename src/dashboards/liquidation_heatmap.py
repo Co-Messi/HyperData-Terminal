@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import math
 from dataclasses import dataclass
 
 from rich import box
@@ -203,9 +202,9 @@ class LiquidationHeatmapDashboard:
         header = Text()
         header.append(f"  {symbol} ", style="bold bright_white")
         header.append(f"${current_price:,.0f}", style=CURRENT_STYLE)
-        header.append(f"  │  ", style="dim")
+        header.append("  │  ", style="dim")
         header.append(f"L: {_format_usd(total_long)}({long_count})", style=LONG_STYLE)
-        header.append(f"  ", style="dim")
+        header.append("  ", style="dim")
         header.append(f"S: {_format_usd(total_short)}({short_count})", style=SHORT_STYLE)
 
         table = Table(

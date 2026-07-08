@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -9,11 +10,18 @@ import aiohttp
 
 from src.data_layer import address_store
 
+logger = logging.getLogger(__name__)
+
 API_URL = "https://api.hyperliquid.xyz/info"
 DATA_DIR = Path(__file__).resolve().parents[2] / "data"
 
 RATE_LIMIT_PER_SEC = 10
 META_CACHE_TTL = 300  # 5 minutes
+
+# Explicit deadline on every request so a hung endpoint fails the scan cycle
+# instead of blocking the hub's position-scan loop indefinitely. Split
+# connect/read so a slow handshake can't consume the entire budget.
+HTTP_TIMEOUT = aiohttp.ClientTimeout(total=10, connect=3, sock_connect=3, sock_read=5)
 
 
 @dataclass
@@ -52,7 +60,16 @@ class PositionScanner:
         async with aiohttp.ClientSession() as session:
             self._session = session
             try:
-                await asyncio.gather(self.update_prices(), self.update_meta())
+                # Independent updates: one endpoint failing must not discard
+                # the other's result (meta is a 5-min cache — losing a refresh
+                # means stale maintenance margins for the whole window).
+                results = await asyncio.gather(
+                    self.update_prices(), self.update_meta(),
+                    return_exceptions=True,
+                )
+                for name, res in zip(("update_prices", "update_meta"), results):
+                    if isinstance(res, BaseException):
+                        logger.warning("[scanner] %s failed: %r", name, res)
 
                 # Discover new addresses: always on first run, then every 30 minutes
                 import time as _time
@@ -102,12 +119,18 @@ class PositionScanner:
                 })
                 if isinstance(data, list):
                     for trade in data:
+                        # Validate at the boundary: exchange payloads are
+                        # untrusted, and a junk identifier persisted here gets
+                        # re-scanned (one API call per cycle) forever.
+                        candidates: list[object] = []
                         for side_key in ("buyer", "seller", "users"):
                             if side_key in trade and isinstance(trade[side_key], str):
-                                new_addresses.add(trade[side_key])
+                                candidates.append(trade[side_key])
                         if "users" in trade and isinstance(trade["users"], list):
-                            for addr in trade["users"]:
-                                new_addresses.add(addr)
+                            candidates.extend(trade["users"])
+                        for addr in candidates:
+                            if address_store.is_valid_address(addr):
+                                new_addresses.add(address_store.normalize_address(addr))
                         if len(new_addresses) >= limit:
                             break
             except Exception:
@@ -279,6 +302,7 @@ class PositionScanner:
             API_URL,
             json=payload,
             headers={"Content-Type": "application/json"},
+            timeout=HTTP_TIMEOUT,
         ) as resp:
             resp.raise_for_status()
             return await resp.json()
@@ -294,6 +318,10 @@ class PositionScanner:
         address_store.add_addresses(self.discovered_addresses, source="position_scanner")
 
     def add_addresses(self, addresses: list[str]):
-        """Manually add addresses to track."""
-        self.discovered_addresses.update(addresses)
-        address_store.add_addresses(addresses, source="position_scanner_manual")
+        """Manually add addresses to track (validated + normalized)."""
+        valid = [
+            address_store.normalize_address(a)
+            for a in addresses if address_store.is_valid_address(a)
+        ]
+        self.discovered_addresses.update(valid)
+        address_store.add_addresses(valid, source="position_scanner_manual")

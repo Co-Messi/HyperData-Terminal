@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import time
+
 import pytest
-from data_layer.spot_prices import SpotPriceSnapshot, SpotPriceCollector
+
+from data_layer.spot_prices import SpotPriceCollector, SpotPriceSnapshot
 
 
 def test_snapshot_fields():

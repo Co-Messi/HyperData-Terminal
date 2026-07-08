@@ -15,6 +15,7 @@ Environment variables:
 import asyncio
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass
 
@@ -339,7 +340,6 @@ class AlertManager:
             delta = hlp_stats["net_delta"]
             zscore = hlp_stats["delta_zscore"]
             session_pnl = hlp_stats["session_pnl"]
-            absorptions = hlp_stats["liquidation_absorptions"]
 
             lines.append(f"AUM: {self._fmt_usd(aum)} | Delta: {self._fmt_usd_signed(delta)} | Z: {zscore:+.1f}")
             lines.append(f"Session PnL: {self._fmt_usd_signed(session_pnl)}")
@@ -357,6 +357,10 @@ class AlertManager:
 
         return "\n".join(lines)
 
+    # Deadline for webhook posts: a stalled Telegram/Discord endpoint must
+    # not wedge whatever task is delivering the alert.
+    _SEND_TIMEOUT = aiohttp.ClientTimeout(total=10, connect=3, sock_connect=3, sock_read=5)
+
     async def _send(self, message: str) -> None:
         """Send alert to all configured channels."""
         if not self._session:
@@ -368,27 +372,41 @@ class AlertManager:
         if self.telegram_token and self.telegram_chat_id:
             try:
                 url = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
-                await self._session.post(url, json={
+                async with self._session.post(url, json={
                     "chat_id": self.telegram_chat_id,
                     "text": message,
                     "parse_mode": "HTML",
-                })
-                logger.info("Telegram alert sent")
-            except Exception:
-                logger.exception("Telegram send failed")
+                }, timeout=self._SEND_TIMEOUT) as resp:
+                    if resp.status == 200:
+                        logger.info("Telegram alert sent")
+                    else:
+                        logger.warning("Telegram send returned %d", resp.status)
+            except Exception as exc:
+                # Exception type only — aiohttp error messages can embed the
+                # request URL, which contains the bot token.
+                logger.warning("Telegram send failed: %s", type(exc).__name__)
 
         # Discord
         if self.discord_webhook:
             try:
-                await self._session.post(self.discord_webhook, json={
+                async with self._session.post(self.discord_webhook, json={
                     "content": message,
-                })
-                logger.info("Discord alert sent")
-            except Exception:
-                logger.exception("Discord send failed")
+                }, timeout=self._SEND_TIMEOUT) as resp:
+                    if resp.status in (200, 204):
+                        logger.info("Discord alert sent")
+                    else:
+                        logger.warning("Discord send returned %d", resp.status)
+            except Exception as exc:
+                # Exception type only — error messages can embed the webhook URL.
+                logger.warning("Discord send failed: %s", type(exc).__name__)
 
-        # Always log to console
-        logger.warning("ALERT: %s", message.replace("\n", " | "))
+        # Log that an alert fired, not its payload — alert bodies can contain
+        # wallet addresses and position intelligence that must not sit in
+        # rotating plaintext logs. Wallet addresses are masked even on the
+        # first line in case a future alert format leads with one.
+        first_line = message.strip().splitlines()[0] if message.strip() else ""
+        redacted = re.sub(r"0x[0-9a-fA-F]{40}", "0x…[redacted]", first_line)
+        logger.warning("ALERT sent (%d total): %.80s", self.alerts_sent, redacted)
 
     async def send_test(self) -> bool:
         """Send a test alert to verify configuration."""

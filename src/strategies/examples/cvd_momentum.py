@@ -11,7 +11,7 @@ buy volume and sell volume exceeds a threshold, emit a signal.
 
 from __future__ import annotations
 
-from src.strategies.base import Strategy, Signal
+from src.strategies.base import Signal, Strategy
 
 
 class CVDMomentum(Strategy):

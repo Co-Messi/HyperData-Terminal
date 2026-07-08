@@ -21,7 +21,6 @@ Usage:
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import time
@@ -30,26 +29,27 @@ from pathlib import Path
 from typing import Any, Callable
 
 from config.settings import DEFAULT_SYMBOLS
+from src.api_server import HyperDataAPI
 from src.data_layer.alerts import AlertManager
-from src.data_layer.liquidation_feed import LiquidationFeed, LiquidationEvent
-from src.data_layer.position_scanner import PositionScanner, TrackedPosition
+from src.data_layer.deribit import DeribitFeed, DeribitIVSnapshot
+from src.data_layer.funding_rates import FundingRateCollector, FundingRateSnapshot
+from src.data_layer.health_monitor import DataHealthMonitor
+from src.data_layer.hlp_tracker import HLPPosition, HLPSnapshot, HLPTracker, HLPTrade
+from src.data_layer.liquidation_feed import LiquidationEvent, LiquidationFeed
+from src.data_layer.long_short_ratio import LongShortCollector, LongShortSnapshot
+from src.data_layer.market_data import AssetInfo, MarketData
+from src.data_layer.orderbook import OrderBookEngine, OrderBookSnapshot
+from src.data_layer.orderflow_engine import (
+    STALE_AFTER_SECONDS as ORDERFLOW_STALE_AFTER,
+)
 from src.data_layer.orderflow_engine import (
     OrderFlowEngine,
     Trade,
-    CVDSnapshot,
-    STALE_AFTER_SECONDS as ORDERFLOW_STALE_AFTER,
 )
-from src.data_layer.market_data import MarketData, AssetInfo
 from src.data_layer.persistence import DataStore
+from src.data_layer.position_scanner import PositionScanner, TrackedPosition
 from src.data_layer.smart_money import SmartMoneyEngine, SmartMoneySignal, WalletProfile
-from src.data_layer.hlp_tracker import HLPTracker, HLPSnapshot, HLPPosition, HLPTrade
-from src.data_layer.funding_rates import FundingRateCollector, FundingRateSnapshot
-from src.data_layer.long_short_ratio import LongShortCollector, LongShortSnapshot
-from src.data_layer.orderbook import OrderBookEngine, OrderBookSnapshot
 from src.data_layer.spot_prices import SpotPriceCollector, SpotPriceSnapshot
-from src.data_layer.deribit import DeribitFeed, DeribitIVSnapshot
-from src.data_layer.health_monitor import DataHealthMonitor
-from src.api_server import HyperDataAPI
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +71,9 @@ class HubStatus:
     orderflow_engine: str = "offline"
     orderbook_feed: str = "offline"
     market_data: str = "offline"
+
+    # Components that raised during start(); non-empty means degraded mode.
+    failed_components: list = field(default_factory=list)
 
     # Counters
     total_liquidations: int = 0
@@ -174,6 +177,8 @@ class HyperDataHub:
         # ── Background tasks ─────────────────────────────────────
         self._tasks: list[asyncio.Task] = []
         self._running = False
+        # Debounce for per-venue orderflow staleness warnings.
+        self._venue_stale_warned_at: dict[str, float] = {}
 
         # Wire up internal callbacks
         self.liquidations.on_liquidation(self._handle_liquidation)
@@ -254,12 +259,15 @@ class HyperDataHub:
         # Start REST API server if port is configured (both modes)
         if self._api_port:
             try:
-                # Loopback by default; set HYPERDATA_API_HOST=0.0.0.0 to expose
-                # on the LAN (no auth — only do this behind a trusted network).
+                # Loopback by default; a non-loopback HYPERDATA_API_HOST is
+                # refused unless HYPERDATA_API_KEY or the explicit unsafe
+                # acknowledgment is set (see HyperDataAPI._resolve_security).
                 api_host = os.environ.get("HYPERDATA_API_HOST", "127.0.0.1")
                 self._api_server = HyperDataAPI(self, host=api_host, port=self._api_port)
                 await self._api_server.start()
             except Exception:
+                self._api_server = None
+                self.status.failed_components.append("api_server")
                 logger.exception("Failed to start API server")
 
         # Background loops that run in both modes
@@ -283,81 +291,88 @@ class HyperDataHub:
         self.store.attach(self)
 
         # ── Alerts ─────────────────────────────────────────────
-        await self.alerts.start()
-        self.alerts.attach(self)
+        try:
+            await self.alerts.start()
+            self.alerts.attach(self)
+        except Exception:
+            self.status.failed_components.append("alerts")
+            logger.exception("Failed to start alert manager")
 
-        logger.info("HyperDataHub started — all components online")
+        if self.status.failed_components:
+            logger.error(
+                "HyperDataHub started DEGRADED — failed components: %s. "
+                "Data from these sources will be missing or stale.",
+                ", ".join(self.status.failed_components),
+            )
+        else:
+            logger.info("HyperDataHub started — all components online")
+
+    async def _start_component(self, name: str, coro, required: bool = False,
+                               on_ok=None, on_fail=None) -> bool:
+        """Start one component, recording failures instead of hiding them.
+
+        A failed *required* component raises and aborts startup; a failed
+        optional component is appended to status.failed_components so health
+        surfaces (log line, /v1/health) report degraded mode honestly.
+        """
+        try:
+            await coro
+            if on_ok:
+                on_ok()
+            logger.info("%s: started", name)
+            return True
+        except Exception:
+            if on_fail:
+                on_fail()
+            if required:
+                logger.exception("Required component %s failed to start", name)
+                raise
+            self.status.failed_components.append(name)
+            logger.exception("Failed to start %s (continuing degraded)", name)
+            return False
 
     async def _start_live(self) -> None:
-        """Connect to real exchange APIs."""
-        # Start liquidation WebSocket feeds
-        try:
-            await self.liquidations.start()
-            self.status.liquidation_feed = "connected"
-            logger.info("Liquidation feed: connected")
-        except Exception:
-            self.status.liquidation_feed = "error"
-            logger.exception("Failed to start liquidation feed")
+        """Connect to real exchange APIs.
 
-        # Start order flow WebSocket
-        try:
-            await self.orderflow.start()
-            self.status.orderflow_engine = "connected"
-            logger.info("Order flow engine: connected")
-        except Exception:
-            self.status.orderflow_engine = "error"
-            logger.exception("Failed to start order flow engine")
+        Every component is optional-but-reported: a failure puts it in
+        status.failed_components (surfaced via /v1/health and the startup
+        log) instead of being silently swallowed.
+        """
+        s = self.status
+        await self._start_component(
+            "liquidation_feed", self.liquidations.start(),
+            on_ok=lambda: setattr(s, "liquidation_feed", "connected"),
+            on_fail=lambda: setattr(s, "liquidation_feed", "error"),
+        )
+        await self._start_component(
+            "orderflow_engine", self.orderflow.start(),
+            on_ok=lambda: setattr(s, "orderflow_engine", "connected"),
+            on_fail=lambda: setattr(s, "orderflow_engine", "error"),
+        )
+        await self._start_component("smart_money", self.smart_money.start())
+        await self._start_component(
+            "hlp_tracker", self.hlp.start(),
+            on_ok=lambda: setattr(s, "hlp_status", "connected"),
+            on_fail=lambda: setattr(s, "hlp_status", "error"),
+        )
+        await self._start_component("funding_rates", self.funding.start())
+        await self._start_component("long_short_ratio", self.lsr.start())
+        await self._start_component(
+            "orderbook", self.orderbook.start(),
+            on_ok=lambda: setattr(s, "orderbook_feed", "connected"),
+            on_fail=lambda: setattr(s, "orderbook_feed", "error"),
+        )
+        await self._start_component(
+            "spot_prices",
+            self.spot.start(perp_price_fn=lambda sym: self.market.assets.get(sym)),
+        )
+        await self._start_component("deribit_iv", self.deribit.start())
 
-        # Start smart money engine
-        try:
-            await self.smart_money.start()
-            logger.info("Smart money engine: started")
-        except Exception:
-            logger.exception("Failed to start smart money engine")
-
-        # Start HLP tracker
-        try:
-            await self.hlp.start()
-            self.status.hlp_status = "connected"
-            logger.info("HLP tracker: started")
-        except Exception:
-            self.status.hlp_status = "error"
-            logger.exception("Failed to start HLP tracker")
-
-        try:
-            await self.funding.start()
-            logger.info("Funding rate collector: started")
-        except Exception:
-            logger.exception("Failed to start funding rate collector")
-
-        try:
-            await self.lsr.start()
-            logger.info("Long/short ratio collector: started")
-        except Exception:
-            logger.exception("Failed to start long/short ratio collector")
-
-        try:
-            await self.orderbook.start()
-            self.status.orderbook_feed = "connected"
-            logger.info("OrderBook engine: started")
-        except Exception:
-            self.status.orderbook_feed = "error"
-            logger.exception("Failed to start orderbook engine")
-
-        try:
-            await self.spot.start(perp_price_fn=lambda sym: self.market.assets.get(sym))
-            logger.info("Spot price collector: started")
-        except Exception:
-            logger.exception("Failed to start spot price collector")
-
-        try:
-            await self.deribit.start()
-            logger.info("Deribit IV feed: started")
-        except Exception:
-            logger.exception("Failed to start Deribit IV feed")
-
-        self.status.position_scanner = "ready"
-        self.status.market_data = "ready"
+        # Loop-driven components: 'starting' until their first cycle actually
+        # succeeds (the loops flip these to 'connected'/'error'). Never claim
+        # 'ready' for something that has not fetched anything yet.
+        self.status.position_scanner = "starting"
+        self.status.market_data = "starting"
 
     async def _start_demo(self) -> None:
         """Start mock data generators."""
@@ -468,6 +483,8 @@ class HyperDataHub:
                     all_positions = await self.positions.scan()
                     self.status.tracked_positions = len(all_positions)
                     self.status.discovered_addresses = len(self.positions.discovered_addresses)
+                    # 'connected' only after a scan actually succeeded.
+                    self.status.position_scanner = "connected"
 
                 self.status.last_position_scan = time.time()
                 self.status.scan_cycle += 1
@@ -482,6 +499,8 @@ class HyperDataHub:
             except asyncio.CancelledError:
                 break
             except Exception:
+                if not self.demo:
+                    self.status.position_scanner = "error"
                 logger.exception("Position scan error")
 
             await asyncio.sleep(self.scan_interval)
@@ -494,6 +513,8 @@ class HyperDataHub:
                     await self._demo_market_refresh()
                 else:
                     await self.market.refresh()
+                    # 'connected' only after a refresh actually succeeded.
+                    self.status.market_data = "connected"
 
                 self.status.last_market_refresh = time.time()
                 self.status.tracked_assets = len(self.market.assets)
@@ -501,103 +522,121 @@ class HyperDataHub:
             except asyncio.CancelledError:
                 break
             except Exception:
+                if not self.demo:
+                    self.status.market_data = "error"
                 logger.exception("Market refresh error")
 
             await asyncio.sleep(self.market_refresh_interval)
 
     async def _status_update_loop(self) -> None:
-        """Update uptime counter and periodically refresh DB stats."""
+        """Update uptime counter and periodically refresh DB stats.
+
+        The body is wrapped so one component's bad stats shape can't kill the
+        loop — this loop is also the staleness watchdog and the source of
+        /v1/health data, so it must outlive individual component errors.
+        """
         _db_tick = 0
         while self._running:
-            self.status.uptime_seconds = time.time() - self.status.started_at
-
-            # Update smart money stats every tick
-            sm_stats = self.smart_money.get_stats()
-            self.status.tracked_wallets = sm_stats["total_wallets"]
-            self.status.ranked_wallets = sm_stats["ranked_wallets"]
-            self.status.smart_money_signals = sm_stats["total_signals"]
-
-            # Update HLP stats every tick
-            hlp_stats = self.hlp.get_stats()
-            self.status.hlp_account_value = hlp_stats["account_value"]
-            self.status.hlp_net_delta = hlp_stats["net_delta"]
-            self.status.hlp_delta_zscore = hlp_stats["delta_zscore"]
-            self.status.hlp_positions = hlp_stats["num_positions"]
-            self.status.hlp_trades = hlp_stats["total_trades"]
-            self.status.hlp_liquidation_absorptions = hlp_stats["liquidation_absorptions"]
-            self.status.hlp_session_pnl = hlp_stats["session_pnl"]
-
-            # Check HLP Z-score for alert
-            if abs(hlp_stats.get("delta_zscore", 0)) > 2.0:
-                asyncio.create_task(self.alerts._check_hlp_zscore(hlp_stats))
-
-            # Persist HLP snapshots periodically
-            self.store.maybe_save_hlp_snapshot()
-
-            _db_tick += 1
-            # Prune old rows + checkpoint the WAL roughly hourly so the DB and
-            # the COUNT(*) below stay bounded on long-running instances.
-            if _db_tick % 3600 == 0:
-                try:
-                    self.store.prune()
-                except Exception:
-                    logger.exception("Error pruning DB")
-            # Update persistence stats every 30 seconds
-            if _db_tick % 30 == 0:
-                try:
-                    db_stats = self.store.get_db_stats()
-                    self.status.db_size_mb = db_stats["db_size_mb"]
-                    self.status.events_persisted = (
-                        db_stats["liquidations_stored"] + db_stats["trades_stored"]
-                    )
-                except Exception:
-                    logger.exception("Error fetching DB stats")
-                try:
-                    for ex_rates in self.funding.rates.values():
-                        for snap in ex_rates.values():
-                            self.store.save_funding_rate(snap)
-                except Exception:
-                    logger.exception("Error saving funding rate snapshots")
-                try:
-                    for snap in self.lsr.ratios.values():
-                        self.store.save_long_short_ratio(snap)
-                except Exception:
-                    logger.exception("Error saving LSR snapshots")
-                try:
-                    for snap in self.deribit.snapshots.values():
-                        self.store.save_options_snapshot(snap)
-                except Exception:
-                    logger.exception("Error saving Deribit IV snapshots")
-
-            # Update new component status fields every tick
-            self.status.funding_rate_symbols_binance = len(self.funding.rates.get("binance", {}))
-            self.status.funding_rate_symbols_bybit = len(self.funding.rates.get("bybit", {}))
-
-            btc_lsr = self.lsr.get_latest("BTC")
-            eth_lsr = self.lsr.get_latest("ETH")
-            self.status.lsr_btc_ratio = btc_lsr.long_short_ratio if btc_lsr else 0.0
-            self.status.lsr_eth_ratio = eth_lsr.long_short_ratio if eth_lsr else 0.0
-
-            self.status.orderbook_symbols = len(self.orderbook.snapshots)
-
-            btc_spot = self.spot.get_latest("BTC")
-            eth_spot = self.spot.get_latest("ETH")
-            self.status.spot_btc_basis_pct = btc_spot.basis_pct if btc_spot else 0.0
-            self.status.spot_eth_basis_pct = eth_spot.basis_pct if eth_spot else 0.0
-
-            btc_iv = self.deribit.get_latest("BTC")
-            eth_iv = self.deribit.get_latest("ETH")
-            self.status.deribit_btc_iv = btc_iv.mark_iv if btc_iv else 0.0
-            self.status.deribit_eth_iv = eth_iv.mark_iv if eth_iv else 0.0
-            # ── Staleness watchdog ──────────────────────────────────
-            # Flag WS feeds that have stopped delivering data as 'stale' so the
-            # UI/API never present frozen numbers as live, and force a reconnect
-            # on a socket that's alive-but-silent (heartbeat only catches
-            # half-open connections, not a venue that quietly stops sending).
-            if not self.demo:
-                await self._update_feed_staleness()
+            try:
+                _db_tick = await self._status_update_tick(_db_tick)
+                # NOTE: HLP z-score alert dispatch was removed here — the
+                # AlertManager z-score/cascade sends are deliberately disabled
+                # (too noisy), so scheduling tasks for them was dead work.
+                # Re-add scheduling here if those alerts are re-enabled.
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("Status update loop error")
 
             await asyncio.sleep(1)
+
+    async def _status_update_tick(self, _db_tick: int) -> int:
+        """One status-loop iteration. Returns the incremented DB tick."""
+        self.status.uptime_seconds = time.time() - self.status.started_at
+
+        # Update smart money stats every tick
+        sm_stats = self.smart_money.get_stats()
+        self.status.tracked_wallets = sm_stats["total_wallets"]
+        self.status.ranked_wallets = sm_stats["ranked_wallets"]
+        self.status.smart_money_signals = sm_stats["total_signals"]
+
+        # Update HLP stats every tick
+        hlp_stats = self.hlp.get_stats()
+        self.status.hlp_account_value = hlp_stats["account_value"]
+        self.status.hlp_net_delta = hlp_stats["net_delta"]
+        self.status.hlp_delta_zscore = hlp_stats["delta_zscore"]
+        self.status.hlp_positions = hlp_stats["num_positions"]
+        self.status.hlp_trades = hlp_stats["total_trades"]
+        self.status.hlp_liquidation_absorptions = hlp_stats["liquidation_absorptions"]
+        self.status.hlp_session_pnl = hlp_stats["session_pnl"]
+
+        # Persist HLP snapshots periodically
+        self.store.maybe_save_hlp_snapshot()
+
+        _db_tick += 1
+        # Prune old rows + checkpoint the WAL roughly hourly so the DB and
+        # the COUNT(*) below stay bounded on long-running instances.
+        if _db_tick % 3600 == 0:
+            try:
+                self.store.prune()
+            except Exception:
+                logger.exception("Error pruning DB")
+        # Update persistence stats every 30 seconds
+        if _db_tick % 30 == 0:
+            try:
+                db_stats = self.store.get_db_stats()
+                self.status.db_size_mb = db_stats["db_size_mb"]
+                self.status.events_persisted = (
+                    db_stats["liquidations_stored"] + db_stats["trades_stored"]
+                )
+            except Exception:
+                logger.exception("Error fetching DB stats")
+            try:
+                for ex_rates in self.funding.rates.values():
+                    for snap in ex_rates.values():
+                        self.store.save_funding_rate(snap)
+            except Exception:
+                logger.exception("Error saving funding rate snapshots")
+            try:
+                for snap in self.lsr.ratios.values():
+                    self.store.save_long_short_ratio(snap)
+            except Exception:
+                logger.exception("Error saving LSR snapshots")
+            try:
+                for snap in self.deribit.snapshots.values():
+                    self.store.save_options_snapshot(snap)
+            except Exception:
+                logger.exception("Error saving Deribit IV snapshots")
+
+        # Update new component status fields every tick
+        self.status.funding_rate_symbols_binance = len(self.funding.rates.get("binance", {}))
+        self.status.funding_rate_symbols_bybit = len(self.funding.rates.get("bybit", {}))
+
+        btc_lsr = self.lsr.get_latest("BTC")
+        eth_lsr = self.lsr.get_latest("ETH")
+        self.status.lsr_btc_ratio = btc_lsr.long_short_ratio if btc_lsr else 0.0
+        self.status.lsr_eth_ratio = eth_lsr.long_short_ratio if eth_lsr else 0.0
+
+        self.status.orderbook_symbols = len(self.orderbook.snapshots)
+
+        btc_spot = self.spot.get_latest("BTC")
+        eth_spot = self.spot.get_latest("ETH")
+        self.status.spot_btc_basis_pct = btc_spot.basis_pct if btc_spot else 0.0
+        self.status.spot_eth_basis_pct = eth_spot.basis_pct if eth_spot else 0.0
+
+        btc_iv = self.deribit.get_latest("BTC")
+        eth_iv = self.deribit.get_latest("ETH")
+        self.status.deribit_btc_iv = btc_iv.mark_iv if btc_iv else 0.0
+        self.status.deribit_eth_iv = eth_iv.mark_iv if eth_iv else 0.0
+        # ── Staleness watchdog ──────────────────────────────────
+        # Flag WS feeds that have stopped delivering data as 'stale' so the
+        # UI/API never present frozen numbers as live, and force a reconnect
+        # on a socket that's alive-but-silent (heartbeat only catches
+        # half-open connections, not a venue that quietly stops sending).
+        if not self.demo:
+            await self._update_feed_staleness()
+
+        return _db_tick
 
     async def _health_monitor_loop(self) -> None:
         """Run data-integrity checks against external sources on an interval.
@@ -628,6 +667,22 @@ class HyperDataHub:
             self.status.orderflow_engine = (
                 "stale" if self.orderflow.is_stale() else "connected"
             )
+            # Combined freshness follows the freshest venue, so one dead venue
+            # can hide behind the other. Warn (debounced) when that happens so
+            # "orderflow connected" is never silently half-true.
+            if not self.orderflow.is_stale():
+                now_w = time.time()
+                for venue in ("hyperliquid", "binance"):
+                    if (self.orderflow.venue_is_stale(venue)
+                            and self.orderflow.venue_data_age(venue) != float("inf")
+                            and now_w - self._venue_stale_warned_at.get(venue, 0.0) > 300):
+                        self._venue_stale_warned_at[venue] = now_w
+                        logger.warning(
+                            "[hub] order flow venue %s silent %.0fs while the "
+                            "combined feed is still fresh — venue-specific "
+                            "data (per-venue CVD) is stale",
+                            venue, self.orderflow.venue_data_age(venue),
+                        )
             # Both venues silent for well past the threshold → kick the HL
             # socket so its backoff loop rebuilds it. The Binance loop self-heals
             # via its own heartbeat, and if Binance were still feeding, the
@@ -802,7 +857,8 @@ class HyperDataHub:
                 total_realized_pnl=total_pnl,
                 total_volume_usd=volume,
                 largest_win=abs(total_pnl) * random.uniform(0.05, 0.3) if total_pnl > 0 else random.uniform(100, 50000),
-                largest_loss=-abs(total_pnl) * random.uniform(0.02, 0.15) if total_pnl < 0 else -random.uniform(100, 30000),
+                largest_loss=(-abs(total_pnl) * random.uniform(0.02, 0.15)
+                              if total_pnl < 0 else -random.uniform(100, 30000)),
                 avg_hold_time_seconds=random.uniform(60, 86400),
                 win_rate=win_rate,
                 sharpe_ratio=sharpe,
@@ -992,6 +1048,7 @@ class HyperDataHub:
     async def _demo_market_refresh(self) -> None:
         """Generate mock market data for demo mode."""
         import random
+
         from src.data_layer.market_data import AssetInfo
 
         mock_assets = [
@@ -1032,6 +1089,7 @@ class HyperDataHub:
     async def _demo_deribit(self) -> None:
         """Generate synthetic Deribit DVOL data for demo mode."""
         import random
+
         from src.data_layer.deribit import DeribitIVSnapshot
 
         btc_iv = 55.0
@@ -1063,6 +1121,7 @@ class HyperDataHub:
     async def _demo_basis(self) -> None:
         """Generate synthetic spot/perp basis data for demo mode."""
         import random
+
         from src.data_layer.spot_prices import SpotPriceSnapshot
 
         bases = {"BTC": 0.05, "ETH": 0.03, "SOL": 0.08}
@@ -1094,6 +1153,7 @@ class HyperDataHub:
     async def _demo_lsr(self) -> None:
         """Generate synthetic long/short ratio data for demo mode."""
         import random
+
         from src.data_layer.long_short_ratio import LongShortSnapshot
 
         ratios = {"BTC": 1.1, "ETH": 0.95, "SOL": 1.2}

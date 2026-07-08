@@ -11,7 +11,6 @@ from rich.live import Live
 from rich.panel import Panel
 from rich.text import Text
 
-from src.data_layer.hub import HyperDataHub
 from src.dashboards.hub_panels import (
     HubCVD,
     HubHLP,
@@ -24,6 +23,7 @@ from src.dashboards.hub_panels import (
     HubWhales,
 )
 from src.dashboards.liquidation_heatmap import LiquidationHeatmapDashboard
+from src.data_layer.hub import HyperDataHub
 
 
 class CombinedDashboard:
