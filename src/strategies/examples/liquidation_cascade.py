@@ -42,8 +42,11 @@ class LiquidationCascade(Strategy):
         if not stats:
             return None
 
-        # Look for a spike in long liquidations (longs getting wiped = price dropping)
-        long_liq_usd = getattr(stats, "total_long_usd", 0) or 0
+        # Look for a spike in long liquidations (longs getting wiped = price
+        # dropping). get_stats() returns a dict; the long-side dollar volume
+        # key is long_volume_usd (getattr on a dict always returned 0 and
+        # silently disabled this strategy).
+        long_liq_usd = stats.get("long_volume_usd", 0) or 0
 
         if long_liq_usd >= self.cascade_threshold_usd:
             self._last_signal_time = now

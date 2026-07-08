@@ -82,12 +82,23 @@ class LLMAgent(Strategy):
         self._eval_times.append(now)
         return True
 
-    def evaluate(self, hub) -> Signal | None:
+    def _refund_eval_slot(self) -> None:
+        """Return the most recent budget slot.
+
+        Called when the call failed at the TRANSPORT level (timeout, refused
+        connection, HTTP error) — no tokens were consumed, so a flaky
+        provider must not exhaust the hourly budget. Parse failures keep
+        their slot: the provider did the work and billed for it.
+        """
+        if self._eval_times:
+            self._eval_times.pop()
+
+    async def evaluate(self, hub) -> Signal | None:
         """Build a market summary and ask the LLM for a decision.
 
-        NOTE: This calls an async HTTP endpoint. Since evaluate() is
-        synchronous, we use asyncio to run the coroutine. If you're
-        already in an async context, see _async_evaluate() directly.
+        Async: the blocking HTTP call runs in the persistent worker thread
+        and is awaited, so a slow LLM response cannot stall the paper
+        trader's event loop (other strategies keep evaluating).
         """
         # If no API key and not using a local model, warn and skip
         if not self.api_key and "localhost" not in self.base_url:
@@ -104,11 +115,16 @@ class LLMAgent(Strategy):
             )
             return None
 
+        loop = asyncio.get_running_loop()
         try:
-            # Run blocking LLM call in the persistent worker thread so it
-            # doesn't stall the async loop.
-            future = self._pool.submit(self._sync_evaluate, hub)
-            return future.result(timeout=20)
+            return await asyncio.wait_for(
+                loop.run_in_executor(self._pool, self._sync_evaluate, hub),
+                timeout=20,
+            )
+        except asyncio.TimeoutError:
+            self._refund_eval_slot()
+            logger.warning("LLM evaluation timed out after 20s")
+            return None
         except Exception:
             logger.exception("LLM agent error")
             return None
@@ -147,6 +163,9 @@ class LLMAgent(Strategy):
                 data = _json.loads(resp.read())
             text = data["choices"][0]["message"]["content"].strip()
         except Exception as e:
+            # Transport-level failure: no tokens consumed — give the budget
+            # slot back so a down provider can't burn the hourly allowance.
+            self._refund_eval_slot()
             logger.warning("LLM API call failed: %s", e)
             return None
 
@@ -204,13 +223,17 @@ class LLMAgent(Strategy):
     def _parse_response(self, text: str) -> Signal | None:
         """Parse LLM response text into a Signal — deterministic, reject-on-ambiguous.
 
-        The first line must be exactly BUY, SELL, or HOLD (case-insensitive,
-        surrounding punctuation tolerated). Substring matching is deliberately
-        NOT done: "I would not BUY here" must never resolve to a BUY.
+        The first NON-EMPTY line must be exactly BUY, SELL, or HOLD
+        (case-insensitive, surrounding punctuation tolerated; leading blank
+        lines are ignored). Substring matching is deliberately NOT done:
+        "I would not BUY here" must never resolve to a BUY.
         """
-        lines = text.split("\n", 1)
-        action_word = lines[0].strip().upper().strip(".!:*# ")
-        reason = lines[1].strip() if len(lines) > 1 else ""
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if not lines:
+            logger.warning("LLM returned empty response")
+            return None
+        action_word = lines[0].upper().strip(".!:*# ")
+        reason = " ".join(lines[1:]) if len(lines) > 1 else ""
 
         if action_word not in ("BUY", "SELL", "HOLD"):
             logger.warning("LLM returned ambiguous action, rejecting: %r", lines[0][:100])

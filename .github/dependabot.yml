@@ -1,0 +1,14 @@
+version: 2
+updates:
+  # Keep requirements.lock / pyproject deps patched (security + routine).
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+
+  # Keep SHA-pinned GitHub Actions fresh.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"

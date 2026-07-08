@@ -14,6 +14,7 @@ Usage:
 
 import atexit
 import logging
+import shutil
 import sqlite3
 import threading
 import time
@@ -56,9 +57,18 @@ class DataStore:
             conn.execute("PRAGMA integrity_check")
             self._conn = conn
             self._init_tables()
-        except sqlite3.DatabaseError:
+        except sqlite3.DatabaseError as exc:
             if conn is not None:
                 conn.close()
+            # Lock/busy contention is NOT corruption: another process (a
+            # dashboard, a verification run) holding the DB must not get the
+            # healthy database quarantined out from under it.
+            if "lock" in str(exc).lower() or "busy" in str(exc).lower():
+                logger.error(
+                    "Database at %s is locked/busy — failing startup rather "
+                    "than quarantining a healthy DB: %s", self.db_path, exc,
+                )
+                raise
             # Quarantine, never delete: move the corrupted DB (and WAL/SHM)
             # aside with a timestamp so history survives for postmortem and
             # possible `.recover`, then start fresh.
@@ -70,19 +80,33 @@ class DataStore:
                 if p.exists():
                     dest = quarantine_dir / f"{p.name}.{stamp}"
                     try:
-                        p.rename(dest)
+                        shutil.move(str(p), str(dest))  # handles cross-device
                     except OSError:
                         logger.exception("Failed to quarantine %s", p)
-                        p.unlink()  # last resort so we can still start
+                        try:
+                            p.unlink()  # last resort so we can still start
+                        except OSError:
+                            logger.exception("Could not remove %s either", p)
             logger.error(
                 "Database corrupted at %s — quarantined to %s and recreated. "
                 "Historical data is preserved there for recovery.",
                 self.db_path, quarantine_dir,
             )
-            self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False, timeout=10)
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA synchronous=NORMAL")
-            self._init_tables()
+            try:
+                self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False, timeout=10)
+                self._conn.execute("PRAGMA journal_mode=WAL")
+                self._conn.execute("PRAGMA synchronous=NORMAL")
+                self._init_tables()
+            except sqlite3.DatabaseError:
+                # The corrupted file could not be moved OR removed (held
+                # handle, read-only mount). Run on an in-memory DB so the
+                # terminal stays alive; persistence is lost for this session.
+                logger.critical(
+                    "Could not recreate database at %s — falling back to an "
+                    "in-memory store (NO persistence this session)", self.db_path,
+                )
+                self._conn = sqlite3.connect(":memory:", check_same_thread=False)
+                self._init_tables()
 
         # Safety net for graceful exits (normal return, unhandled exception,
         # Ctrl-C → KeyboardInterrupt unwinds to interpreter exit). The

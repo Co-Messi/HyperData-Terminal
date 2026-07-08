@@ -15,6 +15,7 @@ Environment variables:
 import asyncio
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass
 
@@ -358,7 +359,7 @@ class AlertManager:
 
     # Deadline for webhook posts: a stalled Telegram/Discord endpoint must
     # not wedge whatever task is delivering the alert.
-    _SEND_TIMEOUT = aiohttp.ClientTimeout(total=10)
+    _SEND_TIMEOUT = aiohttp.ClientTimeout(total=10, connect=3, sock_connect=3, sock_read=5)
 
     async def _send(self, message: str) -> None:
         """Send alert to all configured channels."""
@@ -380,8 +381,10 @@ class AlertManager:
                         logger.info("Telegram alert sent")
                     else:
                         logger.warning("Telegram send returned %d", resp.status)
-            except Exception:
-                logger.exception("Telegram send failed")
+            except Exception as exc:
+                # Exception type only — aiohttp error messages can embed the
+                # request URL, which contains the bot token.
+                logger.warning("Telegram send failed: %s", type(exc).__name__)
 
         # Discord
         if self.discord_webhook:
@@ -393,14 +396,17 @@ class AlertManager:
                         logger.info("Discord alert sent")
                     else:
                         logger.warning("Discord send returned %d", resp.status)
-            except Exception:
-                logger.exception("Discord send failed")
+            except Exception as exc:
+                # Exception type only — error messages can embed the webhook URL.
+                logger.warning("Discord send failed: %s", type(exc).__name__)
 
         # Log that an alert fired, not its payload — alert bodies can contain
         # wallet addresses and position intelligence that must not sit in
-        # rotating plaintext logs.
+        # rotating plaintext logs. Wallet addresses are masked even on the
+        # first line in case a future alert format leads with one.
         first_line = message.strip().splitlines()[0] if message.strip() else ""
-        logger.warning("ALERT sent (%d total): %.80s", self.alerts_sent, first_line)
+        redacted = re.sub(r"0x[0-9a-fA-F]{40}", "0x…[redacted]", first_line)
+        logger.warning("ALERT sent (%d total): %.80s", self.alerts_sent, redacted)
 
     async def send_test(self) -> bool:
         """Send a test alert to verify configuration."""

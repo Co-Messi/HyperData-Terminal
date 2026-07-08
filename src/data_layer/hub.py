@@ -536,20 +536,13 @@ class HyperDataHub:
         /v1/health data, so it must outlive individual component errors.
         """
         _db_tick = 0
-        _last_hlp_alert_check = 0.0
         while self._running:
             try:
                 _db_tick = await self._status_update_tick(_db_tick)
-
-                # Check HLP Z-score for alert — at most once a minute while
-                # extreme, not one new task per tick.
-                hlp_zscore = self.status.hlp_delta_zscore
-                now = time.time()
-                if abs(hlp_zscore) > 2.0 and now - _last_hlp_alert_check > 60.0:
-                    _last_hlp_alert_check = now
-                    asyncio.create_task(
-                        self.alerts._check_hlp_zscore(self.hlp.get_stats())
-                    )
+                # NOTE: HLP z-score alert dispatch was removed here — the
+                # AlertManager z-score/cascade sends are deliberately disabled
+                # (too noisy), so scheduling tasks for them was dead work.
+                # Re-add scheduling here if those alerts are re-enabled.
             except asyncio.CancelledError:
                 break
             except Exception:

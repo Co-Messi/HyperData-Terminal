@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -9,6 +10,8 @@ import aiohttp
 
 from src.data_layer import address_store
 
+logger = logging.getLogger(__name__)
+
 API_URL = "https://api.hyperliquid.xyz/info"
 DATA_DIR = Path(__file__).resolve().parents[2] / "data"
 
@@ -16,8 +19,9 @@ RATE_LIMIT_PER_SEC = 10
 META_CACHE_TTL = 300  # 5 minutes
 
 # Explicit deadline on every request so a hung endpoint fails the scan cycle
-# instead of blocking the hub's position-scan loop indefinitely.
-HTTP_TIMEOUT = aiohttp.ClientTimeout(total=10)
+# instead of blocking the hub's position-scan loop indefinitely. Split
+# connect/read so a slow handshake can't consume the entire budget.
+HTTP_TIMEOUT = aiohttp.ClientTimeout(total=10, connect=3, sock_connect=3, sock_read=5)
 
 
 @dataclass
@@ -56,7 +60,16 @@ class PositionScanner:
         async with aiohttp.ClientSession() as session:
             self._session = session
             try:
-                await asyncio.gather(self.update_prices(), self.update_meta())
+                # Independent updates: one endpoint failing must not discard
+                # the other's result (meta is a 5-min cache — losing a refresh
+                # means stale maintenance margins for the whole window).
+                results = await asyncio.gather(
+                    self.update_prices(), self.update_meta(),
+                    return_exceptions=True,
+                )
+                for name, res in zip(("update_prices", "update_meta"), results):
+                    if isinstance(res, BaseException):
+                        logger.warning("[scanner] %s failed: %r", name, res)
 
                 # Discover new addresses: always on first run, then every 30 minutes
                 import time as _time

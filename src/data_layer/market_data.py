@@ -13,7 +13,9 @@ logger = logging.getLogger(__name__)
 
 # Every outbound request gets an explicit deadline: a hung exchange endpoint
 # must fail the refresh cycle, not stall the hub's market-refresh loop forever.
-HTTP_TIMEOUT = aiohttp.ClientTimeout(total=10)
+# connect/sock_read are split so a slow TLS handshake (venue throttling) can't
+# consume the whole budget and masquerade as a partial-read error.
+HTTP_TIMEOUT = aiohttp.ClientTimeout(total=10, connect=3, sock_connect=3, sock_read=5)
 
 
 @dataclass

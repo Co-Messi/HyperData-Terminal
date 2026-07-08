@@ -129,8 +129,14 @@ def _make_cors_middleware(allowed_origins: set[str] | None):
     return cors_middleware
 
 
-# Paths reachable without an API key (liveness checks must not need secrets).
-_UNAUTHENTICATED_PATHS = {"/v1/health", "/health"}
+# Paths reachable without an API key. Only the minimal liveness probe is
+# exempt — the detailed /v1/health payload (mode, feed states, counters) is
+# operational recon and requires the key on authenticated deployments.
+_UNAUTHENTICATED_PATHS = {"/v1/live"}
+
+# Paths exempt from per-IP rate limiting: load balancers, uptime monitors,
+# and liveness probes often share one NAT egress IP and poll continuously.
+_RATE_LIMIT_EXEMPT_PATHS = {"/v1/live", "/v1/health", "/health"}
 
 
 def _make_auth_middleware(api_key: str):
@@ -185,6 +191,8 @@ class _RateLimiter:
 def _make_rate_limit_middleware(limiter: _RateLimiter):
     @web.middleware
     async def rate_limit_middleware(request: web.Request, handler):
+        if request.path in _RATE_LIMIT_EXEMPT_PATHS:
+            return await handler(request)
         remote = request.remote or "unknown"
         if not limiter.allow(remote):
             return web.json_response({"error": "Rate limit exceeded"}, status=429)
@@ -303,6 +311,7 @@ class HyperDataAPI:
     async def start(self) -> None:
         api_key, cors_origins = self._resolve_security()
         self._api_key = api_key
+        self._cors_origins = cors_origins
 
         middlewares = [_make_rate_limit_middleware(self._rate_limiter)]
         if api_key:
@@ -312,6 +321,7 @@ class HyperDataAPI:
 
         # v1 routes
         v1 = [
+            ("GET", "/v1/live", self.handle_live),
             ("GET", "/v1/health", self.handle_health),
             ("GET", "/v1/market", self.handle_market),
             ("GET", "/v1/market/{symbol}", self.handle_market_symbol),
@@ -415,6 +425,7 @@ class HyperDataAPI:
     _DEDUP_MAX = 500
     _CASCADE_WINDOW = 30
     _CASCADE_BYPASS_DURATION = 30
+    _CASCADE_TRACKER_MAX = 200  # entries kept per symbol/side/exchange key
 
     def __init_dedup(self):
         if not hasattr(self, '_liq_seen'):
@@ -423,27 +434,45 @@ class HyperDataAPI:
             self._heartbeat_task: asyncio.Task | None = None
             self._cascade_tracker: dict[str, list] = {}
             self._cascade_bypass: dict[str, float] = {}
+            self._cascade_bypass_started: dict[str, float] = {}
             self._liq_stats = {"received": 0, "broadcast": 0, "deduped": 0, "filtered": 0}
             self._liq_stats_ts = time.time()
+
+    # Plausible epoch-seconds range for exchange event times (2001..5138).
+    # A timestamp outside this range means a connector skipped ms→s
+    # normalization (or sent 0) — such events cannot be safely hashed.
+    _TS_SANE_MIN = 1e9
+    _TS_SANE_MAX = 1e11
 
     def _is_duplicate_liq(self, ev) -> bool:
         """Duplicate check within the dedup window, keyed per exchange.
 
         Buckets on the EXCHANGE event timestamp (not local receive time) so
         two records of the same event dedup identically regardless of local
-        delivery jitter. The cascade bypass is also per-exchange: a Binance
-        cascade must not let Hyperliquid's heuristic events skip dedup.
+        delivery jitter. Events without a plausible exchange timestamp are
+        never deduped — substituting the local clock would collide distinct
+        events that merely arrived together. The hash uses the exact size:
+        replayed duplicates carry identical payloads, while distinct events
+        of similar size must not collapse into one. The cascade bypass is
+        also per-exchange: a Binance cascade must not let Hyperliquid's
+        heuristic events skip dedup.
         """
         self.__init_dedup()
         now = time.time()
+
+        ev_ts = ev.timestamp
+        if not (self._TS_SANE_MIN < ev_ts < self._TS_SANE_MAX):
+            logger.warning(
+                "[liq] %s event has implausible timestamp %r — skipping dedup",
+                ev.exchange, ev_ts,
+            )
+            return False
 
         bypass_key = f"{ev.symbol}_{ev.side}_{ev.exchange}"
         if bypass_key in self._cascade_bypass and now < self._cascade_bypass[bypass_key]:
             return False
 
-        ev_ts = ev.timestamp if ev.timestamp > 0 else now
-        size_rounded = round(ev.size_usd, -2)
-        h = f"{ev.symbol}_{ev.side}_{size_rounded}_{ev.exchange}_{int(ev_ts // self._DEDUP_WINDOW)}"
+        h = f"{ev.symbol}_{ev.side}_{ev.size_usd:.2f}_{ev.exchange}_{int(ev_ts // self._DEDUP_WINDOW)}"
 
         if len(self._liq_seen) > self._DEDUP_MAX:
             cutoff = now - self._DEDUP_WINDOW * 2
@@ -474,14 +503,26 @@ class HyperDataAPI:
         ]
 
         self._cascade_tracker[key].append((now, ev.size_usd))
+        # Bound per-key memory: only the most recent window entries matter.
+        if len(self._cascade_tracker[key]) > self._CASCADE_TRACKER_MAX:
+            self._cascade_tracker[key] = self._cascade_tracker[key][-self._CASCADE_TRACKER_MAX:]
 
         entries = self._cascade_tracker[key]
         if len(entries) >= 3:
             # Bypass dedup only for this exchange's stream: cascades on one
-            # venue say nothing about duplicates on another.
-            self._cascade_bypass[key] = now + self._CASCADE_BYPASS_DURATION
+            # venue say nothing about duplicates on another. The bypass has
+            # an ABSOLUTE cap: without it, events passing dedup during the
+            # bypass re-trigger cascade detection and extend it forever
+            # (replayed duplicates would keep the floodgate open).
+            first = self._cascade_bypass_started.setdefault(key, now)
+            cap = first + 2 * self._CASCADE_BYPASS_DURATION
+            self._cascade_bypass[key] = min(now + self._CASCADE_BYPASS_DURATION, cap)
             total = sum(sz for _, sz in entries)
             return f"cascade ${total:,.0f} ({len(entries)}x in {self._CASCADE_WINDOW}s)"
+
+        # Quiet again: allow a future cascade to start a fresh bypass window.
+        if key in self._cascade_bypass_started and now > self._cascade_bypass.get(key, 0):
+            del self._cascade_bypass_started[key]
 
         return None
 
@@ -683,7 +724,19 @@ class HyperDataAPI:
 
     # ── WebSocket handler ────────────────────────────────────────
 
-    async def handle_ws(self, request: web.Request) -> web.WebSocketResponse:
+    async def handle_ws(self, request: web.Request) -> web.WebSocketResponse | web.Response:
+        # Browser WebSockets are NOT gated by the same-origin policy: any
+        # webpage can open ws://127.0.0.1 and read the stream. An Origin
+        # header means a browser context — reject it unless the origin was
+        # explicitly allowlisted (HYPERDATA_CORS_ORIGINS). Non-browser
+        # clients (curl, bots, SDKs) send no Origin and are unaffected.
+        origin = request.headers.get("Origin")
+        if origin is not None:
+            allowed = getattr(self, "_cors_origins", None) or set()
+            if origin not in allowed:
+                logger.warning("[ws] Rejected cross-origin upgrade from %s", origin)
+                return web.json_response({"error": "Origin not allowed"}, status=403)
+
         if len(self._ws_clients) >= MAX_WS_CONNECTIONS:
             return web.json_response({"error": "Too many connections"}, status=429)
         ws = web.WebSocketResponse(heartbeat=20, max_msg_size=WS_MAX_MSG_BYTES)
@@ -740,6 +793,15 @@ class HyperDataAPI:
 
     # ── REST Handlers ────────────────────────────────────────────
 
+    async def handle_live(self, request: web.Request) -> web.Response:
+        """Minimal liveness probe — safe to expose unauthenticated.
+
+        Deliberately says nothing about mode, feeds, or counters: the
+        detailed /v1/health payload is operational recon and requires the
+        API key on authenticated deployments.
+        """
+        return web.json_response({"status": "ok"})
+
     async def handle_health(self, request: web.Request) -> web.Response:
         s = self.hub.status
         uptime = int(s.uptime_seconds)
@@ -770,10 +832,12 @@ class HyperDataAPI:
 
         # Top-level status reflects data health when available: 'ok' only when
         # nothing is stale/drifting. 'degraded' otherwise (server is still up).
-        # Components that failed to start also force 'degraded'.
+        # Components that failed to start OR whose loops are currently erroring
+        # (position scanner / market data flip to 'error' at runtime without
+        # touching failed_components) also force 'degraded'.
         overall = data_health.get("overall") if data_health else None
         status = "ok" if overall in (None, "ok", "warn") else "degraded"
-        if s.failed_components:
+        if s.failed_components or any(v == "error" for v in feeds.values()):
             status = "degraded"
 
         return web.json_response({

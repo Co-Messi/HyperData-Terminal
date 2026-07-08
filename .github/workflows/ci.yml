@@ -20,21 +20,23 @@ jobs:
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
-        # requirements.lock pins the runtime deps; -e . adds the package itself.
+        # requirements.lock pins the runtime deps; -e . adds the package
+        # itself; test tooling is pinned so CI is deterministic.
         run: |
           pip install -r requirements.lock
           pip install -e . --no-deps
-          pip install pytest pytest-asyncio ruff pip-audit
+          pip install pytest==9.1.1 pytest-asyncio==1.4.0 ruff==0.15.20 pip-audit==2.10.1
 
       - name: Lint
         run: ruff check src/ tests/
 
       - name: Dependency vulnerability audit
-        # Advisory: a newly-published CVE in a pinned dep should be visible
-        # without failing unrelated PRs. Review failures in the job log.
-        continue-on-error: true
+        # Blocking: a known CVE in a pinned runtime dep fails CI. Dependabot
+        # (.github/dependabot.yml) keeps the lockfile and action SHAs fresh.
         run: pip-audit -r requirements.lock
 
       - name: Test imports

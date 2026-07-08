@@ -7,7 +7,9 @@ corruption quarantine + schema versioning, and alert log redaction.
 """
 from __future__ import annotations
 
+import inspect
 import json
+import sqlite3
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -18,6 +20,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from data_layer.liquidation_feed import (
     BinanceConnection,
+    BybitConnection,
     LiquidationEvent,
     LiquidationFeed,
     OKXConnection,
@@ -64,6 +67,7 @@ async def _client_for(middlewares) -> TestClient:
     async def ok(request):
         return web.json_response({"ok": True})
 
+    app.router.add_get("/v1/live", ok)
     app.router.add_get("/v1/health", ok)
     app.router.add_get("/v1/whales", ok)
     client = TestClient(TestServer(app))
@@ -121,20 +125,23 @@ class TestBindGuard:
 
 class TestAuthMiddleware:
     @pytest.mark.asyncio
-    async def test_key_required_except_health(self):
+    async def test_key_required_except_liveness(self):
         client = await _client_for([
             _make_auth_middleware("sekrit"),
             _make_cors_middleware(None),
         ])
         try:
-            assert (await client.get("/v1/health")).status == 200
+            # Only the minimal liveness probe is exempt; the detailed health
+            # payload is operational recon and requires the key.
+            assert (await client.get("/v1/live")).status == 200
+            assert (await client.get("/v1/health")).status == 401
             assert (await client.get("/v1/whales")).status == 401
             ok_bearer = await client.get(
                 "/v1/whales", headers={"Authorization": "Bearer sekrit"})
             assert ok_bearer.status == 200
-            ok_header = await client.get(
-                "/v1/whales", headers={"X-API-Key": "sekrit"})
-            assert ok_header.status == 200
+            ok_health = await client.get(
+                "/v1/health", headers={"X-API-Key": "sekrit"})
+            assert ok_health.status == 200
             bad = await client.get(
                 "/v1/whales", headers={"Authorization": "Bearer wrong"})
             assert bad.status == 401
@@ -162,8 +169,25 @@ class TestAuthMiddleware:
         client = await _client_for([_make_rate_limit_middleware(limiter)])
         try:
             for _ in range(3):
+                assert (await client.get("/v1/whales")).status == 200
+            assert (await client.get("/v1/whales")).status == 429
+        finally:
+            await client.close()
+
+    @pytest.mark.asyncio
+    async def test_health_probes_exempt_from_rate_limit(self):
+        """LBs/monitors behind one NAT IP poll health continuously — a 429
+        there makes the balancer mark the backend down."""
+        limiter = _RateLimiter(max_requests=2, window_s=60)
+        client = await _client_for([_make_rate_limit_middleware(limiter)])
+        try:
+            for _ in range(10):
                 assert (await client.get("/v1/health")).status == 200
-            assert (await client.get("/v1/health")).status == 429
+                assert (await client.get("/v1/live")).status == 200
+            # Non-exempt routes still consume the budget normally.
+            assert (await client.get("/v1/whales")).status == 200
+            assert (await client.get("/v1/whales")).status == 200
+            assert (await client.get("/v1/whales")).status == 429
         finally:
             await client.close()
 
@@ -252,11 +276,46 @@ class TestLiquidationDedup:
 
     def test_dedup_uses_exchange_timestamp_not_local_clock(self):
         api = _api()
+        base = 1_700_000_001.0
         # Two records of the same event in different dedup buckets by
         # exchange time are distinct regardless of local arrival time.
-        assert api._is_duplicate_liq(_liq_event(timestamp=1000.0)) is False
-        assert api._is_duplicate_liq(_liq_event(timestamp=1009.0)) is False
-        assert api._is_duplicate_liq(_liq_event(timestamp=1000.5)) is True
+        assert api._is_duplicate_liq(_liq_event(timestamp=base)) is False
+        assert api._is_duplicate_liq(_liq_event(timestamp=base + 9.0)) is False
+        assert api._is_duplicate_liq(_liq_event(timestamp=base + 0.5)) is True
+
+    def test_implausible_timestamp_skips_dedup_never_local_clock(self):
+        """ts=0 (parse fallback) or ms-scale ts must not be hashed — falling
+        back to the local clock would collide distinct events that merely
+        arrived together."""
+        api = _api()
+        # Missing/zero timestamp: identical-looking events both broadcast.
+        assert api._is_duplicate_liq(_liq_event(timestamp=0.0)) is False
+        assert api._is_duplicate_liq(_liq_event(timestamp=0.0)) is False
+        # Millisecond-scale (connector forgot /1000): not safely dedupable.
+        assert api._is_duplicate_liq(_liq_event(timestamp=1.7e12)) is False
+        assert api._is_duplicate_liq(_liq_event(timestamp=1.7e12)) is False
+
+    def test_similar_but_distinct_sizes_not_deduped(self):
+        """$99,950 and $100,050 both round to $100k at round(-2) — the hash
+        must use the exact size so distinct events never collapse."""
+        api = _api()
+        ts = 1_700_000_001.0
+        assert api._is_duplicate_liq(_liq_event(timestamp=ts, size_usd=99_950.0)) is False
+        assert api._is_duplicate_liq(_liq_event(timestamp=ts, size_usd=100_050.0)) is False
+        # An exact replay (identical payload) still dedups.
+        assert api._is_duplicate_liq(_liq_event(timestamp=ts, size_usd=99_950.0)) is True
+
+    def test_cascade_bypass_has_absolute_cap(self):
+        """Continuous cascade re-triggers must not extend the dedup bypass
+        forever (replayed duplicates would keep the floodgate open)."""
+        api = _api()
+        ev = _liq_event()
+        key = f"{ev.symbol}_{ev.side}_{ev.exchange}"
+        for _ in range(30):
+            api._check_cascade(ev)
+        started = api._cascade_bypass_started[key]
+        cap = started + 2 * api._CASCADE_BYPASS_DURATION
+        assert api._cascade_bypass[key] <= cap + 1e-6
 
     def test_cascade_bypass_lifts_dedup_for_own_venue_only(self):
         api = _api()
@@ -593,3 +652,211 @@ class TestPerVenueFreshness:
         fresh = e.venue_freshness()
         assert fresh["hyperliquid"]["data_age_seconds"] is None
         assert fresh["hyperliquid"]["stale"] is True
+
+
+# ── Review round 2: WS origin, balance floor, persist-first, feeds ──
+
+class TestWSOriginCheck:
+    @pytest.mark.asyncio
+    async def test_browser_origin_rejected_by_default(self):
+        """Browser WS is not gated by SOP: any webpage can open
+        ws://127.0.0.1 — an unlisted Origin must be refused."""
+        api = _api()
+        api._cors_origins = None  # loopback wildcard REST CORS
+        request = MagicMock()
+        request.headers = {"Origin": "https://evil.example"}
+        resp = await api.handle_ws(request)
+        assert resp.status == 403
+
+    @pytest.mark.asyncio
+    async def test_allowlisted_origin_passes_the_gate(self):
+        api = _api()
+        api._cors_origins = {"https://ok.example"}
+        request = MagicMock()
+        request.headers = {"Origin": "https://bad.example"}
+        assert (await api.handle_ws(request)).status == 403
+        # An allowlisted origin proceeds past the origin gate (the next
+        # check is the connection cap, exercised here by filling it).
+        api._ws_clients = [MagicMock()] * 100
+        request.headers = {"Origin": "https://ok.example"}
+        assert (await api.handle_ws(request)).status == 429
+
+
+class TestPaperTraderRound2:
+    def _trader(self, price=100.0, balance=10_000.0) -> PaperTrader:
+        hub = MagicMock()
+        hub.market.assets = {"BTC": SimpleNamespace(price=price)}
+        return PaperTrader(hub, [], starting_balance=balance)
+
+    def test_catastrophic_close_floors_at_zero(self):
+        """A short losing far more than the posted margin must not drive
+        the account balance negative."""
+        trader = self._trader(price=100.0, balance=1_000.0)
+        trader._execute_trade("t", Signal("BTC", "SELL", size_usd=1_000.0))  # short
+        trader.hub.market.assets["BTC"].price = 10_000.0  # +9900% against us
+        trader._execute_trade("t", Signal("BTC", "BUY", size_usd=1_000.0))   # close
+        assert trader.balance == 0.0
+        assert "BTC" not in trader.positions
+
+    def test_db_error_means_trade_not_executed(self):
+        """Persist-first: a trade that cannot be logged must not mutate the
+        books, or the portfolio silently diverges from the audit trail."""
+        trader = self._trader(balance=5_000.0)
+        db = MagicMock()
+        db.execute.side_effect = sqlite3.OperationalError("disk full")
+        trader._db = db
+        trader._execute_trade("t", Signal("BTC", "BUY", size_usd=1_000.0))
+        assert trader.balance == 5_000.0
+        assert trader.positions == {}
+        assert trader.trades == []
+
+
+class TestLLMRound2:
+    def test_blank_lines_before_action_tolerated(self):
+        agent = LLMAgent(symbol="BTC")
+        assert agent._parse_response("\n\nBUY\nmomentum").action == "BUY"
+        assert agent._parse_response("   \nSELL") .action == "SELL"
+        assert agent._parse_response("\n\n") is None
+
+    def test_transport_failure_refunds_budget_slot(self, monkeypatch):
+        """A down provider must not exhaust the hourly budget: transport
+        failures consumed no tokens, so their slots are returned."""
+        agent = LLMAgent(symbol="BTC")
+        agent.api_key = "k"
+        agent.base_url = "https://llm.example/v1"
+        assert agent._within_budget(now=100.0)
+        assert len(agent._eval_times) == 1
+
+        def boom(*a, **kw):
+            raise OSError("connection refused")
+
+        monkeypatch.setattr("urllib.request.urlopen", boom)
+        hub = MagicMock()
+        hub.market.assets = {"BTC": SimpleNamespace(price=100.0, funding_rate=0.0)}
+        assert agent._sync_evaluate(hub) is None
+        assert len(agent._eval_times) == 0  # slot refunded
+
+    @pytest.mark.asyncio
+    async def test_evaluate_is_async_and_skips_without_key(self):
+        """evaluate() is awaited by the paper trader so a slow LLM cannot
+        block the event loop for other strategies."""
+        agent = LLMAgent(symbol="BTC")
+        agent.api_key = ""
+        agent.base_url = "https://api.example.com/v1"  # non-local, no key
+        result = agent.evaluate(MagicMock())
+        assert inspect.isawaitable(result)
+        assert await result is None
+
+
+class TestFeedsRound2:
+    @pytest.mark.asyncio
+    async def test_binance_array_frame_parsed(self):
+        """@arr frames may batch events into a JSON array — an array frame
+        must parse instead of silently failing an isinstance-dict check."""
+        feed = LiquidationFeed()
+        conn = BinanceConnection(feed)
+        received = []
+        feed.on_liquidation(received.append)
+        frame = [
+            {"e": "forceOrder", "o": {"p": "70000", "q": "0.5", "S": "SELL",
+                                      "s": "BTCUSDT", "T": 1700000000000}},
+            {"e": "forceOrder", "o": {"p": "3500", "q": "2", "S": "BUY",
+                                      "s": "ETHUSDT", "T": 1700000000001}},
+        ]
+        await conn._on_message(frame)
+        assert [ev.symbol for ev in received] == ["BTC", "ETH"]
+
+    @pytest.mark.asyncio
+    async def test_bybit_v5_list_payload_with_short_keys(self):
+        """Bybit v5 allLiquidation sends data as a LIST of records with
+        short keys (p/v/S/s/T) — both shapes must parse without raising."""
+        feed = LiquidationFeed()
+        conn = BybitConnection(feed)
+        received = []
+        feed.on_liquidation(received.append)
+        await conn._on_message({
+            "topic": "allLiquidation.BTCUSDT",
+            "data": [
+                {"p": "70000", "v": "0.5", "S": "Sell", "s": "BTCUSDT",
+                 "T": 1700000000000},
+                {"p": "", "v": None, "S": None, "s": None, "T": "x"},  # malformed
+            ],
+        })
+        assert len(received) == 1
+        assert received[0].symbol == "BTC"
+        assert received[0].side == "long"
+        assert feed.parse_errors["bybit"] == 1
+
+    @pytest.mark.asyncio
+    async def test_bybit_non_dict_data_does_not_raise(self):
+        feed = LiquidationFeed()
+        conn = BybitConnection(feed)
+        await conn._on_message({"topic": "allLiquidation.BTCUSDT", "data": "junk"})
+        await conn._on_message({"topic": "allLiquidation.BTCUSDT", "data": [None, 42]})
+        assert feed.parse_errors["bybit"] >= 2
+
+
+class TestPersistenceRound2:
+    def test_locked_db_raises_instead_of_quarantining(self, tmp_path, monkeypatch):
+        """'database is locked' is contention, not corruption — a healthy DB
+        held by another process must never be quarantined."""
+        import data_layer.persistence as persistence_mod
+
+        real_connect = persistence_mod.sqlite3.connect
+
+        def locked_connect(*args, **kwargs):
+            raise sqlite3.OperationalError("database is locked")
+
+        monkeypatch.setattr(persistence_mod.sqlite3, "connect", locked_connect)
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            DataStore(tmp_path / "locked.db")
+        monkeypatch.setattr(persistence_mod.sqlite3, "connect", real_connect)
+        assert not (tmp_path / "corrupted").exists()
+
+
+class TestAlertsRound2:
+    @pytest.mark.asyncio
+    async def test_send_failure_does_not_leak_token(self, caplog):
+        """aiohttp error messages can embed the request URL — which contains
+        the bot token — so failure logs carry the exception type only."""
+        from data_layer.alerts import AlertManager
+        mgr = AlertManager()
+        mgr.telegram_token = "123456:SECRET-TOKEN-VALUE"
+        mgr.telegram_chat_id = "42"
+        mgr.discord_webhook = ""
+        session = MagicMock()
+        session.post = MagicMock(side_effect=RuntimeError(
+            f"cannot connect to https://api.telegram.org/bot{mgr.telegram_token}/sendMessage"
+        ))
+        mgr._session = session
+
+        with caplog.at_level("DEBUG", logger="data_layer.alerts"):
+            await mgr._send("test message")
+        assert "SECRET-TOKEN-VALUE" not in caplog.text
+        assert "Telegram send failed" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_wallet_on_first_line_still_redacted(self, caplog):
+        from data_layer.alerts import AlertManager
+        mgr = AlertManager()
+        mgr.telegram_token = ""
+        mgr.discord_webhook = ""
+        wallet = "0x" + "cd" * 20
+        with caplog.at_level("WARNING", logger="data_layer.alerts"):
+            await mgr._send(f"whale {wallet} near liquidation")
+        assert wallet not in caplog.text
+        assert "ALERT sent" in caplog.text
+        await mgr.stop()
+
+
+class TestCascadeExampleStrategy:
+    def test_cascade_strategy_actually_fires(self):
+        """getattr on the stats dict always returned 0 and silently disabled
+        this strategy — dict access must read the real key."""
+        from src.strategies.examples import LiquidationCascade
+        hub = MagicMock()
+        hub.liquidations.get_stats.return_value = {"long_volume_usd": 2_000_000.0}
+        strat = LiquidationCascade(symbol="BTC", cascade_threshold_usd=1_000_000)
+        signal = strat.evaluate(hub)
+        assert signal is not None
+        assert signal.action == "BUY"

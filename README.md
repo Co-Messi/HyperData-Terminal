@@ -121,7 +121,8 @@ python run_api.py --port 8420
 
 | Endpoint | Description |
 |---|---|
-| `GET /v1/health` | Server status and uptime |
+| `GET /v1/live` | Minimal liveness probe (always unauthenticated) |
+| `GET /v1/health` | Server status and uptime (requires the API key when one is set) |
 | `GET /v1/market` | All assets — prices, OI, funding |
 | `GET /v1/market/{symbol}` | Single asset detail |
 | `GET /v1/liquidations` | Recent liquidation events |
