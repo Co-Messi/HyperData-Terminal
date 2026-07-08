@@ -1,23 +1,38 @@
+"""PositionScanner unit tests.
+
+All network calls are mocked; the SQLite-backed address store is redirected to
+a per-test temp directory so tests never touch the repo's data/ files.
+"""
 from __future__ import annotations
 
-import asyncio
-import json
-from unittest.mock import AsyncMock, MagicMock, patch
+import sqlite3
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from src.data_layer.position_scanner import (
-    DISCOVERED_ADDRESSES_PATH,
-    PositionScanner,
-    TrackedPosition,
-)
-
+from data_layer.position_scanner import PositionScanner, TrackedPosition
+from src.data_layer import address_store
 
 # ── Fixtures ─────────────────────────────────────────────────────
 
+@pytest.fixture(autouse=True)
+def isolated_address_store(tmp_path, monkeypatch):
+    """Point the address store at a temp SQLite DB for every test."""
+    monkeypatch.setattr(address_store, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(address_store, "DB_PATH", tmp_path / "hyperdata.db")
+    monkeypatch.setattr(address_store, "LEGACY_JSON", tmp_path / "discovered_addresses.json")
+    monkeypatch.setattr(address_store, "_initialized", False)
+    yield tmp_path
+
+
+def _addr(seed: str) -> str:
+    """Build a valid 0x + 40-hex wallet address from a short seed."""
+    return "0x" + (seed * 40)[:40]
+
+
 def _make_position(**overrides) -> TrackedPosition:
     defaults = dict(
-        address="0xabc",
+        address=_addr("abc"),
         symbol="BTC",
         side="long",
         size_usd=50_000.0,
@@ -31,6 +46,17 @@ def _make_position(**overrides) -> TrackedPosition:
     )
     defaults.update(overrides)
     return TrackedPosition(**defaults)
+
+
+def _mock_session(json_payload) -> MagicMock:
+    session = MagicMock()
+    response = AsyncMock()
+    response.json = AsyncMock(return_value=json_payload)
+    response.raise_for_status = MagicMock()
+    response.__aenter__ = AsyncMock(return_value=response)
+    response.__aexit__ = AsyncMock(return_value=False)
+    session.post = MagicMock(return_value=response)
+    return session
 
 
 MOCK_ALL_MIDS = {"BTC": "71000.0", "ETH": "3500.0", "SOL": "150.0"}
@@ -77,7 +103,7 @@ MOCK_CLEARINGHOUSE_STATE = {
 class TestTrackedPosition:
     def test_creation(self):
         p = _make_position()
-        assert p.address == "0xabc"
+        assert p.address == _addr("abc")
         assert p.side == "long"
         assert p.leverage == 10.0
 
@@ -137,9 +163,9 @@ class TestMaintenanceMarginLookup:
 
 
 class TestFilterMethods:
-    def setup_method(self):
-        self.scanner = PositionScanner()
-        self.scanner.positions = [
+    def setup_positions(self):
+        scanner = PositionScanner()
+        scanner.positions = [
             _make_position(side="long", distance_pct=0.5, size_usd=100_000),
             _make_position(side="long", distance_pct=1.5, size_usd=50_000),
             _make_position(side="short", distance_pct=0.8, size_usd=200_000),
@@ -147,79 +173,111 @@ class TestFilterMethods:
             _make_position(side="long", distance_pct=4.5, size_usd=30_000),
             _make_position(side="short", distance_pct=10.0, size_usd=10_000),
         ]
+        return scanner
 
     def test_get_danger_zone_default(self):
-        danger = self.scanner.get_danger_zone()
+        danger = self.setup_positions().get_danger_zone()
         assert len(danger) == 3
         assert all(p.distance_pct <= 2.0 for p in danger)
 
     def test_get_danger_zone_custom_threshold(self):
-        danger = self.scanner.get_danger_zone(threshold_pct=1.0)
+        danger = self.setup_positions().get_danger_zone(threshold_pct=1.0)
         assert len(danger) == 2
 
     def test_get_closest_longs(self):
-        longs = self.scanner.get_closest_longs(n=2)
+        longs = self.setup_positions().get_closest_longs(n=2)
         assert len(longs) == 2
         assert all(p.side == "long" for p in longs)
         assert longs[0].distance_pct < longs[1].distance_pct
 
     def test_get_closest_shorts(self):
-        shorts = self.scanner.get_closest_shorts(n=2)
+        shorts = self.setup_positions().get_closest_shorts(n=2)
         assert len(shorts) == 2
         assert all(p.side == "short" for p in shorts)
         assert shorts[0].distance_pct < shorts[1].distance_pct
 
     def test_get_closest_longs_more_than_available(self):
-        longs = self.scanner.get_closest_longs(n=100)
+        longs = self.setup_positions().get_closest_longs(n=100)
         assert len(longs) == 3
 
     def test_get_zone_summary(self):
-        summary = self.scanner.get_zone_summary()
+        summary = self.setup_positions().get_zone_summary()
         assert summary["within_1pct"]["count"] == 2
         assert summary["within_1pct"]["total_value"] == 300_000
         assert summary["within_2pct"]["count"] == 3
         assert summary["within_5pct"]["count"] == 5
 
     def test_get_zone_summary_empty(self):
-        self.scanner.positions = []
-        summary = self.scanner.get_zone_summary()
+        scanner = self.setup_positions()
+        scanner.positions = []
+        summary = scanner.get_zone_summary()
         assert summary["within_1pct"]["count"] == 0
         assert summary["within_5pct"]["total_value"] == 0.0
 
 
 class TestAddressPersistence:
-    def test_add_addresses(self, tmp_path, monkeypatch):
-        addr_file = tmp_path / "discovered_addresses.json"
-        monkeypatch.setattr(
-            "src.data_layer.position_scanner.DISCOVERED_ADDRESSES_PATH", addr_file
-        )
-        scanner = PositionScanner()
-        scanner.add_addresses(["0xaaa", "0xbbb"])
-        assert "0xaaa" in scanner.discovered_addresses
-        assert addr_file.exists()
+    """Address persistence is SQLite-backed (data_layer.address_store)."""
 
-        loaded = json.loads(addr_file.read_text())
-        assert "0xaaa" in loaded
-        assert "0xbbb" in loaded
-
-    def test_load_existing_addresses(self, tmp_path, monkeypatch):
-        addr_file = tmp_path / "discovered_addresses.json"
-        addr_file.write_text(json.dumps(["0x111", "0x222"]))
-        monkeypatch.setattr(
-            "src.data_layer.position_scanner.DISCOVERED_ADDRESSES_PATH", addr_file
-        )
+    def test_add_addresses_persists_to_sqlite(self, isolated_address_store):
         scanner = PositionScanner()
-        assert "0x111" in scanner.discovered_addresses
-        assert "0x222" in scanner.discovered_addresses
+        a1, a2 = _addr("aaa"), _addr("bbb")
+        scanner.add_addresses([a1, a2])
 
-    def test_corrupted_file_handled(self, tmp_path, monkeypatch):
-        addr_file = tmp_path / "discovered_addresses.json"
-        addr_file.write_text("NOT VALID JSON {{{")
-        monkeypatch.setattr(
-            "src.data_layer.position_scanner.DISCOVERED_ADDRESSES_PATH", addr_file
-        )
+        assert a1 in scanner.discovered_addresses
+        assert a2 in scanner.discovered_addresses
+
+        # Rows actually landed in the discovered_addresses table.
+        conn = sqlite3.connect(str(isolated_address_store / "hyperdata.db"))
+        rows = {
+            r[0] for r in
+            conn.execute("SELECT address FROM discovered_addresses").fetchall()
+        }
+        conn.close()
+        assert {a1, a2} <= rows
+
+    def test_load_existing_addresses(self):
+        a1, a2 = _addr("111"), _addr("222")
+        address_store.add_addresses([a1, a2], source="test")
+
         scanner = PositionScanner()
-        assert len(scanner.discovered_addresses) == 0
+        assert a1 in scanner.discovered_addresses
+        assert a2 in scanner.discovered_addresses
+
+    def test_invalid_addresses_rejected(self, isolated_address_store):
+        scanner = PositionScanner()
+        scanner.add_addresses([
+            "not-an-address",
+            "0xTOOSHORT",
+            "0x" + "g" * 40,        # non-hex
+            _addr("c0ffee"),         # the only valid one
+        ])
+        assert scanner.discovered_addresses == {_addr("c0ffee")}
+
+        conn = sqlite3.connect(str(isolated_address_store / "hyperdata.db"))
+        count = conn.execute("SELECT COUNT(*) FROM discovered_addresses").fetchone()[0]
+        conn.close()
+        assert count == 1
+
+    def test_addresses_normalized_to_lowercase(self):
+        mixed = "0x" + "AbCdEf0123456789aBcDeF0123456789ABCDEF01"
+        scanner = PositionScanner()
+        scanner.add_addresses([mixed])
+        assert mixed.lower() in scanner.discovered_addresses
+        assert mixed not in scanner.discovered_addresses
+
+    def test_retention_cap_expires_oldest(self, monkeypatch):
+        monkeypatch.setattr(address_store, "MAX_TRACKED_ADDRESSES", 3)
+        for i in range(5):
+            address_store.add_addresses([_addr(f"{i}{i}{i}")], source="test")
+        remaining = address_store.get_all_addresses()
+        assert len(remaining) == 3
+
+    def test_store_validator(self):
+        assert address_store.is_valid_address(_addr("abc"))
+        assert not address_store.is_valid_address("0xabc")
+        assert not address_store.is_valid_address(None)
+        assert not address_store.is_valid_address(42)
+        assert not address_store.is_valid_address("0x" + "z" * 40)
 
 
 class TestGetPositionsForAddress:
@@ -228,18 +286,9 @@ class TestGetPositionsForAddress:
         scanner = PositionScanner()
         scanner.market_prices = {"BTC": 71_000.0, "ETH": 3_500.0}
         scanner.market_meta = MOCK_META
+        scanner._session = _mock_session(MOCK_CLEARINGHOUSE_STATE)
 
-        mock_session = MagicMock()
-        mock_response = AsyncMock()
-        mock_response.json = AsyncMock(return_value=MOCK_CLEARINGHOUSE_STATE)
-        mock_response.raise_for_status = MagicMock()
-        mock_response.__aenter__ = AsyncMock(return_value=mock_response)
-        mock_response.__aexit__ = AsyncMock(return_value=False)
-        mock_session.post = MagicMock(return_value=mock_response)
-
-        scanner._session = mock_session
-
-        positions = await scanner.get_positions_for_address("0xtest")
+        positions = await scanner.get_positions_for_address(_addr("fed"))
 
         assert len(positions) == 2
 
@@ -259,18 +308,9 @@ class TestGetPositionsForAddress:
         scanner = PositionScanner()
         scanner.market_prices = {}
         scanner.market_meta = MOCK_META
+        scanner._session = _mock_session({"assetPositions": [], "marginSummary": {}})
 
-        mock_session = MagicMock()
-        mock_response = AsyncMock()
-        mock_response.json = AsyncMock(return_value={"assetPositions": [], "marginSummary": {}})
-        mock_response.raise_for_status = MagicMock()
-        mock_response.__aenter__ = AsyncMock(return_value=mock_response)
-        mock_response.__aexit__ = AsyncMock(return_value=False)
-        mock_session.post = MagicMock(return_value=mock_response)
-
-        scanner._session = mock_session
-
-        positions = await scanner.get_positions_for_address("0xempty")
+        positions = await scanner.get_positions_for_address(_addr("e"))
         assert positions == []
 
     @pytest.mark.asyncio
@@ -295,36 +335,38 @@ class TestGetPositionsForAddress:
         scanner = PositionScanner()
         scanner.market_prices = {"BTC": 70_000.0}
         scanner.market_meta = MOCK_META
+        scanner._session = _mock_session(state)
 
-        mock_session = MagicMock()
-        mock_response = AsyncMock()
-        mock_response.json = AsyncMock(return_value=state)
-        mock_response.raise_for_status = MagicMock()
-        mock_response.__aenter__ = AsyncMock(return_value=mock_response)
-        mock_response.__aexit__ = AsyncMock(return_value=False)
-        mock_session.post = MagicMock(return_value=mock_response)
-
-        scanner._session = mock_session
-
-        positions = await scanner.get_positions_for_address("0xfallback")
+        positions = await scanner.get_positions_for_address(_addr("f"))
         assert len(positions) == 1
         assert abs(positions[0].liq_price - 63_210.0) < 0.01
+
+
+class TestDiscoverAddresses:
+    @pytest.mark.asyncio
+    async def test_discovery_validates_payload_addresses(self):
+        """Junk strings in exchange trade payloads must never be persisted."""
+        good = _addr("dead")
+        trades = [
+            {"buyer": good, "seller": "junk-string"},
+            {"users": [good, "0xshort", 12345, None]},
+            {"users": "not-a-list"},
+        ]
+        scanner = PositionScanner()
+        scanner._session = _mock_session(trades)
+
+        discovered = await scanner.discover_addresses(limit=10)
+        assert good in discovered
+        assert "junk-string" not in discovered
+        assert "0xshort" not in discovered
+        assert address_store.get_all_addresses() == {good}
 
 
 class TestUpdatePrices:
     @pytest.mark.asyncio
     async def test_update_prices(self):
         scanner = PositionScanner()
-
-        mock_session = MagicMock()
-        mock_response = AsyncMock()
-        mock_response.json = AsyncMock(return_value=MOCK_ALL_MIDS)
-        mock_response.raise_for_status = MagicMock()
-        mock_response.__aenter__ = AsyncMock(return_value=mock_response)
-        mock_response.__aexit__ = AsyncMock(return_value=False)
-        mock_session.post = MagicMock(return_value=mock_response)
-
-        scanner._session = mock_session
+        scanner._session = _mock_session(MOCK_ALL_MIDS)
 
         await scanner.update_prices()
         assert scanner.market_prices["BTC"] == 71_000.0
@@ -336,16 +378,7 @@ class TestUpdateMeta:
     @pytest.mark.asyncio
     async def test_update_meta(self):
         scanner = PositionScanner()
-
-        mock_session = MagicMock()
-        mock_response = AsyncMock()
-        mock_response.json = AsyncMock(return_value=MOCK_META)
-        mock_response.raise_for_status = MagicMock()
-        mock_response.__aenter__ = AsyncMock(return_value=mock_response)
-        mock_response.__aexit__ = AsyncMock(return_value=False)
-        mock_session.post = MagicMock(return_value=mock_response)
-
-        scanner._session = mock_session
+        scanner._session = _mock_session(MOCK_META)
 
         await scanner.update_meta()
         assert scanner.market_meta == MOCK_META
@@ -367,10 +400,6 @@ class TestUpdateMeta:
 
 class TestDistanceCalculation:
     def test_distance_for_long(self):
-        scanner = PositionScanner()
-        scanner.market_prices = {"BTC": 70_000.0}
-        scanner.market_meta = MOCK_META
-
         # liq at 63500, current at 70000
         # distance = |70000 - 63500| / 70000 * 100 = 9.2857%
         current = 70_000.0
@@ -399,3 +428,16 @@ class TestRateLimiter:
         for _ in range(5):
             await scanner._rate_limit()
         assert len(scanner._request_times) == 5
+
+
+class TestPostTimeout:
+    @pytest.mark.asyncio
+    async def test_post_sends_explicit_timeout(self):
+        """Every outbound request must carry an explicit deadline (High 4)."""
+        scanner = PositionScanner()
+        session = _mock_session({})
+        scanner._session = session
+        await scanner._post({"type": "allMids"})
+        _, kwargs = session.post.call_args
+        assert kwargs.get("timeout") is not None
+        assert kwargs["timeout"].total == 10

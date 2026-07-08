@@ -32,11 +32,11 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from src.data_layer.market_data import AssetInfo, MarketData  # noqa: E402
-from config.settings import DASHBOARD_REFRESH_RATE, DEFAULT_SYMBOLS  # noqa: E402
-
+from src.utils.helpers import format_pct as fmt_pct  # noqa: E402
+from src.utils.helpers import format_price as fmt_price  # noqa: E402
 
 # -- Formatting helpers (imported from central helpers) ---------------------
-from src.utils.helpers import format_usd as fmt_usd, format_price as fmt_price, format_pct as fmt_pct
+from src.utils.helpers import format_usd as fmt_usd  # noqa: E402
 
 
 def fmt_funding(value: float) -> str:
@@ -258,10 +258,8 @@ class MarketOverviewDashboard:
 
             if asset.funding_rate >= 0:
                 rate_style = "bold bright_green"
-                bar_char = "\U0001f7e9"  # green square
             else:
                 rate_style = "bold bright_red"
-                bar_char = "\U0001f7e5"  # red square
 
             bar = make_bar(abs_ann, max_annualized, width=20)
 

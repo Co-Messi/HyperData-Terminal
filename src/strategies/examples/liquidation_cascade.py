@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import time
 
-from src.strategies.base import Strategy, Signal
+from src.strategies.base import Signal, Strategy
 
 
 class LiquidationCascade(Strategy):

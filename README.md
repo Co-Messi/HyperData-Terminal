@@ -105,6 +105,18 @@ Start the API server alongside or instead of the terminal:
 python run_api.py --port 8420
 ```
 
+> **⚠️ Security: local-only by default.** The API binds to `127.0.0.1` and is
+> intended for loopback use. It serves wallet-derived positions, liquidation
+> danger zones, and live order flow — trading intelligence you should not
+> expose to a LAN or the internet. A non-loopback bind
+> (`HYPERDATA_API_HOST=0.0.0.0`) is **refused** unless you either set
+> `HYPERDATA_API_KEY=<secret>` (all non-health routes then require
+> `Authorization: Bearer <secret>` or `X-API-Key`) or explicitly accept the
+> risk with `HYPERDATA_UNSAFE_PUBLIC_API=1`. Restrict browser access with
+> `HYPERDATA_CORS_ORIGINS=https://your-app.example` (wildcard CORS applies to
+> loopback binds only). Do not front this API with a public tunnel or reverse
+> proxy without auth and rate limiting of your own.
+
 ### Endpoints
 
 | Endpoint | Description |

@@ -29,6 +29,11 @@ target-version = "py312"
 [tool.ruff.lint]
 select = ["E", "F", "W", "I"]
 
+[tool.ruff.lint.per-file-ignores]
+# Presentation layer: ASCII-art boot screens and Rich table markup read
+# better unwrapped; everything else must respect the line limit.
+"src/dashboards/*" = ["E501"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"

@@ -15,6 +15,10 @@ DATA_DIR = Path(__file__).resolve().parents[2] / "data"
 RATE_LIMIT_PER_SEC = 10
 META_CACHE_TTL = 300  # 5 minutes
 
+# Explicit deadline on every request so a hung endpoint fails the scan cycle
+# instead of blocking the hub's position-scan loop indefinitely.
+HTTP_TIMEOUT = aiohttp.ClientTimeout(total=10)
+
 
 @dataclass
 class TrackedPosition:
@@ -102,12 +106,18 @@ class PositionScanner:
                 })
                 if isinstance(data, list):
                     for trade in data:
+                        # Validate at the boundary: exchange payloads are
+                        # untrusted, and a junk identifier persisted here gets
+                        # re-scanned (one API call per cycle) forever.
+                        candidates: list[object] = []
                         for side_key in ("buyer", "seller", "users"):
                             if side_key in trade and isinstance(trade[side_key], str):
-                                new_addresses.add(trade[side_key])
+                                candidates.append(trade[side_key])
                         if "users" in trade and isinstance(trade["users"], list):
-                            for addr in trade["users"]:
-                                new_addresses.add(addr)
+                            candidates.extend(trade["users"])
+                        for addr in candidates:
+                            if address_store.is_valid_address(addr):
+                                new_addresses.add(address_store.normalize_address(addr))
                         if len(new_addresses) >= limit:
                             break
             except Exception:
@@ -279,6 +289,7 @@ class PositionScanner:
             API_URL,
             json=payload,
             headers={"Content-Type": "application/json"},
+            timeout=HTTP_TIMEOUT,
         ) as resp:
             resp.raise_for_status()
             return await resp.json()
@@ -294,6 +305,10 @@ class PositionScanner:
         address_store.add_addresses(self.discovered_addresses, source="position_scanner")
 
     def add_addresses(self, addresses: list[str]):
-        """Manually add addresses to track."""
-        self.discovered_addresses.update(addresses)
-        address_store.add_addresses(addresses, source="position_scanner_manual")
+        """Manually add addresses to track (validated + normalized)."""
+        valid = [
+            address_store.normalize_address(a)
+            for a in addresses if address_store.is_valid_address(a)
+        ]
+        self.discovered_addresses.update(valid)
+        address_store.add_addresses(valid, source="position_scanner_manual")

@@ -23,12 +23,12 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from src.data_layer.market_data import MarketData
 from src.data_layer.orderflow_engine import (
     CVDSnapshot,
     OrderFlowEngine,
     Trade,
 )
-from src.data_layer.market_data import MarketData
 
 logger = logging.getLogger(__name__)
 
@@ -206,7 +206,7 @@ class CVDDashboard:
 
         bar = Text()
         bar.append("  \u20bf ", style="bold bright_yellow")
-        bar.append(f"BITCOIN  ", style="bold white")
+        bar.append("BITCOIN  ", style="bold white")
         bar.append(f"${price:,.2f}", style="bold bright_white")
         bar.append("  ")
 
@@ -391,7 +391,7 @@ class CVDDashboard:
         now_str = datetime.now().strftime("%H:%M:%S")
         return Panel(
             table,
-            title=f"[bold bright_green]\U0001f4c8 BTC CVD[/]",
+            title="[bold bright_green]\U0001f4c8 BTC CVD[/]",
             subtitle=f"[dim]{now_str}  #{self.cycle}[/]",
             border_style="bright_green",
             box=_box.ROUNDED,

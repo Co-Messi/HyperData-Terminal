@@ -6,9 +6,9 @@ import time
 import pytest
 
 from data_layer.orderflow_engine import (
-    Trade,
-    TimeframeBucket,
     OrderFlowEngine,
+    TimeframeBucket,
+    Trade,
     classify_signal,
 )
 

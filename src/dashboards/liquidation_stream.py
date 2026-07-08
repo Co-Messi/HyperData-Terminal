@@ -24,7 +24,6 @@ import pyfiglet
 from rich.align import Align
 from rich.box import DOUBLE_EDGE, HEAVY, SIMPLE_HEAVY
 from rich.console import Console, Group
-from rich.layout import Layout
 from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
@@ -37,7 +36,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from src.data_layer.liquidation_feed import LiquidationEvent, LiquidationFeed
+from src.data_layer.liquidation_feed import LiquidationEvent, LiquidationFeed  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +71,7 @@ TIME_WINDOWS: list[tuple[str, int]] = [
 # ---------------------------------------------------------------------------
 # Formatting helpers (imported from central helpers)
 # ---------------------------------------------------------------------------
-from src.utils.helpers import format_usd as fmt_usd
+from src.utils.helpers import format_usd as fmt_usd  # noqa: E402
 
 
 def fmt_number(value: int) -> str:

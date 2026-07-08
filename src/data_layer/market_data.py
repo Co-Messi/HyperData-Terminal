@@ -11,6 +11,10 @@ from config.settings import HYPERLIQUID_INFO_URL, MAX_REQUESTS_PER_SECOND
 
 logger = logging.getLogger(__name__)
 
+# Every outbound request gets an explicit deadline: a hung exchange endpoint
+# must fail the refresh cycle, not stall the hub's market-refresh loop forever.
+HTTP_TIMEOUT = aiohttp.ClientTimeout(total=10)
+
 
 @dataclass
 class AssetInfo:
@@ -132,9 +136,21 @@ class MarketData:
             return {"bids": [], "asks": []}
 
         levels = data.get("levels", [[], []])
-        bids = [{"price": float(b["px"]), "size": float(b["sz"])} for b in levels[0][:depth]]
-        asks = [{"price": float(a["px"]), "size": float(a["sz"])} for a in levels[1][:depth]]
-        return {"bids": bids, "asks": asks}
+        if not isinstance(levels, list) or len(levels) < 2:
+            return {"bids": [], "asks": []}
+
+        def _parse_side(raw_levels) -> list[dict]:
+            parsed: list[dict] = []
+            if not isinstance(raw_levels, list):
+                return parsed
+            for lvl in raw_levels[:depth]:
+                try:
+                    parsed.append({"price": float(lvl["px"]), "size": float(lvl["sz"])})
+                except (KeyError, TypeError, ValueError):
+                    logger.debug("Dropped malformed orderbook level: %.100s", lvl)
+            return parsed
+
+        return {"bids": _parse_side(levels[0]), "asks": _parse_side(levels[1])}
 
     async def get_candles(
         self,
@@ -164,14 +180,17 @@ class MarketData:
 
         candles: list[dict] = []
         for c in data:
-            candles.append({
-                "timestamp": c.get("t"),
-                "open": float(c.get("o", 0)),
-                "high": float(c.get("h", 0)),
-                "low": float(c.get("l", 0)),
-                "close": float(c.get("c", 0)),
-                "volume": float(c.get("v", 0)),
-            })
+            try:
+                candles.append({
+                    "timestamp": c.get("t"),
+                    "open": float(c.get("o", 0)),
+                    "high": float(c.get("h", 0)),
+                    "low": float(c.get("l", 0)),
+                    "close": float(c.get("c", 0)),
+                    "volume": float(c.get("v", 0)),
+                })
+            except (TypeError, ValueError, AttributeError):
+                logger.debug("Dropped malformed candle: %.100s", c)
         return candles
 
     async def get_recent_trades(self, symbol: str, limit: int = 100) -> list[dict]:
@@ -187,12 +206,15 @@ class MarketData:
 
         trades: list[dict] = []
         for t in data[:limit]:
-            trades.append({
-                "time": t.get("time"),
-                "price": float(t.get("px", 0)),
-                "size": float(t.get("sz", 0)),
-                "side": t.get("side", ""),
-            })
+            try:
+                trades.append({
+                    "time": t.get("time"),
+                    "price": float(t.get("px", 0)),
+                    "size": float(t.get("sz", 0)),
+                    "side": t.get("side", ""),
+                })
+            except (TypeError, ValueError, AttributeError):
+                logger.debug("Dropped malformed trade: %.100s", t)
         return trades
 
     # ── Internals ─────────────────────────────────────────────────
@@ -211,6 +233,7 @@ class MarketData:
                 HYPERLIQUID_INFO_URL,
                 json=payload,
                 headers={"Content-Type": "application/json"},
+                timeout=HTTP_TIMEOUT,
             ) as resp:
                 resp.raise_for_status()
                 return await resp.json()

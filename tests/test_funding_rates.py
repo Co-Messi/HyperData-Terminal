@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import time
+
 import pytest
-from data_layer.funding_rates import FundingRateSnapshot, FundingRateCollector, normalise_fr_symbol
+
+from data_layer.funding_rates import FundingRateCollector, FundingRateSnapshot, normalise_fr_symbol
 
 
 def test_normalise_fr_symbol():

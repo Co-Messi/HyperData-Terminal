@@ -12,7 +12,7 @@ low (shorts paying longs), open a long.
 
 from __future__ import annotations
 
-from src.strategies.base import Strategy, Signal
+from src.strategies.base import Signal, Strategy
 
 
 class FundingRateArb(Strategy):

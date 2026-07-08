@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import time
+
 import pytest
-from data_layer.long_short_ratio import LongShortSnapshot, LongShortCollector
+
+from data_layer.long_short_ratio import LongShortCollector, LongShortSnapshot
 
 
 def test_snapshot_fields():

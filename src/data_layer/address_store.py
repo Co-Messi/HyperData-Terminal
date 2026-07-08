@@ -7,6 +7,7 @@ On first use, migrates any existing JSON file into the table.
 """
 import json
 import logging
+import re
 import sqlite3
 import threading
 import time
@@ -17,6 +18,24 @@ logger = logging.getLogger(__name__)
 DATA_DIR = Path(__file__).resolve().parents[2] / "data"
 DB_PATH = DATA_DIR / "hyperdata.db"
 LEGACY_JSON = DATA_DIR / "discovered_addresses.json"
+
+# EVM wallet address: 0x + 40 hex chars. Anything else from an exchange
+# payload is junk and must not be persisted (it would be re-scanned forever).
+_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
+
+# Retention cap: keep the most recently seen addresses; every tracked address
+# costs a clearinghouseState call per scan cycle.
+MAX_TRACKED_ADDRESSES = 50_000
+
+
+def is_valid_address(address: object) -> bool:
+    """True for a well-formed EVM wallet address string."""
+    return isinstance(address, str) and bool(_ADDRESS_RE.match(address))
+
+
+def normalize_address(address: str) -> str:
+    """Canonical form: lowercase (EVM addresses are case-insensitive)."""
+    return address.lower()
 
 _CREATE = """
 CREATE TABLE IF NOT EXISTS discovered_addresses (
@@ -72,31 +91,28 @@ def _init() -> None:
 
 
 def add_address(address: str, source: str = "unknown") -> None:
-    """Insert or update a single address. Idempotent."""
-    _init()
-    now = time.time()
-    try:
-        with _lock:
-            conn = _get_conn()
-            conn.execute(
-                "INSERT INTO discovered_addresses (address, source, first_seen, last_seen) "
-                "VALUES (?, ?, ?, ?) "
-                "ON CONFLICT(address) DO UPDATE SET last_seen = excluded.last_seen",
-                (address, source, now, now),
-            )
-            conn.commit()
-            conn.close()
-    except Exception:
-        logger.debug("[address_store] add failed", exc_info=True)
+    """Insert or update a single address. Idempotent. Invalid input is dropped."""
+    add_addresses([address], source=source)
 
 
 def add_addresses(addresses: list[str] | set[str], source: str = "unknown") -> int:
-    """Batch insert. Returns count written."""
+    """Batch insert (validated + normalized). Returns count written.
+
+    Non-address strings from exchange payloads are dropped and counted here
+    so garbage identifiers never enter the store, and the table is capped at
+    MAX_TRACKED_ADDRESSES by expiring the least recently seen rows.
+    """
     _init()
     if not addresses:
         return 0
     now = time.time()
-    rows = [(a, source, now, now) for a in addresses]
+    valid = [normalize_address(a) for a in addresses if is_valid_address(a)]
+    dropped = len(list(addresses)) - len(valid)
+    if dropped:
+        logger.warning("[address_store] dropped %d invalid address strings", dropped)
+    if not valid:
+        return 0
+    rows = [(a, source, now, now) for a in valid]
     try:
         with _lock:
             conn = _get_conn()
@@ -106,6 +122,19 @@ def add_addresses(addresses: list[str] | set[str], source: str = "unknown") -> i
                 "ON CONFLICT(address) DO UPDATE SET last_seen = excluded.last_seen",
                 rows,
             )
+            # Retention cap: expire the least-recently-seen overflow.
+            count = conn.execute(
+                "SELECT COUNT(*) FROM discovered_addresses"
+            ).fetchone()[0]
+            if count > MAX_TRACKED_ADDRESSES:
+                overflow = count - MAX_TRACKED_ADDRESSES
+                conn.execute(
+                    "DELETE FROM discovered_addresses WHERE address IN ("
+                    "SELECT address FROM discovered_addresses "
+                    "ORDER BY last_seen ASC LIMIT ?)",
+                    (overflow,),
+                )
+                logger.info("[address_store] expired %d least-recently-seen addresses", overflow)
             conn.commit()
             conn.close()
             return len(rows)

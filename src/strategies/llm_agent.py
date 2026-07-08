@@ -14,9 +14,12 @@ Configure via environment variables (or .env file):
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import logging
 import os
+import time
+from collections import deque
 
 import aiohttp
 
@@ -42,6 +45,10 @@ SYSTEM_PROMPT = (
 class LLMAgent(Strategy):
     """Strategy that delegates trading decisions to a language model."""
 
+    # Budget guardrail: an LLM call per check interval adds up. Configurable
+    # via LLM_MAX_EVALS_PER_HOUR; evaluations beyond the budget are skipped.
+    DEFAULT_MAX_EVALS_PER_HOUR = 60
+
     def __init__(self, symbol: str = "BTC") -> None:
         self.symbol = symbol
 
@@ -49,10 +56,31 @@ class LLMAgent(Strategy):
         self.base_url = os.environ.get("LLM_BASE_URL", "http://localhost:11434/v1")
         self.model = os.environ.get("LLM_MODEL", "llama3")
         self.api_key = os.environ.get("LLM_API_KEY", "")
+        try:
+            self.max_evals_per_hour = int(
+                os.environ.get("LLM_MAX_EVALS_PER_HOUR", self.DEFAULT_MAX_EVALS_PER_HOUR)
+            )
+        except ValueError:
+            self.max_evals_per_hour = self.DEFAULT_MAX_EVALS_PER_HOUR
+        self._eval_times: deque[float] = deque(maxlen=max(self.max_evals_per_hour, 1))
+        # One long-lived worker thread — not a new executor per evaluation.
+        self._pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="llm-agent"
+        )
 
     @property
     def name(self) -> str:
         return "llm_agent"
+
+    def _within_budget(self, now: float | None = None) -> bool:
+        """Sliding-window cap on LLM calls per hour."""
+        now = time.time() if now is None else now
+        while self._eval_times and now - self._eval_times[0] > 3600:
+            self._eval_times.popleft()
+        if len(self._eval_times) >= self.max_evals_per_hour:
+            return False
+        self._eval_times.append(now)
+        return True
 
     def evaluate(self, hub) -> Signal | None:
         """Build a market summary and ask the LLM for a decision.
@@ -69,12 +97,18 @@ class LLMAgent(Strategy):
             )
             return None
 
+        if not self._within_budget():
+            logger.warning(
+                "LLM eval budget exhausted (%d/hour) — skipping evaluation",
+                self.max_evals_per_hour,
+            )
+            return None
+
         try:
-            # Run blocking LLM call in a thread so it doesn't stall the async loop
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                future = pool.submit(self._sync_evaluate, hub)
-                return future.result(timeout=20)
+            # Run blocking LLM call in the persistent worker thread so it
+            # doesn't stall the async loop.
+            future = self._pool.submit(self._sync_evaluate, hub)
+            return future.result(timeout=20)
         except Exception:
             logger.exception("LLM agent error")
             return None
@@ -161,50 +195,26 @@ class LLMAgent(Strategy):
         # ---- Parse response ----
         try:
             text = data["choices"][0]["message"]["content"].strip()
-        except (KeyError, IndexError):
+        except (KeyError, IndexError, TypeError, AttributeError):
             logger.warning("Unexpected LLM response format: %s", json.dumps(data)[:200])
             return None
 
-        lines = text.split("\n", 1)
-        action_word = lines[0].strip().upper()
-        reason = lines[1].strip() if len(lines) > 1 else ""
-
-        # Validate action
-        if action_word not in ("BUY", "SELL", "HOLD"):
-            # Try to find the action word somewhere in the first line
-            for word in ("BUY", "SELL", "HOLD"):
-                if word in action_word:
-                    action_word = word
-                    break
-            else:
-                logger.warning("LLM returned unparseable action: %s", lines[0])
-                return None
-
-        if action_word == "HOLD":
-            return None
-
-        return Signal(
-            symbol=self.symbol,
-            action=action_word,
-            size_usd=100.0,
-            confidence=0.6,
-            reason=f"[LLM] {reason}",
-        )
+        return self._parse_response(text)
 
     def _parse_response(self, text: str) -> Signal | None:
-        """Parse LLM response text into a Signal."""
+        """Parse LLM response text into a Signal — deterministic, reject-on-ambiguous.
+
+        The first line must be exactly BUY, SELL, or HOLD (case-insensitive,
+        surrounding punctuation tolerated). Substring matching is deliberately
+        NOT done: "I would not BUY here" must never resolve to a BUY.
+        """
         lines = text.split("\n", 1)
-        action_word = lines[0].strip().upper()
+        action_word = lines[0].strip().upper().strip(".!:*# ")
         reason = lines[1].strip() if len(lines) > 1 else ""
 
         if action_word not in ("BUY", "SELL", "HOLD"):
-            for word in ("BUY", "SELL", "HOLD"):
-                if word in action_word:
-                    action_word = word
-                    break
-            else:
-                logger.warning("LLM returned unparseable action: %s", lines[0])
-                return None
+            logger.warning("LLM returned ambiguous action, rejecting: %r", lines[0][:100])
+            return None
 
         if action_word == "HOLD":
             return None

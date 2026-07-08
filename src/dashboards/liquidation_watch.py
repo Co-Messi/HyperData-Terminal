@@ -30,18 +30,18 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from src.data_layer.position_scanner import PositionScanner, TrackedPosition  # noqa: E402
 from config.settings import (  # noqa: E402
     DASHBOARD_REFRESH_RATE,
     LIQ_ZONE_1_PCT,
     LIQ_ZONE_2_PCT,
     LIQ_ZONE_5_PCT,
 )
-
+from src.data_layer.position_scanner import PositionScanner, TrackedPosition  # noqa: E402
+from src.utils.helpers import format_pct_value as fmt_pct  # noqa: E402
+from src.utils.helpers import format_price as fmt_price  # noqa: E402
 
 # ── Formatting helpers (imported from central helpers) ────────────────────
-from src.utils.helpers import format_usd as fmt_usd, format_price as fmt_price, format_pct_value as fmt_pct
-
+from src.utils.helpers import format_usd as fmt_usd  # noqa: E402
 
 # ── Zone summary with long/short breakdown ────────────────────────────────
 

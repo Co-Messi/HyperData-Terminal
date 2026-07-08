@@ -62,6 +62,7 @@ class WalletProfile:
     pnl_score: float = 0.0         # log-scaled PnL
     sharpe_ratio: float = 0.0      # risk-adjusted returns
     composite_score: float = 0.0    # final weighted score
+    confidence: float = 0.0         # 0-1 sample-size confidence (see _compute_confidence)
 
     # Classification
     rank: int = 0                   # 1 = best performer
@@ -101,8 +102,13 @@ class SmartMoneyEngine:
     BETA = 0.40     # PnL weight (log-scaled)
     GAMMA = 0.25    # Sharpe weight
 
-    # Thresholds
-    MIN_TRADES_FOR_RANKING = 3          # Low for early data collection; tighten later
+    # Thresholds. Three closed trades says nothing about skill — a coin flip
+    # "wins" three in a row 12.5% of the time — so ranking requires a
+    # minimally meaningful sample plus real volume, and every profile carries
+    # a sample-size confidence that consumers must surface alongside tiers.
+    MIN_TRADES_FOR_RANKING = 10
+    MIN_VOLUME_FOR_RANKING = 50_000     # Total traded volume (USD)
+    FULL_CONFIDENCE_TRADES = 50         # Trades at which confidence saturates
     SMART_MONEY_TOP_N = 100             # Top 100 = smart money
     DUMB_MONEY_BOTTOM_N = 100           # Bottom 100 = dumb money
     ANALYSIS_INTERVAL = 300             # Analyze wallets every 5 minutes
@@ -200,8 +206,8 @@ class SmartMoneyEngine:
                                 or row.get("user")
                                 or ""
                             )
-                            if isinstance(addr, str) and addr.startswith("0x"):
-                                addresses.append(addr.lower())
+                            if address_store.is_valid_address(addr):
+                                addresses.append(address_store.normalize_address(addr))
                         if addresses:
                             logger.info(
                                 "[smart_money] Fetched %d leaderboard wallets from %s",
@@ -229,8 +235,8 @@ class SmartMoneyEngine:
                 raw = json.loads(ANCHOR_PATH.read_text())
                 for entry in raw.get("anchors", []):
                     addr = entry.get("address", "")
-                    if isinstance(addr, str) and addr.startswith("0x"):
-                        seed_addrs.append(addr.lower())
+                    if address_store.is_valid_address(addr):
+                        seed_addrs.append(address_store.normalize_address(addr))
                         anchor_count += 1
         except Exception:
             logger.debug("[smart_money] Failed to load anchor_wallets.json")
@@ -337,14 +343,19 @@ class SmartMoneyEngine:
                             if data.get("channel") == "trades":
                                 for trade in data.get("data", []):
                                     for addr in trade.get("users", []):
-                                        if addr and addr not in self.wallets:
+                                        # Untrusted payload: only well-formed
+                                        # wallet addresses become profiles.
+                                        if not address_store.is_valid_address(addr):
+                                            continue
+                                        addr = address_store.normalize_address(addr)
+                                        if addr not in self.wallets:
                                             self.wallets[addr] = WalletProfile(
                                                 address=addr,
                                                 discovered_at=time.time(),
                                                 last_seen=time.time(),
                                                 last_analyzed=0,
                                             )
-                                        elif addr and addr in self.wallets:
+                                        else:
                                             self.wallets[addr].last_seen = time.time()
             except asyncio.CancelledError:
                 return
@@ -376,7 +387,10 @@ class SmartMoneyEngine:
                         if data.get("channel") == "trades":
                             for trade in data.get("data", []):
                                 for addr in trade.get("users", []):
-                                    if addr and addr not in self.wallets:
+                                    if not address_store.is_valid_address(addr):
+                                        continue
+                                    addr = address_store.normalize_address(addr)
+                                    if addr not in self.wallets:
                                         self.wallets[addr] = WalletProfile(
                                             address=addr,
                                             discovered_at=time.time(),
@@ -425,7 +439,7 @@ class SmartMoneyEngine:
                 # Re-rank after each batch
                 self.rank_all()
 
-                ranked_count = sum(1 for w in self.wallets.values() if w.total_trades >= self.MIN_TRADES_FOR_RANKING)
+                ranked_count = sum(1 for w in self.wallets.values() if self._qualifies_for_ranking(w))
                 logger.info(
                     "[smart_money] Analyzed %d wallets, %d total tracked, %d ranked",
                     len(batch), len(self.wallets), ranked_count,
@@ -519,6 +533,7 @@ class SmartMoneyEngine:
         wallet.sharpe_ratio = self._compute_sharpe(close_pnls)
         wallet.pnl_score = self._compute_pnl_score(total_pnl)
         wallet.composite_score = self._compute_composite(wallet)
+        wallet.confidence = self._compute_confidence(wallet)
 
         # 5. Fetch clearinghouse state for account value + open positions
         ch = await self._fetch_clearinghouse(address)
@@ -578,15 +593,35 @@ class SmartMoneyEngine:
 
         return self.ALPHA * wr + self.BETA * pnl + self.GAMMA * sharpe
 
+    def _compute_confidence(self, w: WalletProfile) -> float:
+        """Sample-size confidence in [0, 1].
+
+        Linear in closed-trade count up to FULL_CONFIDENCE_TRADES. This is a
+        coverage heuristic (recent fills only, no confidence interval on win
+        rate) — consumers must show it next to any smart/dumb label rather
+        than presenting tiers as certainty.
+        """
+        return min(1.0, w.total_trades / float(self.FULL_CONFIDENCE_TRADES))
+
+    def _qualifies_for_ranking(self, w: WalletProfile) -> bool:
+        return (w.total_trades >= self.MIN_TRADES_FOR_RANKING
+                and w.total_volume_usd >= self.MIN_VOLUME_FOR_RANKING)
+
     # ── Ranking ───────────────────────────────────────────────────────
 
     def rank_all(self) -> None:
         """Re-rank all wallets by composite_score."""
-        qualified = [
-            w for w in self.wallets.values()
-            if w.total_trades >= self.MIN_TRADES_FOR_RANKING
-        ]
+        qualified = [w for w in self.wallets.values() if self._qualifies_for_ranking(w)]
         qualified.sort(key=lambda w: w.composite_score, reverse=True)
+
+        qualified_set = {w.address for w in qualified}
+        # Wallets that no longer qualify must lose their old rank/tier, or a
+        # stale "smart" label survives after the sample stops qualifying.
+        for w in self.wallets.values():
+            if w.address not in qualified_set:
+                w.rank = 0
+                if w.tier in ("smart", "average", "dumb"):
+                    w.tier = "unknown"
 
         for i, w in enumerate(qualified, 1):
             w.rank = i
@@ -707,7 +742,7 @@ class SmartMoneyEngine:
 
     def get_stats(self) -> dict:
         """Summary stats: total wallets, ranked wallets, signals generated."""
-        ranked = sum(1 for w in self.wallets.values() if w.total_trades >= self.MIN_TRADES_FOR_RANKING)
+        ranked = sum(1 for w in self.wallets.values() if self._qualifies_for_ranking(w))
         smart = sum(1 for w in self.wallets.values() if w.tier == "smart")
         dumb = sum(1 for w in self.wallets.values() if w.tier == "dumb")
         return {
@@ -716,4 +751,15 @@ class SmartMoneyEngine:
             "smart_wallets": smart,
             "dumb_wallets": dumb,
             "total_signals": len(self.signals),
+            # Coverage caveats: rankings come from recent fills only and small
+            # samples — consumers should show these limits, not just tiers.
+            "ranking_criteria": {
+                "min_trades": self.MIN_TRADES_FOR_RANKING,
+                "min_volume_usd": self.MIN_VOLUME_FOR_RANKING,
+                "note": (
+                    "Performance is computed from recent fills only; tiers are "
+                    "heuristic. Check each wallet's `confidence` (0-1 sample-"
+                    "size score) before acting on smart/dumb labels."
+                ),
+            },
         }

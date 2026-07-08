@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import time
+
 import pytest
-from data_layer.orderbook import OrderBookLevel, OrderBookSnapshot, OrderBookEngine, compute_imbalance
+
+from data_layer.orderbook import OrderBookEngine, OrderBookLevel, compute_imbalance
 
 
 def test_order_book_level():

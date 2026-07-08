@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import sqlite3
 import time
 from pathlib import Path
@@ -27,7 +28,7 @@ from typing import Any
 
 from rich.console import Console
 
-from .base import Strategy, Signal
+from .base import Signal, Strategy
 
 logger = logging.getLogger(__name__)
 console = Console()
@@ -153,18 +154,47 @@ class PaperTrader:
     # Trade execution
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _signal_is_valid(signal: Signal) -> bool:
+        """Reject malformed signals before they can corrupt the books."""
+        try:
+            size = float(signal.size_usd)
+        except (TypeError, ValueError):
+            return False
+        return (
+            signal.action in ("BUY", "SELL")
+            and isinstance(signal.symbol, str) and bool(signal.symbol)
+            and size > 0
+            and math.isfinite(size)
+        )
+
     def _execute_trade(self, strategy_name: str, signal: Signal) -> None:
-        """Execute a paper trade: update positions, log to SQLite, print."""
+        """Execute a paper trade: update positions, log to SQLite, print.
+
+        Accounting invariants:
+        - balance never goes negative (adds to a position are balance-checked
+          exactly like opens);
+        - adding to a position updates the size-weighted average entry price;
+        - an opposite-side signal closes the whole position (explicit
+          close-all semantics; partial reduction is not modeled).
+        """
+        if not self._signal_is_valid(signal):
+            logger.warning(
+                "Rejected invalid signal from %s: action=%r symbol=%r size_usd=%r",
+                strategy_name, signal.action, signal.symbol, signal.size_usd,
+            )
+            return
+
         # Get current market price for the symbol
         asset = self.hub.market.assets.get(signal.symbol)
-        if asset is None:
+        if asset is None or not asset.price or asset.price <= 0:
             logger.warning(
                 "Cannot execute trade for %s — no market data", signal.symbol
             )
             return
         price = asset.price
 
-        # Calculate PnL if closing/reducing an existing position
+        # Calculate PnL if closing an existing position
         pnl = 0.0
         if signal.symbol in self.positions:
             pos = self.positions[signal.symbol]
@@ -178,8 +208,19 @@ class PaperTrader:
                 self.balance += pos["size_usd"] + pnl
                 del self.positions[signal.symbol]
             else:
-                # Adding to position in same direction — just increase size
-                pos["size_usd"] += signal.size_usd
+                # Adding in the same direction: balance-checked like an open,
+                # entry price becomes the size-weighted average.
+                if signal.size_usd > self.balance:
+                    logger.warning(
+                        "Insufficient balance to add to %s (need $%.2f, have $%.2f)",
+                        signal.symbol, signal.size_usd, self.balance,
+                    )
+                    return
+                new_size = pos["size_usd"] + signal.size_usd
+                pos["entry_price"] = (
+                    pos["entry_price"] * pos["size_usd"] + price * signal.size_usd
+                ) / new_size
+                pos["size_usd"] = new_size
                 self.balance -= signal.size_usd
         else:
             # Open a new position

@@ -71,7 +71,7 @@ async def print_boot_sequence(console: Console, mode: str, dashboards: list[str]
     nw = 22  # name column width (same for both boxes)
     bw = 80  # box inner width
 
-    console.print(f"  [bold bright_cyan]\u250c\u2500 INITIALIZING COMPONENTS " + "\u2500" * (bw - 26) + "\u2510[/]")
+    console.print("  [bold bright_cyan]\u250c\u2500 INITIALIZING COMPONENTS " + "\u2500" * (bw - 26) + "\u2510[/]")
     console.print(f"  [bright_cyan]\u2502[/]{' ' * bw}[bright_cyan]\u2502[/]")
 
     for name, desc, color in components:
@@ -85,10 +85,10 @@ async def print_boot_sequence(console: Console, mode: str, dashboards: list[str]
         console.print(f"  [bright_cyan]\u2502[/]{rich}{' ' * max(pad_ck, 0)} [bold bright_green]\u2713[/][bright_cyan]\u2502[/]")
 
     console.print(f"  [bright_cyan]\u2502[/]{' ' * bw}[bright_cyan]\u2502[/]")
-    console.print(f"  [bold bright_cyan]\u2514" + "\u2500" * bw + "\u2518[/]")
+    console.print("  [bold bright_cyan]\u2514" + "\u2500" * bw + "\u2518[/]")
 
     console.print()
-    console.print(f"  [bold bright_white]\u250c\u2500 ACTIVE DASHBOARDS " + "\u2500" * (bw - 21) + "\u2510[/]")
+    console.print("  [bold bright_white]\u250c\u2500 ACTIVE DASHBOARDS " + "\u2500" * (bw - 21) + "\u2510[/]")
     for d in dashboards:
         info = DASHBOARD_INFO.get(d, {"name": d, "desc": "", "color": "white"})
         content = f"  \u25b8  {info['name']:<{nw}}{info['desc']}"
@@ -96,7 +96,7 @@ async def print_boot_sequence(console: Console, mode: str, dashboards: list[str]
         rich = f"  [{info['color']}]\u25b8[/]  [{info['color']}]{info['name']:<{nw}}[/][dim]{info['desc']}[/]"
         console.print(f"  [bright_white]\u2502[/]{rich}{' ' * max(pad, 0)}[bright_white]\u2502[/]")
         await asyncio.sleep(0.15)
-    console.print(f"  [bold bright_white]\u2514" + "\u2500" * bw + "\u2518[/]")
+    console.print("  [bold bright_white]\u2514" + "\u2500" * bw + "\u2518[/]")
 
     console.print()
     for i in range(bar_width + 1):
