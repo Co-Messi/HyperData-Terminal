@@ -1737,17 +1737,53 @@ class TestReconnectBackoff:
 
 
 class TestHLSharding:
-    """Measured live: Hyperliquid drops a socket (1006) at ~10 `trades`
-    subscriptions; the single 50-symbol socket died 0.6s after every connect
-    and the zero-sleep reconnect loop hid it (107 connects / 75s on the base
-    commit). Symbols are now sharded across sockets of <= 8 subscriptions."""
+    """Measured live: a `trades` subscription for a coin Hyperliquid does not
+    list (PEPE/BONK/FLOKI in DEFAULT_SYMBOLS — HL calls them kPEPE/...) closes
+    the socket with 1006. The single 50-symbol socket therefore died 0.6s
+    after every connect and the zero-sleep reconnect loop hid it (107
+    connects / 75s on the base commit). Fix: filter against the live meta
+    universe; shard so a mid-session delisting takes down one shard, not the
+    venue."""
+
+    def test_unlisted_symbols_are_skipped_and_named_once(self, caplog):
+        from src.data_layer.orderflow_engine import OrderFlowEngine
+        e = OrderFlowEngine(symbols=["BTC", "PEPE", "ETH", "BONK"])
+        universe = {"BTC", "ETH", "kPEPE", "SOL"}
+        with caplog.at_level("WARNING"):
+            assert e._hl_listed(["BTC", "PEPE", "ETH", "BONK"], universe) == ["BTC", "ETH"]
+            assert e._hl_listed(["BTC", "PEPE", "ETH", "BONK"], universe) == ["BTC", "ETH"]
+        assert caplog.text.count("PEPE is not listed") == 1          # once, not per reconnect
+        assert "Hyperliquid lists it as kPEPE" in caplog.text
+        assert caplog.text.count("BONK is not listed") == 1
+        assert "lists it as kBONK" not in caplog.text                # no alias -> no hint
+        # No universe (fetch failed): subscribe unfiltered, never go dark.
+        assert e._hl_listed(["BTC", "PEPE"], None) == ["BTC", "PEPE"]
+
+    @pytest.mark.asyncio
+    async def test_universe_is_fetched_once_and_cached(self):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from src.data_layer.orderflow_engine import OrderFlowEngine
+        e = OrderFlowEngine(symbols=["BTC"])
+        resp = AsyncMock()
+        resp.json = AsyncMock(return_value={"universe": [{"name": "BTC"}, {"name": "kPEPE"}, "junk"]})
+        resp.__aenter__ = AsyncMock(return_value=resp)
+        resp.__aexit__ = AsyncMock(return_value=False)
+        session = MagicMock()
+        session.post = MagicMock(return_value=resp)
+        assert await e._fetch_hl_universe(session) == {"BTC", "kPEPE"}
+        assert await e._fetch_hl_universe(session) == {"BTC", "kPEPE"}
+        assert session.post.call_count == 1                            # cached within TTL
+        # A failing refresh keeps the last good universe instead of returning None.
+        e._hl_universe_at = 0.0
+        session.post = MagicMock(side_effect=RuntimeError("503"))
+        assert await e._fetch_hl_universe(session) == {"BTC", "kPEPE"}
 
     def test_shards_cover_all_symbols_within_the_cap(self):
         from config.settings import DEFAULT_SYMBOLS
         from src.data_layer.orderflow_engine import HL_SUBSCRIPTIONS_PER_SOCKET, OrderFlowEngine
         e = OrderFlowEngine()                       # all 50 defaults
         shards = e._hl_shards()
-        assert HL_SUBSCRIPTIONS_PER_SOCKET <= 8    # 10 is the measured kill threshold
         assert all(0 < len(s) <= HL_SUBSCRIPTIONS_PER_SOCKET for s in shards)
         assert [s for shard in shards for s in shard] == list(DEFAULT_SYMBOLS)
         assert len(shards) == -(-len(DEFAULT_SYMBOLS) // HL_SUBSCRIPTIONS_PER_SOCKET)
@@ -1818,6 +1854,53 @@ class TestHLSharding:
         src = inspect.getsource(HyperDataHub._update_feed_staleness)
         assert "orderflow.force_reconnect()" in src
         assert "orderflow._ws" not in src
+
+    @pytest.mark.asyncio
+    async def test_stop_lets_shards_close_their_sessions(self, monkeypatch):
+        """Seen live: five 'Unclosed client session' errors at shutdown — one
+        per healthy shard — because stop() cancelled each loop while it was
+        inside `await session.close()`. stop() must let the close finish."""
+        import asyncio
+
+        from src.data_layer.orderflow_engine import OrderFlowEngine
+        e = OrderFlowEngine(symbols=["BTC"])
+
+        class FakeSession:
+            closed = False
+
+            async def close(self):
+                await asyncio.sleep(0.1)        # a real connector close takes time
+                self.closed = True
+
+        class FakeWS:
+            closed = False
+
+            async def close(self):
+                self.closed = True
+                gate.set()
+
+        gate = asyncio.Event()
+        session, ws = FakeSession(), FakeWS()
+
+        async def fake_connect_and_listen(shard=0):
+            e._hl_sessions[shard] = session
+            e._hl_sockets[shard] = ws
+            try:
+                await gate.wait()               # "socket closed by stop()"
+            finally:
+                e._hl_sockets.pop(shard, None)
+                e._hl_sessions.pop(shard, None)
+                if not session.closed:
+                    await asyncio.shield(session.close())
+
+        monkeypatch.setattr(e, "_connect_and_listen", fake_connect_and_listen)
+        e._running = True
+        e._hl_tasks = [asyncio.create_task(e._run_forever(0))]
+        await asyncio.sleep(0)
+        await e.stop()
+        assert ws.closed is True
+        assert session.closed is True           # not abandoned mid-close
+        assert e._hl_tasks == []
 
 
 # ── M13: extraction equivalence (demo generators, liquidation processing) ──

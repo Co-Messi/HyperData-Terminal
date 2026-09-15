@@ -50,12 +50,17 @@ false positives but misses smaller liquidations.
 - Trades are de-duplicated per venue (HL `tid`, Binance aggTrade `id`) so a
   reconnect/resubscribe replay cannot double-count into the never-resetting
   cumulative CVD.
-- Hyperliquid drops a WebSocket (close code 1006) once it carries roughly ten
-  `trades` subscriptions, so the 50 tracked symbols are spread across sockets
-  of at most 8 subscriptions each. A socket the server closes shortly after
-  connecting is retried with backoff (1s doubling to 15s), never in a tight
-  loop; the venue reads `connected` while any shard is up, and each shard's
-  connects are counted in `/v1/health` → `orderflow_venues.hyperliquid.connects`.
+- Hyperliquid drops a WebSocket (close code 1006, no error message) when it
+  receives a `trades` subscription for a coin it does not list. Subscriptions
+  are therefore filtered against the live `meta` universe (refreshed hourly);
+  an unlisted default symbol is skipped with one WARNING naming it and the
+  alias Hyperliquid uses (`PEPE` → `kPEPE`). Symbols are also spread across
+  sockets of at most 8 subscriptions so a coin delisted between refreshes
+  takes down one shard, not the venue. A socket the server closes shortly
+  after connecting is retried with backoff (1s doubling to 15s), never in a
+  tight loop; the venue reads `connected` while any shard is up, and every
+  shard connect is counted in `/v1/health` →
+  `orderflow_venues.hyperliquid.connects`.
 
 ## Staleness watchdog (frozen feeds never read as live)
 
