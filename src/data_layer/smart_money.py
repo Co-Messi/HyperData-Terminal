@@ -59,9 +59,13 @@ class WalletProfile:
 
     # Computed scores
     win_rate: float = 0.0           # winning / total
-    pnl_score: float = 0.0         # log-scaled PnL
-    sharpe_ratio: float = 0.0      # risk-adjusted returns
-    composite_score: float = 0.0    # final weighted score
+    pnl_score: float = 0.0         # log-scaled PnL, [-1, 1]
+    # Risk-adjusted per-trade RETURN ratio (mean/std of closedPnl/notional,
+    # shrunk toward 0 on small samples). NOT an annualised Sharpe ratio —
+    # no time basis, no risk-free rate. The field keeps its historical name
+    # because it is a persisted DB column.
+    sharpe_ratio: float = 0.0
+    composite_score: float = 0.0    # final weighted score, ordinal only
     confidence: float = 0.0         # 0-1 sample-size confidence (see _compute_confidence)
 
     # Classification
@@ -101,10 +105,31 @@ class SmartMoneySignal:
 class SmartMoneyEngine:
     API_URL = "https://api.hyperliquid.xyz/info"
 
-    # Scoring weights
-    ALPHA = 0.35    # Win rate weight
-    BETA = 0.40     # PnL weight (log-scaled)
-    GAMMA = 0.25    # Sharpe weight
+    # ── Scoring ──────────────────────────────────────────────────
+    # composite = ALPHA*win_rate + BETA*pnl_score + GAMMA*risk_adjusted
+    #
+    # Every component is bounded (win_rate in [0, 1], the other two in
+    # [-1, 1]) and the weights sum to 1, so the composite is bounded in
+    # [-0.65, 1] and is an ORDINAL ranking key — not a probability and not
+    # fitted to data. The weights encode a stated preference:
+    #   BETA  0.40  realised PnL is what a follower actually captures, and
+    #               it is the hardest of the three to fake;
+    #   ALPHA 0.35  win rate is intuitive but gameable with tiny scalps, so
+    #               it must not dominate PnL;
+    #   GAMMA 0.25  the risk-adjusted ratio breaks ties between wallets
+    #               with similar PnL; it is the noisiest input on small
+    #               samples, hence the smallest weight and the shrinkage.
+    ALPHA = 0.35
+    BETA = 0.40
+    GAMMA = 0.25
+    # pnl_score = sign(pnl) * min(1, log10(1 + |pnl|) / PNL_LOG_SCALE):
+    # $1k -> 0.50, $10k -> 0.67, $100k -> 0.83, $1M+ -> 1.0. The previous
+    # divisor of 10 compressed three orders of magnitude into 0.3..0.6 and
+    # made BETA's nominal weight mostly decorative.
+    PNL_LOG_SCALE = 6.0
+    # Small-sample shrinkage for the risk-adjusted ratio: raw * n/(n+K).
+    # 10 trades keep a third of the raw ratio, 20 keep half, 100 keep ~83%.
+    RISK_SHRINK_TRADES = 20
 
     # Thresholds. Three closed trades says nothing about skill — a coin flip
     # "wins" three in a row 12.5% of the time — so ranking requires a
@@ -485,6 +510,7 @@ class SmartMoneyEngine:
 
         # 2. Parse closedPnl and compute metrics
         close_pnls: list[float] = []
+        close_returns: list[float] = []   # closedPnl / fill notional, per close
         total_volume = 0.0
         winning = 0
         losing = 0
@@ -521,6 +547,8 @@ class SmartMoneyEngine:
 
                 # Every close fill counts as a trade (including breakeven)
                 close_pnls.append(closed_pnl)
+                if size_usd > 0:
+                    close_returns.append(closed_pnl / size_usd)
                 total_pnl += closed_pnl
                 if closed_pnl > 0:
                     winning += 1
@@ -543,7 +571,7 @@ class SmartMoneyEngine:
 
         # 4. Compute derived scores
         wallet.win_rate = winning / total_close_trades if total_close_trades > 0 else 0.0
-        wallet.sharpe_ratio = self._compute_sharpe(close_pnls)
+        wallet.sharpe_ratio = self._compute_risk_adjusted(close_returns)
         wallet.pnl_score = self._compute_pnl_score(total_pnl)
         wallet.composite_score = self._compute_composite(wallet)
         wallet.confidence = self._compute_confidence(wallet)
@@ -573,38 +601,48 @@ class SmartMoneyEngine:
     # ── Scoring ───────────────────────────────────────────────────────
 
     def _compute_pnl_score(self, total_pnl: float) -> float:
-        """Log-scaled PnL normalized to approx -1..1 range."""
-        if total_pnl > 0:
-            score = math.log10(1 + total_pnl) / 10
-        elif total_pnl < 0:
-            score = -math.log10(1 + abs(total_pnl)) / 10
-        else:
-            score = 0.0
-        return max(-1.0, min(1.0, score))
+        """Signed log-scaled PnL in [-1, 1]; monotonic in PnL, saturating at
+        ±10**PNL_LOG_SCALE dollars (see the class-level scoring notes)."""
+        if total_pnl == 0:
+            return 0.0
+        magnitude = math.log10(1 + abs(total_pnl)) / self.PNL_LOG_SCALE
+        return math.copysign(min(1.0, magnitude), total_pnl)
 
-    def _compute_sharpe(self, pnl_values: list[float]) -> float:
-        """Sharpe ratio from distribution of closed PnL values."""
-        if len(pnl_values) < 2:
+    def _compute_risk_adjusted(self, returns: list[float]) -> float:
+        """Small-sample-shrunk mean/std of per-trade RETURNS.
+
+        Inputs are closedPnl / fill notional, so a wallet scalping ten
+        consistent $50 wins on $50k notional does not out-score a wallet
+        compounding real returns; dollar PnL magnitude lives in pnl_score.
+        Zero dispersion (identical returns) says nothing about risk and
+        scores 0. The raw ratio is multiplied by n/(n+RISK_SHRINK_TRADES),
+        so a handful of similar trades cannot max the component.
+        Not annualised, no risk-free rate — see WalletProfile.sharpe_ratio.
+        """
+        n = len(returns)
+        if n < 2:
             return 0.0
-        returns = np.array(pnl_values)
-        mean = float(np.mean(returns))
-        std = float(np.std(returns))
-        if std == 0:
+        arr = np.array(returns, dtype=float)
+        std = float(np.std(arr))
+        # Identical returns give std ~1e-19 from float rounding, not 0.0 —
+        # an exact-zero test would turn that noise into a ~1e15 ratio.
+        if not std > 1e-12:
             return 0.0
-        return mean / std
+        raw = float(np.mean(arr)) / std
+        return raw * (n / (n + self.RISK_SHRINK_TRADES))
 
     def _compute_composite(self, w: WalletProfile) -> float:
-        """Weighted composite score."""
+        """Weighted composite ranking key, bounded in [-0.65, 1]."""
         # Win rate: already 0-1
-        wr = w.win_rate
+        wr = max(0.0, min(1.0, w.win_rate))
 
-        # Log-scaled PnL
+        # Log-scaled PnL, [-1, 1]
         pnl = self._compute_pnl_score(w.total_realized_pnl)
 
-        # Sharpe — normalize to approx -1..1
-        sharpe = max(-3.0, min(3.0, w.sharpe_ratio)) / 3.0
+        # Risk-adjusted ratio clamped to [-3, 3] then scaled to [-1, 1]
+        risk = max(-3.0, min(3.0, w.sharpe_ratio)) / 3.0
 
-        return self.ALPHA * wr + self.BETA * pnl + self.GAMMA * sharpe
+        return self.ALPHA * wr + self.BETA * pnl + self.GAMMA * risk
 
     def _compute_confidence(self, w: WalletProfile) -> float:
         """Sample-size confidence in [0, 1].

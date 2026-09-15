@@ -9,12 +9,17 @@ Configure via environment variables (or .env file):
     LLM_BASE_URL  — API base URL   (default: http://localhost:11434/v1)
     LLM_MODEL     — Model name     (default: llama3)
     LLM_API_KEY   — API key        (default: empty, not needed for Ollama)
+
+Transport model (H3): the request is a plain aiohttp call awaited under
+asyncio.wait_for, so a timeout actually CANCELS the in-flight request —
+there is no worker thread that can be left wedged behind a trickling
+response. At most one evaluation is in flight; a tick that arrives while
+one is running is skipped, not queued.
 """
 
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
 import json
 import logging
 import os
@@ -38,7 +43,7 @@ except ImportError:
 SYSTEM_PROMPT = (
     "You are a crypto trading assistant. Based on the market data provided, "
     "respond with exactly one word on the first line: BUY, SELL, or HOLD. "
-    "On the second line, give a brief reason (one sentence max)."
+    "On the second line, give a brief reason (under 20 words)."
 )
 
 
@@ -48,6 +53,11 @@ class LLMAgent(Strategy):
     # Budget guardrail: an LLM call per check interval adds up. Configurable
     # via LLM_MAX_EVALS_PER_HOUR; evaluations beyond the budget are skipped.
     DEFAULT_MAX_EVALS_PER_HOUR = 60
+    # Total wall-clock budget for one evaluation (connect + response).
+    EVAL_TIMEOUT_S = 20.0
+    # `reason` is untrusted provider output; max_tokens is a request, not a
+    # guarantee, so bound what we keep/print/store.
+    MAX_REASON_CHARS = 200
 
     def __init__(self, symbol: str = "BTC") -> None:
         self.symbol = symbol
@@ -63,10 +73,8 @@ class LLMAgent(Strategy):
         except ValueError:
             self.max_evals_per_hour = self.DEFAULT_MAX_EVALS_PER_HOUR
         self._eval_times: deque[float] = deque(maxlen=max(self.max_evals_per_hour, 1))
-        # One long-lived worker thread — not a new executor per evaluation.
-        self._pool = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="llm-agent"
-        )
+        # In-flight guard: one evaluation at a time, never a queue.
+        self._inflight = False
 
     @property
     def name(self) -> str:
@@ -85,10 +93,13 @@ class LLMAgent(Strategy):
     def _refund_eval_slot(self) -> None:
         """Return the most recent budget slot.
 
-        Called when the call failed at the TRANSPORT level (timeout, refused
-        connection, HTTP error) — no tokens were consumed, so a flaky
-        provider must not exhaust the hourly budget. Parse failures keep
-        their slot: the provider did the work and billed for it.
+        Called ONLY when the request never reached the provider (connection
+        refused / DNS / TLS failure — aiohttp.ClientConnectorError): no tokens
+        could have been consumed, so a down provider must not exhaust the
+        hourly budget. A TIMEOUT is deliberately NOT refunded: a slow provider
+        may well have completed and billed the generation, and refunding
+        would let it run at check_interval frequency (~2x the nominal cap).
+        HTTP errors and parse failures keep their slot for the same reason.
         """
         if self._eval_times:
             self._eval_times.pop()
@@ -96,9 +107,10 @@ class LLMAgent(Strategy):
     async def evaluate(self, hub) -> Signal | None:
         """Build a market summary and ask the LLM for a decision.
 
-        Async: the blocking HTTP call runs in the persistent worker thread
-        and is awaited, so a slow LLM response cannot stall the paper
-        trader's event loop (other strategies keep evaluating).
+        Async and cancellable: the aiohttp request runs under wait_for, so
+        the EVAL_TIMEOUT_S deadline aborts the request itself. If a previous
+        evaluation is still in flight this tick is skipped (no budget slot
+        consumed) rather than queued behind it.
         """
         # If no API key and not using a local model, warn and skip
         if not self.api_key and "localhost" not in self.base_url:
@@ -108,6 +120,10 @@ class LLMAgent(Strategy):
             )
             return None
 
+        if self._inflight:
+            logger.warning("LLM evaluation still in flight — skipping this tick")
+            return None
+
         if not self._within_budget():
             logger.warning(
                 "LLM eval budget exhausted (%d/hour) — skipping evaluation",
@@ -115,70 +131,36 @@ class LLMAgent(Strategy):
             )
             return None
 
-        loop = asyncio.get_running_loop()
+        self._inflight = True
         try:
-            return await asyncio.wait_for(
-                loop.run_in_executor(self._pool, self._sync_evaluate, hub),
-                timeout=20,
-            )
+            return await asyncio.wait_for(self._async_evaluate(hub), timeout=self.EVAL_TIMEOUT_S)
         except asyncio.TimeoutError:
-            self._refund_eval_slot()
-            logger.warning("LLM evaluation timed out after 20s")
+            # Request cancelled. Slot NOT refunded — see _refund_eval_slot.
+            logger.warning(
+                "LLM evaluation timed out after %.0fs (request cancelled; budget slot kept — "
+                "the provider may have billed the generation)", self.EVAL_TIMEOUT_S,
+            )
             return None
+        except aiohttp.ClientConnectorError as exc:
+            # Never reached the provider: nothing billed, give the slot back.
+            self._refund_eval_slot()
+            logger.warning("LLM API unreachable (%s) — budget slot refunded", exc)
+            return None
+        except asyncio.CancelledError:
+            raise
         except Exception:
             logger.exception("LLM agent error")
             return None
-
-    def _sync_evaluate(self, hub) -> Signal | None:
-        """Synchronous LLM call via urllib — no async dependency."""
-        import json as _json
-        import urllib.request
-
-        summary = self._build_market_summary(hub)
-        if summary is None:
-            return None
-
-        url = f"{self.base_url.rstrip('/')}/chat/completions"
-        payload = _json.dumps({
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": (
-                    "You are a crypto trading assistant. Based on the market data provided, "
-                    "respond with exactly one word on the first line: BUY, SELL, or HOLD. "
-                    "On the second line, give a brief reason (under 20 words)."
-                )},
-                {"role": "user", "content": summary},
-            ],
-            "temperature": 0.3,
-            "max_tokens": 60,
-        }).encode()
-
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-
-        req = urllib.request.Request(url, data=payload, headers=headers)
-        try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                data = _json.loads(resp.read())
-            text = data["choices"][0]["message"]["content"].strip()
-        except Exception as e:
-            # Transport-level failure: no tokens consumed — give the budget
-            # slot back so a down provider can't burn the hourly allowance.
-            self._refund_eval_slot()
-            logger.warning("LLM API call failed: %s", e)
-            return None
-
-        return self._parse_response(text)
+        finally:
+            self._inflight = False
 
     async def _async_evaluate(self, hub) -> Signal | None:
-        """Async version — call this directly from an async paper trader."""
-        # ---- Build market summary from hub data ----
+        """One LLM round-trip via aiohttp. Connection failures propagate to
+        evaluate() (which refunds the slot); everything else is handled here."""
         summary = self._build_market_summary(hub)
         if summary is None:
             return None
 
-        # ---- Call the LLM ----
         url = f"{self.base_url.rstrip('/')}/chat/completions"
         headers = {"Content-Type": "application/json"}
         if self.api_key:
@@ -190,28 +172,18 @@ class LLMAgent(Strategy):
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": summary},
             ],
-            "max_tokens": 100,
+            "max_tokens": 60,
             "temperature": 0.3,
         }
 
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=15)
-                ) as resp:
-                    if resp.status != 200:
-                        body = await resp.text()
-                        logger.warning("LLM API returned %d: %s", resp.status, body[:200])
-                        return None
-                    data = await resp.json()
-        except asyncio.TimeoutError:
-            logger.warning("LLM API timed out after 15s")
-            return None
-        except aiohttp.ClientError as e:
-            logger.warning("LLM API connection error: %s", e)
-            return None
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, headers=headers) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    logger.warning("LLM API returned %d: %s", resp.status, body[:200])
+                    return None
+                data = await resp.json()
 
-        # ---- Parse response ----
         try:
             text = data["choices"][0]["message"]["content"].strip()
         except (KeyError, IndexError, TypeError, AttributeError):
@@ -226,7 +198,9 @@ class LLMAgent(Strategy):
         The first NON-EMPTY line must be exactly BUY, SELL, or HOLD
         (case-insensitive, surrounding punctuation tolerated; leading blank
         lines are ignored). Substring matching is deliberately NOT done:
-        "I would not BUY here" must never resolve to a BUY.
+        "I would not BUY here" must never resolve to a BUY. The reason is
+        truncated to MAX_REASON_CHARS — it is provider output and is later
+        printed and stored.
         """
         lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
         if not lines:
@@ -234,6 +208,8 @@ class LLMAgent(Strategy):
             return None
         action_word = lines[0].upper().strip(".!:*# ")
         reason = " ".join(lines[1:]) if len(lines) > 1 else ""
+        if len(reason) > self.MAX_REASON_CHARS:
+            reason = reason[: self.MAX_REASON_CHARS - 1] + "…"
 
         if action_word not in ("BUY", "SELL", "HOLD"):
             logger.warning("LLM returned ambiguous action, rejecting: %r", lines[0][:100])
@@ -291,7 +267,3 @@ class LLMAgent(Strategy):
             pass
 
         return "\n".join(parts)
-
-    def _sync_call(self, hub) -> Signal | None:
-        """Synchronous wrapper for threading fallback."""
-        return asyncio.run(self._async_evaluate(hub))

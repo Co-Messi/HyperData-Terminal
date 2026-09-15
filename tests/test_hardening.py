@@ -731,22 +731,24 @@ class TestLLMRound2:
         assert agent._parse_response("   \nSELL") .action == "SELL"
         assert agent._parse_response("\n\n") is None
 
-    def test_transport_failure_refunds_budget_slot(self, monkeypatch):
-        """A down provider must not exhaust the hourly budget: transport
-        failures consumed no tokens, so their slots are returned."""
+    @pytest.mark.asyncio
+    async def test_transport_failure_refunds_budget_slot(self, monkeypatch):
+        """A down provider must not exhaust the hourly budget: a request that
+        never reached the provider consumed no tokens, so its slot is
+        returned. (H3: this is the ONLY refund case — timeouts keep theirs.)"""
+        import aiohttp
+
         agent = LLMAgent(symbol="BTC")
         agent.api_key = "k"
         agent.base_url = "https://llm.example/v1"
-        assert agent._within_budget(now=100.0)
-        assert len(agent._eval_times) == 1
 
-        def boom(*a, **kw):
-            raise OSError("connection refused")
+        async def refused(hub):
+            raise aiohttp.ClientConnectorError(MagicMock(), OSError("connection refused"))
 
-        monkeypatch.setattr("urllib.request.urlopen", boom)
+        monkeypatch.setattr(agent, "_async_evaluate", refused)
         hub = MagicMock()
         hub.market.assets = {"BTC": SimpleNamespace(price=100.0, funding_rate=0.0)}
-        assert agent._sync_evaluate(hub) is None
+        assert await agent.evaluate(hub) is None
         assert len(agent._eval_times) == 0  # slot refunded
 
     @pytest.mark.asyncio
