@@ -18,8 +18,16 @@ Security model:
     - A non-loopback bind (HYPERDATA_API_HOST) is refused unless either
       HYPERDATA_API_KEY is set (all non-health routes then require it) or
       HYPERDATA_UNSAFE_PUBLIC_API=1 explicitly acknowledges the risk.
-    - CORS is wildcard only on loopback; non-loopback binds must allowlist
-      origins via HYPERDATA_CORS_ORIGINS (comma-separated), else no CORS.
+    - CORS is NEVER wildcard. Loopback is not a boundary against the user's
+      own browser: any web page can fetch() http://127.0.0.1:8420 and, with
+      `Access-Control-Allow-Origin: *`, read the wallet-derived positions
+      back. Browser origins must be allowlisted via HYPERDATA_CORS_ORIGINS
+      (comma-separated); with no allowlist, no CORS headers are sent (curl,
+      SDKs and other non-browser clients are unaffected). The SAME allowlist
+      gates WebSocket upgrades carrying an Origin header.
+    - On a loopback bind the Host header must also be loopback, so a DNS
+      rebinding page (evil.example -> 127.0.0.1) cannot reach the API even
+      without CORS.
     - Per-IP REST rate limit + WebSocket per-client send queues.
 """
 from __future__ import annotations
@@ -85,26 +93,67 @@ def _serialize(obj: Any) -> Any:
     return obj
 
 
+def _host_header_is_loopback(host_header: str) -> bool:
+    """True if an HTTP Host header names a loopback address.
+
+    Accepts `localhost`, `127.x.x.x`, `::1` and `[::1]`, each with or without
+    a port. Anything else — including a DNS name that happens to resolve to
+    127.0.0.1 — is refused, which is the point: a rebinding attacker controls
+    the name, not the address.
+    """
+    host = (host_header or "").strip().lower()
+    if not host:
+        return False
+    if host.startswith("["):                       # [::1]:8420
+        end = host.find("]")
+        if end == -1:
+            return False
+        host = host[1:end]
+    elif host.count(":") == 1:                     # name:port / v4:port
+        host = host.rsplit(":", 1)[0]
+    # A bare IPv6 literal (no brackets, several colons) falls through as-is.
+    return _is_loopback_host(host)
+
+
+def _make_host_guard_middleware(bind_host: str):
+    """Reject requests whose Host header is not loopback, on a loopback bind.
+
+    Defends against DNS rebinding: a page at evil.example whose DNS flips to
+    127.0.0.1 makes same-origin requests that carry `Host: evil.example`.
+    Returns None for a non-loopback bind (we cannot know the valid names).
+    """
+    if not _is_loopback_host(bind_host):
+        return None
+
+    @web.middleware
+    async def host_guard_middleware(request: web.Request, handler):
+        if not _host_header_is_loopback(request.headers.get("Host", "")):
+            logger.warning("Rejected request with non-loopback Host header %r on loopback bind",
+                           request.headers.get("Host", ""))
+            return web.json_response({"error": "Invalid Host header"}, status=403)
+        return await handler(request)
+
+    return host_guard_middleware
+
+
 def _make_cors_middleware(allowed_origins: set[str] | None):
     """CORS middleware factory.
 
-    allowed_origins=None means wildcard (loopback binds only); otherwise the
-    request Origin must be in the allowlist to receive CORS headers.
+    CORS headers are emitted ONLY for a request whose Origin is in the
+    allowlist; never a wildcard. An empty/None allowlist means browsers get
+    no CORS grant at all (non-browser clients send no Origin and don't care).
     """
+    allowed = allowed_origins or set()
 
     def _cors_headers(request: web.Request) -> dict[str, str]:
-        if allowed_origins is None:
-            origin = "*"
-        else:
-            req_origin = request.headers.get("Origin", "")
-            if req_origin not in allowed_origins:
-                return {}
-            origin = req_origin
+        req_origin = request.headers.get("Origin", "")
+        if not req_origin or req_origin not in allowed:
+            return {}
         return {
-            "Access-Control-Allow-Origin": origin,
+            "Access-Control-Allow-Origin": req_origin,
             "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
             "Access-Control-Allow-Headers": "Authorization, Content-Type, X-API-Key",
-            **({"Vary": "Origin"} if origin != "*" else {}),
+            "Vary": "Origin",
         }
 
     @web.middleware
@@ -274,22 +323,22 @@ class HyperDataAPI:
 
     # ── Lifecycle ────────────────────────────────────────────────
 
-    def _resolve_security(self) -> tuple[str, set[str] | None]:
+    def _resolve_security(self) -> tuple[str, set[str]]:
         """Validate bind/auth/CORS config. Returns (api_key, cors_allowlist).
 
-        Raises RuntimeError for a non-loopback bind with neither an API key
-        nor an explicit unsafe acknowledgment.
+        The allowlist is the ONE browser-origin policy for both REST CORS and
+        WebSocket upgrades; it is never a wildcard on any bind. Raises
+        RuntimeError for a non-loopback bind with neither an API key nor an
+        explicit unsafe acknowledgment.
         """
         api_key = os.environ.get("HYPERDATA_API_KEY", "").strip()
         unsafe_ack = os.environ.get("HYPERDATA_UNSAFE_PUBLIC_API", "") == "1"
         origins_raw = os.environ.get("HYPERDATA_CORS_ORIGINS", "").strip()
-        origins: set[str] | None = (
-            {o.strip() for o in origins_raw.split(",") if o.strip()}
-            if origins_raw else None
-        )
+        origins: set[str] = {o.strip() for o in origins_raw.split(",") if o.strip()}
 
         if _is_loopback_host(self.host):
-            # Loopback: wildcard CORS unless an allowlist was configured.
+            # Loopback: no credentials needed, but browsers still get CORS
+            # only for explicitly allowlisted origins (see module docstring).
             return api_key, origins
 
         if not api_key and not unsafe_ack:
@@ -305,15 +354,20 @@ class HyperDataAPI:
                 "(HYPERDATA_UNSAFE_PUBLIC_API=1). Anyone on the network can "
                 "read wallet/trading intelligence.", self.host,
             )
-        # Non-loopback: never wildcard CORS. No allowlist -> no CORS headers.
-        return api_key, (origins or set())
+        return api_key, origins
 
     async def start(self) -> None:
         api_key, cors_origins = self._resolve_security()
         self._api_key = api_key
         self._cors_origins = cors_origins
 
-        middlewares = [_make_rate_limit_middleware(self._rate_limiter)]
+        # Host guard FIRST so a rebinding request never reaches rate
+        # limiting, auth, or a handler.
+        middlewares = []
+        host_guard = _make_host_guard_middleware(self.host)
+        if host_guard is not None:
+            middlewares.append(host_guard)
+        middlewares.append(_make_rate_limit_middleware(self._rate_limiter))
         if api_key:
             middlewares.append(_make_auth_middleware(api_key))
         middlewares.append(_make_cors_middleware(cors_origins))
@@ -728,8 +782,10 @@ class HyperDataAPI:
         # Browser WebSockets are NOT gated by the same-origin policy: any
         # webpage can open ws://127.0.0.1 and read the stream. An Origin
         # header means a browser context — reject it unless the origin was
-        # explicitly allowlisted (HYPERDATA_CORS_ORIGINS). Non-browser
-        # clients (curl, bots, SDKs) send no Origin and are unaffected.
+        # explicitly allowlisted (HYPERDATA_CORS_ORIGINS — the same allowlist
+        # the REST CORS middleware uses, so the two surfaces cannot disagree).
+        # Non-browser clients (curl, bots, SDKs) send no Origin and are
+        # unaffected.
         origin = request.headers.get("Origin")
         if origin is not None:
             allowed = getattr(self, "_cors_origins", None) or set()
