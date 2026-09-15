@@ -1,0 +1,379 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HyperData Terminal — real-time crypto market intelligence in your terminal</title>
+  <meta name="description" content="Open-source crypto market-data terminal. Streams live data from Hyperliquid, Binance, Bybit, OKX and Deribit into six terminal dashboards, a REST API and a paper-trading engine. No API keys required. Apache-2.0.">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#f5f5fa" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#0e1020" media="(prefers-color-scheme: dark)">
+
+  <!-- Social cards. SITE_URL below assumes GitHub Pages for this repo; change it if the site is hosted elsewhere. -->
+  <link rel="canonical" href="https://co-messi.github.io/HyperData-Terminal/">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="HyperData Terminal">
+  <meta property="og:title" content="HyperData Terminal">
+  <meta property="og:description" content="Real-time crypto market intelligence, right in your terminal. Live data from 5 exchanges, 6 dashboards, a REST API and paper trading. Open source, no API keys.">
+  <meta property="og:url" content="https://co-messi.github.io/HyperData-Terminal/">
+  <meta property="og:image" content="https://co-messi.github.io/HyperData-Terminal/og-image.png">
+  <meta property="og:image:width" content="1280">
+  <meta property="og:image:height" content="640">
+  <meta property="og:image:alt" content="HyperData Terminal: real-time crypto market intelligence, right in your terminal.">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="HyperData Terminal">
+  <meta name="twitter:description" content="Real-time crypto market intelligence, right in your terminal. Live data from 5 exchanges, 6 dashboards, a REST API and paper trading. Open source, no API keys.">
+  <meta name="twitter:image" content="https://co-messi.github.io/HyperData-Terminal/og-image.png">
+  <meta name="twitter:image:alt" content="HyperData Terminal: real-time crypto market intelligence, right in your terminal.">
+
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Instrument+Sans:ital,wght@0,400;0,500;0,600;0,700;1,400&family=JetBrains+Mono:wght@400;500;600&display=swap">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+
+  <header class="site-header">
+    <div class="wrap">
+      <a class="brand" href="#top" aria-label="HyperData Terminal home">
+        <svg viewBox="0 0 64 64" aria-hidden="true" focusable="false">
+          <rect width="64" height="64" rx="14" fill="#0e1020"/>
+          <path d="M14 46 C 26 40, 38 30, 50 14" fill="none" stroke="#3ec0f0" stroke-width="5" stroke-linecap="round"/>
+          <path d="M16 52 C 28 47, 40 38, 52 22" fill="none" stroke="#a48cff" stroke-width="5" stroke-linecap="round"/>
+        </svg>
+        <span>HyperData <span class="brand-sub">Terminal</span></span>
+      </a>
+      <nav class="site-nav" aria-label="Primary">
+        <a href="#dashboards">Dashboards</a>
+        <a href="#data">Data</a>
+        <a href="#build">API &amp; strategies</a>
+        <a href="#install">Install</a>
+        <a class="btn" href="https://github.com/Co-Messi/HyperData-Terminal">
+          <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
+          GitHub
+        </a>
+      </nav>
+    </div>
+  </header>
+
+  <main id="main">
+    <section class="hero" id="top" aria-labelledby="hero-title">
+      <div class="wrap">
+        <div>
+          <h1 id="hero-title">Real-time crypto market intelligence, right in your terminal.</h1>
+          <p class="lede">HyperData Terminal streams live data from Hyperliquid, Binance, Bybit, OKX and Deribit. Track whale positions, monitor liquidation cascades, analyze order flow and paper-trade your own strategies, all from one command. <strong>No API keys required.</strong></p>
+
+          <dl class="spec" aria-label="At a glance">
+            <div><dt>Exchanges</dt><dd>5</dd></div>
+            <div><dt>Dashboards</dt><dd>6</dd></div>
+            <div><dt>Data components</dt><dd>14</dd></div>
+            <div><dt>API endpoints</dt><dd>17+</dd></div>
+            <div><dt>License</dt><dd>Apache-2.0</dd></div>
+            <div><dt>Runtime</dt><dd>Python 3.12+</dd></div>
+          </dl>
+
+          <div class="hero-actions">
+            <a class="btn btn-primary" href="#install">Install in four commands</a>
+            <a class="btn" href="https://github.com/Co-Messi/HyperData-Terminal">View the source</a>
+          </div>
+        </div>
+
+        <figure class="window" style="margin:0">
+          <div class="window-bar" aria-hidden="true">
+            <span class="dots"><i></i><i></i><i></i></span>
+            <span class="title">hyperdata — all dashboards</span>
+          </div>
+          <img src="screenshot-market.png" width="1600" height="875" alt="HyperData Terminal's combined view in a terminal window: liquidation watch, order flow, a live liquidation feed, market overview and system status panels side by side." fetchpriority="high" decoding="async">
+        </figure>
+      </div>
+    </section>
+
+    <section class="section" id="dashboards" aria-labelledby="dash-title">
+      <div class="wrap">
+        <div class="section-head">
+          <h2 id="dash-title">Six dashboards, one command.</h2>
+          <p>Run <code>hyperdata</code> and pick a view from the menu. Every dashboard reads from the same data hub and updates in real time. <kbd>Ctrl+C</kbd> takes you back to the menu.</p>
+        </div>
+
+        <div class="dash-grid">
+          <figure class="window menu-window" style="margin:0">
+            <div class="window-bar" aria-hidden="true">
+              <span class="dots"><i></i><i></i><i></i></span>
+              <span class="title">hyperdata</span>
+            </div>
+<pre><code><span class="c">$</span> hyperdata
+
+  <span class="a">[1]</span>  Liquidation Watch    <span class="c">Closest to liquidation</span>
+  <span class="a">[2]</span>  Liquidation Stream   <span class="c">Multi-exchange feed</span>
+  <span class="a">[3]</span>  Liquidation Heatmap  <span class="c">Risk by price level</span>
+  <span class="a">[4]</span>  CVD Order Flow       <span class="c">BTC volume delta</span>
+  <span class="a">[5]</span>  Market Overview      <span class="c">Funding, OI, prices</span>
+  <span class="a">[6]</span>  Whale Tracker        <span class="c">Largest positions</span>
+  <span class="a">[0]</span>  All Dashboards       <span class="c">Combined view</span>
+
+  <span class="c">Press Ctrl+C to return to menu.</span>
+  Select: <span class="cursor" aria-hidden="true"></span></code></pre>
+          </figure>
+
+          <figure class="window" style="margin:0">
+            <div class="window-bar" aria-hidden="true">
+              <span class="dots"><i></i><i></i><i></i></span>
+              <span class="title">hyperdata — starting up</span>
+            </div>
+            <img src="screenshot-combined.png" width="1600" height="867" alt="HyperData Terminal starting up: the HyperData banner, the list of data components being initialized, the active dashboards, and a progress bar reporting all systems online." loading="lazy" decoding="async">
+          </figure>
+        </div>
+
+        <dl class="dash-list">
+          <div>
+            <dt><span class="n">[1]</span><span>Liquidation Watch</span></dt>
+            <dd>BTC positions closest to liquidation on Hyperliquid. Tracks distance-to-liquidation in real time, so you can see which whales are about to get wiped.</dd>
+          </div>
+          <div>
+            <dt><span class="n">[2]</span><span>Liquidation Stream</span></dt>
+            <dd>Multi-exchange liquidation feed from Hyperliquid, Binance, Bybit and OKX, with size, price and exchange for every event.</dd>
+          </div>
+          <div>
+            <dt><span class="n">[3]</span><span>Liquidation Heatmap</span></dt>
+            <dd>Price-level view of where liquidations are concentrated. Red bars mark long-liquidation risk below price; green bars mark short-liquidation risk above it.</dd>
+          </div>
+          <div>
+            <dt><span class="n">[4]</span><span>CVD Order Flow</span></dt>
+            <dd>Cumulative volume delta for BTC, built from Binance WebSocket trades. See whether buyers or sellers are in control.</dd>
+          </div>
+          <div>
+            <dt><span class="n">[5]</span><span>Market Overview</span></dt>
+            <dd>Funding rates, open interest and prices for 50 assets across exchanges. Spot divergences and funding extremes at a glance.</dd>
+          </div>
+          <div>
+            <dt><span class="n">[6]</span><span>Whale Tracker</span></dt>
+            <dd>The largest open positions on Hyperliquid: size, entry price, PnL and liquidation price for the biggest players.</dd>
+          </div>
+        </dl>
+      </div>
+    </section>
+
+    <section class="section" id="data" aria-labelledby="data-title">
+      <div class="wrap">
+        <div class="split">
+          <div class="prose">
+            <h2 id="data-title">Five exchanges. Public feeds. No keys.</h2>
+            <p>All data is fetched live from public exchange endpoints over WebSocket and REST. Nothing to sign up for, nothing to configure before the first run.</p>
+            <p>Inside, a single hub owns 14 data components and manages their async lifecycles. The dashboards, the API and the paper-trading engine all read from that one hub.</p>
+            <ul class="components" aria-label="Data components">
+              <li>Liquidations from 4 exchanges</li>
+              <li>CVD order flow</li>
+              <li>Whale positions</li>
+              <li>Funding rates</li>
+              <li>Open interest</li>
+              <li>Orderbook depth</li>
+              <li>DVOL implied volatility</li>
+              <li>Long/short ratios</li>
+              <li>Spot prices</li>
+              <li>Smart-money signals</li>
+            </ul>
+          </div>
+
+          <div class="table-wrap">
+            <table>
+              <caption class="visually-hidden">Data sources, what each provides, and how it is connected</caption>
+              <thead>
+                <tr><th scope="col">Source</th><th scope="col">Data</th><th scope="col">Connection</th></tr>
+              </thead>
+              <tbody>
+                <tr><td>Hyperliquid</td><td>Positions, liquidations, funding, whale tracking</td><td>WebSocket + REST</td></tr>
+                <tr><td>Binance</td><td>Trades, liquidations, orderbook</td><td>WebSocket</td></tr>
+                <tr><td>Bybit</td><td>Liquidations</td><td>WebSocket</td></tr>
+                <tr><td>OKX</td><td>Liquidations</td><td>WebSocket</td></tr>
+                <tr><td>Deribit</td><td>DVOL implied volatility</td><td>REST</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="integrity" aria-labelledby="integrity-title">
+      <div class="wrap">
+        <div class="split">
+          <div class="prose">
+            <h2 id="integrity-title">Data that checks itself.</h2>
+            <p>HyperData continuously cross-checks its live feeds against Binance and Deribit and flags anything stale. The status is printed on the dashboard and exposed at <code>/v1/health</code>, so your own tools can read it too.</p>
+            <div class="note">
+              <p><strong>Coverage is honest, not a complete census.</strong> OKX and Bybit liquidations are real feeds (Bybit covers its top 15 symbols). Binance's stream is throttled at the source to about one liquidation per symbol per second. Hyperliquid liquidations are inferred from large trades and flagged as estimated. Details are in <a href="https://github.com/Co-Messi/HyperData-Terminal/blob/main/docs/DATA_INTEGRITY.md">docs/DATA_INTEGRITY.md</a>.</p>
+            </div>
+          </div>
+
+          <div class="states" role="list" aria-label="Feed status states">
+            <div class="state live" role="listitem">
+              <span class="tag">✓ LIVE</span>
+              <p><strong>The feed agrees with the reference.</strong> Data is arriving and matches the cross-check within tolerance.</p>
+            </div>
+            <div class="state stale" role="listitem">
+              <span class="tag">⚠ STALE</span>
+              <p><strong>The feed has gone quiet.</strong> No fresh data has arrived recently, so what you see may be out of date.</p>
+            </div>
+            <div class="state drift" role="listitem">
+              <span class="tag">⚠ DRIFT</span>
+              <p><strong>The feed disagrees with the reference.</strong> Values have diverged from Binance or Deribit beyond the expected range.</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="build" aria-labelledby="build-title">
+      <div class="wrap">
+        <div class="section-head">
+          <h2 id="build-title">Build on the same hub.</h2>
+          <p>Everything the dashboards see is also available to your code: through a local REST API and WebSocket, or directly inside a paper-trading strategy.</p>
+        </div>
+
+        <div class="build-grid">
+          <div>
+            <h3>REST API and WebSocket</h3>
+            <p>Start the server alongside or instead of the terminal. It binds to <code>127.0.0.1</code> by default and refuses a public bind unless you set an API key or explicitly accept the risk.</p>
+            <figure class="window" style="margin:0">
+              <div class="window-bar" aria-hidden="true">
+                <span class="dots"><i></i><i></i><i></i></span>
+                <span class="title">shell</span>
+              </div>
+<pre><code><span class="c">$</span> python run_api.py --port 8420
+
+<span class="c">$</span> curl http://localhost:8420/v1/market/BTC | python -m json.tool
+<span class="c">$</span> curl http://localhost:8420/v1/orderflow/BTC
+<span class="c">$</span> curl http://localhost:8420/v1/liquidations/stats
+<span class="c">$</span> curl http://localhost:8420/v1/positions/danger-zone</code></pre>
+            </figure>
+
+            <details>
+              <summary>All 17 endpoints</summary>
+              <div class="table-wrap endpoints stack-sm">
+                <table>
+                  <caption class="visually-hidden">REST and WebSocket endpoints</caption>
+                  <thead><tr><th scope="col">Endpoint</th><th scope="col">Returns</th></tr></thead>
+                  <tbody>
+                    <tr><td><code>GET /v1/live</code></td><td>Minimal liveness probe (always unauthenticated)</td></tr>
+                    <tr><td><code>GET /v1/health</code></td><td>Server status and uptime</td></tr>
+                    <tr><td><code>GET /v1/market</code></td><td>All assets: prices, OI, funding</td></tr>
+                    <tr><td><code>GET /v1/market/{symbol}</code></td><td>Single asset detail</td></tr>
+                    <tr><td><code>GET /v1/liquidations</code></td><td>Recent liquidation events</td></tr>
+                    <tr><td><code>GET /v1/liquidations/stats</code></td><td>Aggregate liquidation statistics</td></tr>
+                    <tr><td><code>GET /v1/orderflow/{symbol}</code></td><td>CVD snapshots for a symbol</td></tr>
+                    <tr><td><code>GET /v1/funding-rates</code></td><td>Funding rates across exchanges</td></tr>
+                    <tr><td><code>GET /v1/funding-rates/{symbol}</code></td><td>Single asset funding rate</td></tr>
+                    <tr><td><code>GET /v1/long-short-ratio</code></td><td>Long/short ratio</td></tr>
+                    <tr><td><code>GET /v1/basis</code></td><td>Basis spread</td></tr>
+                    <tr><td><code>GET /v1/deribit/iv</code></td><td>DVOL implied volatility</td></tr>
+                    <tr><td><code>GET /v1/orderbook/{symbol}</code></td><td>Orderbook snapshot</td></tr>
+                    <tr><td><code>GET /v1/whales</code></td><td>Top whale positions</td></tr>
+                    <tr><td><code>GET /v1/positions/danger-zone</code></td><td>Positions closest to liquidation</td></tr>
+                    <tr><td><code>GET /v1/public/metrics</code></td><td>Server metrics and component health</td></tr>
+                    <tr><td><code>WS /v1/ws</code></td><td>Real-time event stream: liquidations, trades, signals</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </details>
+
+            <details>
+              <summary>Optional LLM agent</summary>
+              <p>The agent sends a market summary to any OpenAI-compatible API and asks for a trading decision. Point it at OpenAI, Ollama, LM Studio, Groq, Together or your own endpoint with three variables in <code>.env</code>: <code>LLM_BASE_URL</code>, <code>LLM_MODEL</code> and <code>LLM_API_KEY</code>. The prompt lives in <code>src/strategies/llm_agent.py</code>.</p>
+            </details>
+          </div>
+
+          <div>
+            <h3>Paper trading, your strategy</h3>
+            <p>Real market data, fake money. A strategy is one class with one method that returns a signal or nothing; the whole interface fits in about 30 lines.</p>
+            <figure class="window" style="margin:0">
+              <div class="window-bar" aria-hidden="true">
+                <span class="dots"><i></i><i></i><i></i></span>
+                <span class="title">src/strategies/examples/my_strategy.py</span>
+              </div>
+<pre><code><span class="k">from</span> src.strategies.base <span class="k">import</span> Strategy, Signal
+
+<span class="k">class</span> <span class="a">MyStrategy</span>(Strategy):
+    name = <span class="s">"my_strategy"</span>
+
+    <span class="k">def</span> <span class="a">evaluate</span>(self, hub) -> Signal | None:
+        <span class="c"># hub.orderflow, hub.market, hub.liquidations,</span>
+        <span class="c"># hub.funding, hub.lsr, hub.positions,</span>
+        <span class="c"># hub.spot, hub.deribit are all live here.</span>
+        snap = hub.orderflow.get_snapshot(<span class="s">"BTC"</span>, <span class="s">"5m"</span>)
+        <span class="k">if not</span> snap:
+            <span class="k">return</span> None
+
+        cvd = snap.buy_volume - snap.sell_volume
+        <span class="k">if</span> cvd > 100_000:
+            <span class="k">return</span> Signal(<span class="s">"BTC"</span>, <span class="s">"BUY"</span>, size_usd=100,
+                          confidence=0.7, reason=<span class="s">"Strong buy pressure"</span>)
+        <span class="k">elif</span> cvd < -100_000:
+            <span class="k">return</span> Signal(<span class="s">"BTC"</span>, <span class="s">"SELL"</span>, size_usd=100,
+                          confidence=0.7, reason=<span class="s">"Strong sell pressure"</span>)
+        <span class="k">return</span> None</code></pre>
+            </figure>
+
+            <details>
+              <summary>Included example strategies</summary>
+              <div class="table-wrap stack-sm">
+                <table>
+                  <caption class="visually-hidden">Example strategies shipped with the project</caption>
+                  <thead><tr><th scope="col">Strategy</th><th scope="col">Reads</th><th scope="col">Logic</th></tr></thead>
+                  <tbody>
+                    <tr><td>CVDMomentum</td><td><code>hub.orderflow</code></td><td>Buy when order flow is strongly positive, sell when negative</td></tr>
+                    <tr><td>FundingRateArb</td><td><code>hub.funding</code></td><td>Short when funding is high, long when negative</td></tr>
+                    <tr><td>LiquidationCascade</td><td><code>hub.liquidations</code></td><td>Buy the dip after large liquidation cascades</td></tr>
+                    <tr><td>WhaleFollow</td><td><code>hub.positions</code></td><td>Mirror the direction of the largest whale positions</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </details>
+
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section install-band" id="install" aria-labelledby="install-title">
+      <div class="wrap">
+        <div class="split">
+          <div class="prose">
+            <h2 id="install-title">Four commands to live data.</h2>
+            <p>Clone, install, run. The first launch opens the dashboard menu with data streaming from all five exchanges.</p>
+            <dl class="reqs">
+              <dt>Requires</dt><dd>Python 3.12 or newer, pip, git</dd>
+              <dt>API keys</dt><dd>None for the dashboards or the API. Only the optional LLM agent needs one.</dd>
+              <dt>License</dt><dd>Apache-2.0</dd>
+            </dl>
+          </div>
+
+          <figure class="window install" style="margin:0">
+            <div class="window-bar" aria-hidden="true">
+              <span class="dots"><i></i><i></i><i></i></span>
+              <span class="title">shell</span>
+            </div>
+<pre id="install-commands"><code><span class="prompt">$ </span><span data-cmd>git clone https://github.com/Co-Messi/HyperData-Terminal.git</span>
+<span class="prompt">$ </span><span data-cmd>cd HyperData-Terminal</span>
+<span class="prompt">$ </span><span data-cmd>pip install -e .</span>
+<span class="prompt">$ </span><span data-cmd>hyperdata</span></code></pre>
+            <button class="copy" type="button" data-copy="install-commands" aria-label="Copy install commands">Copy</button>
+          </figure>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="wrap">
+      <span>HyperData Terminal is open source under the Apache License 2.0.</span>
+      <span class="spacer"></span>
+      <a href="https://github.com/Co-Messi/HyperData-Terminal">GitHub</a>
+      <a href="https://github.com/Co-Messi/HyperData-Terminal/blob/main/docs/DATA_INTEGRITY.md">Data integrity</a>
+      <a href="https://github.com/Co-Messi/HyperData-Terminal/blob/main/README.md#contributing">Contributing</a>
+    </div>
+  </footer>
+
+  <script src="script.js" defer></script>
+</body>
+</html>
