@@ -1791,27 +1791,38 @@ class TestH6WriterThread:
             store.close()
 
     def test_queue_is_bounded_and_drops_are_counted(self, tmp_path, monkeypatch, caplog):
+        """Pre-fix: the queue was unbounded. The writer is parked with a
+        gate INSIDE _apply, so 'the first item is in flight' is an event the
+        test waits on, not a 5ms poll against a 2s deadline that lost the
+        race under CI load (S5) and then asserted an exact count."""
+        import threading
+
         from src.data_layer import persistence
         monkeypatch.setattr(persistence, "WRITE_QUEUE_MAX", 5)
         store = DataStore(tmp_path / "q.db")
+        taken, release = threading.Event(), threading.Event()
+        real_apply = store._apply
+
+        def gated_apply(batch):
+            taken.set()
+            release.wait(10)
+            real_apply(batch)
+
+        store._apply = gated_apply
         try:
-            # Park the writer: it pops the first item, then blocks on the
-            # connection lock held here; everything else piles up in the queue.
-            with store._lock:
-                store._save_liquidation(_Liq(0))
-                import time as _t
-                deadline = _t.time() + 2
-                while store._applied_seq == 0 and store._write_q and _t.time() < deadline:
-                    _t.sleep(0.005)   # let the writer take the first batch
-                with caplog.at_level("WARNING"):
-                    for i in range(1, 10):
-                        store._save_liquidation(_Liq(i))
-            store.flush()
+            store._save_liquidation(_Liq(0))
+            assert taken.wait(10), "writer never picked up the first batch"
+            with caplog.at_level("WARNING"):
+                for i in range(1, 10):
+                    store._save_liquidation(_Liq(i))
             assert store.dropped_writes == 4                       # 1 in flight + 5 queued + 4 dropped
+            release.set()
+            store.flush()
             assert store.get_db_stats()["dropped_writes"] == 4
             assert store.get_db_stats()["liquidations_stored"] == 6
             assert "write queue full" in caplog.text
         finally:
+            release.set()
             store.close()
 
     def test_close_stops_writer_and_persists_everything(self, tmp_path):
