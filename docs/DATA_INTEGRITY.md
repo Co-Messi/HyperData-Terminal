@@ -34,7 +34,8 @@ false positives but misses smaller liquidations.
 
   | status | meaning |
   |---|---|
-  | `ok` | trades arriving within 30s |
+  | `ok` | trades arriving within 30s (Hyperliquid: and every expected shard socket up) |
+  | `partial` | Hyperliquid only: trades arriving, but at least one of its subscription shards is dark — flapping (its last two sockets died within 30s of connecting) or without a socket past the grace — so that shard's symbols are missing from the CVD; `shards_dark` / `dark_symbols` say which |
   | `connecting` | (re)connected under 30s ago, no trade yet |
   | `silent` | socket open past the grace period, **zero frames received** — the handshake succeeded but the stream delivers nothing (Binance Futures is geo-blocked in some regions and behaves exactly like this) |
   | `frozen` | frames still arriving but none parse into a trade for 30s (schema change); the per-venue `parse_errors` counter says why |
@@ -58,9 +59,12 @@ false positives but misses smaller liquidations.
   sockets of at most 8 subscriptions so a coin delisted between refreshes
   takes down one shard, not the venue. A socket the server closes shortly
   after connecting is retried with backoff (1s doubling to 15s), never in a
-  tight loop; the venue reads `connected` while any shard is up, and every
-  shard connect is counted in `/v1/health` →
-  `orderflow_venues.hyperliquid.connects`.
+  tight loop. Shard liveness is tracked individually: `/v1/health` →
+  `orderflow_venues.hyperliquid` carries `sockets_open` vs
+  `sockets_expected`, `shards_dark`, `shards_idle` (no listed symbols) and
+  `dark_symbols`, and a venue with any dark shard reads `partial` rather
+  than `ok` — one live shard can no longer hide six dead ones. Every shard
+  connect is still counted in `connects`.
 
 ## Staleness watchdog (frozen feeds never read as live)
 

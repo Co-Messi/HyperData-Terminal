@@ -181,7 +181,9 @@ class HyperDataHub:
         self.store = DataStore()
         self.liquidations = LiquidationFeed()
         self.positions = PositionScanner()
-        # Start with top 50 symbols — dynamically expanded after market data loads
+        # DEFAULT_SYMBOLS (config/settings.py). Nothing expands this list at
+        # runtime: the Hyperliquid shard plan is fixed for the session at
+        # OrderFlowEngine.start(), and add_symbol() only adds buckets.
         self.orderflow = OrderFlowEngine(symbols=self.symbols)
         self.market = MarketData()
         self.alerts = AlertManager()

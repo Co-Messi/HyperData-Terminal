@@ -85,6 +85,12 @@ def venue_cvd_text(engine: OrderFlowEngine, symbol: str, compact: bool = False) 
         if status == "ok":
             val = cvd[venue]
             text.append(f"{tag} {val:+,.0f}", style="green" if val >= 0 else "red")
+        elif status == "partial":
+            # Trades ARE flowing from the live shards; the figure is real
+            # but missing the dark shards' symbols — say so next to it.
+            val = cvd[venue]
+            text.append(f"{tag} {val:+,.0f}", style="green" if val >= 0 else "red")
+            text.append(" partial", style="yellow")
         elif status == "connecting":
             text.append(f"{tag} {status}", style="yellow")
         else:

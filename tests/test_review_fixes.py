@@ -1997,6 +1997,272 @@ class TestHLSharding:
         assert e._hl_tasks == []
 
 
+# ── S1: a dead Hyperliquid shard must be visible, not hidden by a live one ──
+
+def _sharded_engine(now: float):
+    """16 symbols -> 2 shards; shard 0 up and trading, shard 1's state is
+    left for the test to set. Mirrors what start() sets up, without sockets."""
+    from unittest.mock import MagicMock
+
+    from src.data_layer.orderflow_engine import OrderFlowEngine, ShardState
+    e = OrderFlowEngine(symbols=[f"S{i}" for i in range(16)])
+    e._hl_shard_plan = e._hl_shards()
+    e._hl_shard_state = {0: ShardState(connected_at=now - 300), 1: ShardState(down_since=now - 300)}
+    e._hl_sockets = {0: MagicMock(closed=False)}
+    e._venue_connected("hyperliquid")
+    e._handle_message({"channel": "trades", "data": [
+        {"coin": "S0", "px": "1", "sz": "1", "side": "B", "time": int(now * 1000), "tid": 1},
+    ]})
+    return e
+
+
+class TestS1ShardLiveness:
+    """Pre-fix: last_hl_message_at was stamped by ANY shard's trades and the
+    venue only went 'disconnected' when `not self._hl_sockets`, so with one
+    shard alive Hyperliquid read `ok` no matter how many were dark, and
+    hl_sockets_open reached nothing but a log line."""
+
+    def test_one_live_shard_no_longer_hides_a_dead_one(self):
+        import time as _t
+        now = _t.time()
+        e = _sharded_engine(now)
+        status, reason = e.venue_status("hyperliquid", now)
+        assert status == "partial"
+        assert "1/2 sockets open" in reason and "shards [1] dark" in reason and "S8" in reason
+        fresh = e.venue_freshness(now)["hyperliquid"]
+        assert fresh["sockets_open"] == 1 and fresh["sockets_expected"] == 2
+        assert fresh["shards_dark"] == [1] and fresh["dark_symbols"] == [f"S{i}" for i in range(8, 16)]
+        assert fresh["connected"] is True and fresh["stale"] is False
+        # Still contributing (shard 0's trades are real), just not fully.
+        assert e.contributing_venues(now) == ["hyperliquid"]
+        # 'binance' carries no shard fields: sharding is a Hyperliquid thing.
+        assert "sockets_open" not in e.venue_freshness(now)["binance"]
+
+    def test_grace_idle_and_recovery(self):
+        import time as _t
+        from unittest.mock import MagicMock
+        now = _t.time()
+        e = _sharded_engine(now)
+        st = e._hl_shard_state[1]
+        st.down_since = now - 5                              # between reconnects, inside grace
+        assert e.venue_status("hyperliquid", now)[0] == "ok"
+        st.down_since = now - 31                             # past the grace: dark
+        assert e.venue_status("hyperliquid", now)[0] == "partial"
+        st.idle = True                                       # none of its symbols listed: expected to have no socket
+        assert e.venue_status("hyperliquid", now)[0] == "ok"
+        assert e.hl_shard_status(now)["sockets_expected"] == 1
+        assert e.hl_shard_status(now)["shards_idle"] == [1]
+        st.idle = False
+        st.connected_at, st.down_since = now - 1, 0.0        # back up
+        e._hl_sockets[1] = MagicMock(closed=False)
+        assert e.venue_status("hyperliquid", now)[0] == "ok"
+
+    def test_flapping_shard_is_dark_even_while_its_socket_is_briefly_open(self):
+        """The confirmed-live failure: a rejected subscription closes the
+        socket ~0.6s after every connect and the 1-15s backoff keeps every
+        gap under the 30s grace, so 'socket gone for >30s' never fires."""
+        import time as _t
+        from unittest.mock import MagicMock
+
+        from src.data_layer.orderflow_engine import HL_SHARD_FLAP_CLOSES
+        now = _t.time()
+        e = _sharded_engine(now)
+        st = e._hl_shard_state[1]
+        st.short_closes = HL_SHARD_FLAP_CLOSES
+        st.connected_at, st.down_since = now - 0.5, 0.0      # just reconnected, again
+        e._hl_sockets[1] = MagicMock(closed=False)
+        assert e.hl_sockets_open == 2                        # the old signal says all is well
+        assert e.venue_status("hyperliquid", now)[0] == "partial"
+        st.connected_at = now - 31                           # this socket has lived: proven
+        assert e.venue_status("hyperliquid", now)[0] == "ok"
+
+    @pytest.mark.asyncio
+    async def test_run_forever_counts_short_closes_and_resets_on_a_long_one(self, monkeypatch):
+        import asyncio
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+
+        from src.data_layer import orderflow_engine as of
+        from src.data_layer.orderflow_engine import HL_SHARD_FLAP_CLOSES, OrderFlowEngine
+        e = OrderFlowEngine(symbols=["BTC"])
+        clock = {"t": 1_000_000.0}
+        monkeypatch.setattr(of, "time", SimpleNamespace(time=lambda: clock["t"]))
+        monkeypatch.setattr(of.asyncio, "sleep", AsyncMock())
+        lives = iter([0.6, 0.6, 0.6, 120.0, 0.6])
+
+        async def fake_connect(shard=0):
+            try:
+                clock["t"] += next(lives)
+            except StopIteration:
+                e._running = False
+
+        monkeypatch.setattr(e, "_connect_and_listen", fake_connect)
+        e._running = True
+        seen: list[int] = []
+        real_state = e._shard_state
+
+        def spy(shard):
+            st = real_state(shard)
+            seen.append(st.short_closes)
+            return st
+
+        monkeypatch.setattr(e, "_shard_state", spy)
+        await asyncio.wait_for(e._run_forever(0), timeout=2)
+        st = e._hl_shard_state[0]
+        # three short closes -> flapping; one long-lived socket -> reset; one short -> 1
+        assert max(seen) >= HL_SHARD_FLAP_CLOSES
+        assert st.short_closes == 1
+
+    @pytest.mark.asyncio
+    async def test_hub_health_and_api_reflect_a_partial_venue(self, tmp_path, monkeypatch, caplog):
+        import time as _t
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        from aiohttp import web
+        from aiohttp.test_utils import TestClient, TestServer
+
+        from src.api_server import HyperDataAPI
+        from src.data_layer.health_monitor import DataHealthMonitor
+        from src.data_layer.hub import HubStatus
+        now = _t.time()
+        e = _sharded_engine(now)
+        e._venue_connected("binance")
+        e._handle_binance_trade({"data": {"s": "BTCUSDT", "p": "1", "q": "1", "m": False,
+                                          "T": int(now * 1000), "a": 1}})
+
+        # Hub watchdog: 'partial', with the shard reason in the warning.
+        hub = _isolated_hub(tmp_path, monkeypatch)
+        try:
+            hub.orderflow = e
+            hub.status.orderflow_engine = "connected"
+            hub.status.started_at = now - 600
+            with caplog.at_level("WARNING"):
+                await hub._update_feed_staleness()
+            assert hub.status.orderflow_engine == "partial"
+            assert "hyperliquid is partial" in caplog.text and "shards [1] dark" in caplog.text
+        finally:
+            hub.store.close()
+
+        # Health monitor: the per-venue check warns, the blended one passes.
+        mon_hub = SimpleNamespace(
+            orderflow=e,
+            orderbook=MagicMock(is_stale=lambda: False, data_age=lambda: 1.0),
+            status=SimpleNamespace(last_market_refresh=now),
+            deribit=MagicMock(get_latest=lambda x: None),
+            positions=_scanner(monkeypatch),
+        )
+        checks = {c.name: c for c in DataHealthMonitor(mon_hub)._check_freshness()}
+        assert checks["order_flow"].status == "pass"
+        assert checks["order_flow_hyperliquid"].status == "warn"
+        assert checks["order_flow_hyperliquid"].detail.startswith("partial:")
+
+        # /v1/health: shard counts are a field, not a log line; status 'warn'.
+        api_hub = MagicMock()
+        api_hub.status = HubStatus(mode="live", orderflow_engine="partial")
+        api_hub.orderflow = e
+        api_hub.positions = _scanner(monkeypatch)
+        api_hub.health.latest.return_value = {"overall": "ok"}
+        api = HyperDataAPI(hub=api_hub)
+        app = web.Application()
+        app.router.add_get("/v1/health", api.handle_health)
+        app.router.add_get("/v1/orderflow/{symbol}", api.handle_orderflow)
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            body = await (await client.get("/v1/health")).json()
+            hl = body["orderflow_venues"]["hyperliquid"]
+            assert body["status"] == "warn"
+            assert hl["status"] == "partial"
+            assert hl["sockets_open"] == 1 and hl["sockets_expected"] == 2 and hl["shards_dark"] == [1]
+            flow = await (await client.get("/v1/orderflow/S0")).json()
+            assert flow["venue_coverage"]["hyperliquid"] == "partial"
+            assert "hyperliquid" in flow["venues_contributing"]
+        finally:
+            await client.close()
+
+    def test_cvd_renderer_keeps_the_number_and_flags_partial(self):
+        import time as _t
+
+        from rich.console import Console
+
+        from src.dashboards.cvd_dashboard import venue_cvd_text
+        e = _sharded_engine(_t.time())
+        console = Console(record=True, width=120, force_terminal=False)
+        console.print(venue_cvd_text(e, "S0"))
+        text = console.export_text()
+        assert "HL +1 partial" in text
+
+    @pytest.mark.asyncio
+    async def test_idle_shard_wakes_for_stop_instead_of_burning_the_grace(self, monkeypatch):
+        """Nit: the idle branch slept HL_UNIVERSE_TTL without checking
+        _running, so stop() waited the full STOP_GRACE_SECONDS on it."""
+        import asyncio
+        import time as _t
+        from unittest.mock import AsyncMock
+
+        from src.data_layer.orderflow_engine import OrderFlowEngine
+        e = OrderFlowEngine(symbols=["PEPE"])                       # not listed -> idles
+        monkeypatch.setattr(e, "_fetch_hl_universe", AsyncMock(return_value={"BTC"}))
+        e._running = True
+        e._stop_event = asyncio.Event()
+        e._hl_shard_plan = e._hl_shards()
+        e._hl_shard_state = {}
+
+        class FakeWS:                                               # a healthy shard alongside it
+            closed = False
+
+            async def close(self):
+                self.closed = True
+
+        e._hl_sockets[1] = FakeWS()
+        task = asyncio.create_task(e._run_forever(0))
+        e._hl_tasks = [task]
+        await asyncio.sleep(0.05)
+        assert e._hl_shard_state[0].idle is True
+        assert e.hl_shard_status()["shards_idle"] == [0]
+        t0 = _t.monotonic()
+        await e.stop()
+        assert _t.monotonic() - t0 < 2.0                            # not STOP_GRACE_SECONDS (5s)
+        assert task.done() and not task.cancelled()                 # it returned, it was not cut off
+
+
+# ── S7: the shard plan is fixed at start(); add_symbol() cannot grow it ──
+
+class TestS7ShardPlanFixed:
+    @pytest.mark.asyncio
+    async def test_add_symbol_while_running_does_not_repartition_shards(self, monkeypatch, caplog):
+        import asyncio
+
+        from src.data_layer.orderflow_engine import OrderFlowEngine
+        e = OrderFlowEngine(symbols=[f"S{i}" for i in range(8)])   # exactly one full shard
+
+        async def park(*a, **k):
+            await asyncio.sleep(10)
+
+        monkeypatch.setattr(e, "_run_forever", park)
+        monkeypatch.setattr(e, "_binance_trade_loop", park)
+        await e.start()
+        try:
+            plan = [list(x) for x in e._hl_shard_plan]
+            with caplog.at_level("WARNING"):
+                e.add_symbol("NEW")
+            assert "NEW" in e.buckets
+            assert len(e._hl_shards()) == 2                         # the naive recompute grows...
+            assert e._hl_shard_plan == plan and len(e._hl_tasks) == 1   # ...the plan and the loops do not
+            assert "shard plan is fixed at start()" in caplog.text
+        finally:
+            await e.stop()
+
+    def test_add_symbol_before_start_is_silent(self, caplog):
+        from src.data_layer.orderflow_engine import OrderFlowEngine
+        e = OrderFlowEngine(symbols=["BTC"])
+        with caplog.at_level("WARNING"):
+            e.add_symbol("ETH")
+        assert "shard plan" not in caplog.text
+        assert e._hl_shards() == [["BTC", "ETH"]]
+
+
 # ── M13: extraction equivalence (demo generators, liquidation processing) ──
 
 class TestM13Extraction:

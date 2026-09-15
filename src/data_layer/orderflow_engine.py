@@ -67,6 +67,15 @@ HL_SHORT_CLOSE_MAX_BACKOFF = 15.0
 # before cancelling whatever is left.
 STOP_GRACE_SECONDS = 5.0
 
+# A shard whose last HL_SHARD_FLAP_CLOSES sockets each died within
+# STALE_AFTER_SECONDS of connecting is "flapping" and counts as dark even
+# while its next socket is momentarily open (the confirmed-live failure
+# mode: a subscription HL rejects closes the socket ~0.6s after every
+# connect, and a 1-15s backoff keeps each gap under the connect grace, so
+# a plain "socket closed for >30s" test never fires). A shard whose socket
+# has simply been gone for longer than CONNECT_GRACE_SECONDS is dark too.
+HL_SHARD_FLAP_CLOSES = 2
+
 # Upper bound on remembered trade IDs per venue (oldest evicted first).
 MAX_SEEN_IDS = 100_000
 
@@ -90,6 +99,22 @@ class VenueState:
     trades: int = 0                 # frames that parsed into a Trade
     parse_errors: int = 0
     _last_parse_error_log_at: float = field(default=0.0, repr=False)
+
+@dataclass
+class ShardState:
+    """Liveness of one Hyperliquid subscription shard (= one socket loop).
+
+    The venue-level VenueState cannot see a dead shard: last_hl_message_at
+    is stamped by ANY shard's trades and the venue reads 'connected' while
+    at least one socket is up, so with one shard alive the other six could
+    be dark forever and Hyperliquid would still report `ok`. This is what
+    makes that visible (S1).
+    """
+    connected_at: float = 0.0   # current socket's connect time; 0 = no socket
+    down_since: float = 0.0     # when the last socket went away (start() time before the first)
+    short_closes: int = 0       # consecutive sockets that died < STALE_AFTER_SECONDS after connect
+    idle: bool = False          # none of its symbols are listed: no socket expected
+
 
 TIMEFRAME_WINDOWS: dict[str, int] = {
     "1m": 60,
@@ -282,6 +307,15 @@ class OrderFlowEngine:
         self._hl_tasks: list[asyncio.Task] = []
         self._hl_sockets: dict[int, aiohttp.ClientWebSocketResponse] = {}
         self._hl_sessions: dict[int, aiohttp.ClientSession] = {}
+        # The shard -> symbols plan is FIXED at start(): one socket loop per
+        # shard is created there, so re-partitioning a grown symbol list on
+        # reconnect (as _hl_shards() would) hands existing shards different
+        # symbols and creates shards with no loop (S7).
+        self._hl_shard_plan: list[list[str]] = []
+        self._hl_shard_state: dict[int, ShardState] = {}
+        # Set by stop(); lets a shard idling on an unlisted symbol set wake
+        # up immediately instead of stop() burning STOP_GRACE_SECONDS on it.
+        self._stop_event: asyncio.Event | None = None
         # Live Hyperliquid coin universe (None = not fetched / fetch failed).
         self._hl_universe: set[str] | None = None
         self._hl_universe_at: float = 0.0
@@ -396,6 +430,43 @@ class OrderFlowEngine:
     def hl_sockets_open(self) -> int:
         return sum(1 for ws in self._hl_sockets.values() if not ws.closed)
 
+    def _shard_state(self, shard: int) -> ShardState:
+        return self._hl_shard_state.setdefault(shard, ShardState(down_since=time.time()))
+
+    @staticmethod
+    def _shard_is_dark(st: ShardState, now: float) -> bool:
+        """A shard whose symbols are not being delivered: flapping (see
+        HL_SHARD_FLAP_CLOSES), or without a socket past the connect grace.
+        A shard that idles because none of its symbols are listed has no
+        socket by design and is never dark."""
+        if st.idle:
+            return False
+        flapping = st.short_closes >= HL_SHARD_FLAP_CLOSES
+        if st.connected_at > 0:
+            # Open, but only just — a flapping shard has not proven itself
+            # until a socket has lived past STALE_AFTER_SECONDS.
+            return flapping and (now - st.connected_at) < STALE_AFTER_SECONDS
+        return flapping or (now - st.down_since) > CONNECT_GRACE_SECONDS
+
+    def hl_shard_status(self, now: float | None = None) -> dict:
+        """Per-shard liveness for the Hyperliquid venue: how many sockets
+        are open against how many are expected, which shards are dark and
+        which symbols that takes with it. Surfaced in venue_freshness()
+        (so /v1/health) and folded into venue_status() as 'partial'."""
+        now = time.time() if now is None else now
+        expected = [i for i, st in self._hl_shard_state.items() if not st.idle]
+        dark = sorted(i for i in expected if self._shard_is_dark(self._hl_shard_state[i], now))
+        dark_symbols = [
+            sym for i in dark for sym in (self._hl_shard_plan[i] if i < len(self._hl_shard_plan) else [])
+        ]
+        return {
+            "sockets_open": self.hl_sockets_open,
+            "sockets_expected": len(expected),
+            "shards_dark": dark,
+            "shards_idle": sorted(i for i, st in self._hl_shard_state.items() if st.idle),
+            "dark_symbols": dark_symbols,
+        }
+
     async def force_reconnect(self) -> int:
         """Close every open Hyperliquid socket so the shard loops rebuild
         them (the hub's watchdog calls this on a dead-but-open feed).
@@ -443,7 +514,11 @@ class OrderFlowEngine:
         """(status, reason) for one venue.
 
         status is one of:
-          ok            trades arriving within STALE_AFTER_SECONDS
+          ok            trades arriving within STALE_AFTER_SECONDS (Hyperliquid:
+                        and every expected shard socket is up)
+          partial       Hyperliquid only — trades arriving, but at least one
+                        shard is dark (flapping or socket gone past the
+                        grace): its symbols' trades are missing from the CVD
           connecting    (re)connected < CONNECT_GRACE_SECONDS ago, no trade yet
           silent        connected, past the grace period, ZERO frames received
                         since this connection (regional block / dead stream)
@@ -480,6 +555,16 @@ class OrderFlowEngine:
                     f"{st.parse_errors} parse errors"
                 )
             return "stale", f"last trade {trade_age:.0f}s ago, no frames for {frame_age:.0f}s"
+        if venue == "hyperliquid":
+            shards = self.hl_shard_status(now)
+            if shards["shards_dark"]:
+                syms = shards["dark_symbols"]
+                return "partial", (
+                    f"last trade {trade_age:.1f}s ago but {shards['sockets_open']}/"
+                    f"{shards['sockets_expected']} sockets open — shards {shards['shards_dark']} dark "
+                    f"({len(syms)} symbols not delivering: {', '.join(syms[:8])}"
+                    f"{', ...' if len(syms) > 8 else ''})"
+                )
         return "ok", f"last trade {trade_age:.1f}s ago"
 
     def venue_freshness(self, now: float | None = None) -> dict[str, dict]:
@@ -509,15 +594,22 @@ class OrderFlowEngine:
                 "trades": st.trades,
                 "parse_errors": st.parse_errors,
             }
+        # Shard granularity for Hyperliquid: the venue-level fields above
+        # cannot show one dark socket behind six live ones.
+        out["hyperliquid"].update(self.hl_shard_status(now))
         return out
 
     def venue_coverage(self, now: float | None = None) -> dict[str, str]:
         """{venue: status} — the short form renderers put next to a CVD number."""
         return {v: self.venue_status(v, now)[0] for v in VENUES}
 
+    # Statuses under which a venue's trades are flowing into the CVD/OFI
+    # figures ('partial': some of them are).
+    CONTRIBUTING_STATUSES = ("ok", "partial")
+
     def contributing_venues(self, now: float | None = None) -> list[str]:
         """Venues whose trades are currently flowing into the CVD/OFI figures."""
-        return [v for v, s in self.venue_coverage(now).items() if s == "ok"]
+        return [v for v, s in self.venue_coverage(now).items() if s in self.CONTRIBUTING_STATUSES]
 
     async def start(self) -> None:
         """Open WebSocket(s), subscribe, and begin processing in background."""
@@ -526,6 +618,10 @@ class OrderFlowEngine:
             return
         self._running = True
         shards = self._hl_shards()
+        self._hl_shard_plan = shards
+        now = time.time()
+        self._hl_shard_state = {i: ShardState(down_since=now) for i in range(len(shards))}
+        self._stop_event = asyncio.Event()
         self._hl_tasks = [
             asyncio.create_task(self._run_forever(i), name=f"orderflow-hl-{i}")
             for i in range(len(shards))
@@ -547,6 +643,8 @@ class OrderFlowEngine:
         one per healthy shard, seen live).
         """
         self._running = False
+        if self._stop_event is not None:
+            self._stop_event.set()
         closed_any = False
         for ws in list(self._hl_sockets.values()):
             if not ws.closed:
@@ -720,9 +818,11 @@ class OrderFlowEngine:
                 lived = time.time() - started
                 if lived >= STALE_AFTER_SECONDS:
                     backoff = 1.0          # healthy session; server-side churn is normal
+                    self._shard_state(shard).short_closes = 0
                     continue
                 if not self._running:
                     break
+                self._shard_state(shard).short_closes += 1
                 logger.info(
                     "[hl-%d] WebSocket closed by server after %.1fs (short-lived) — reconnecting in %.1fs",
                     shard, lived, backoff,
@@ -751,21 +851,26 @@ class OrderFlowEngine:
     async def _connect_and_listen(self, shard: int = 0) -> None:
         """One connection lifecycle for one shard: connect, subscribe its
         symbols, read messages until the socket closes."""
-        shards = self._hl_shards()
-        wanted = shards[shard] if shard < len(shards) else []
+        plan = self._hl_shard_plan or self._hl_shards()
+        wanted = plan[shard] if shard < len(plan) else []
+        state = self._shard_state(shard)
         session = aiohttp.ClientSession()
         self._hl_sessions[shard] = session
         ws = None
         try:
             symbols = self._hl_listed(wanted, await self._fetch_hl_universe(session))
             if not symbols:
+                state.idle = True
                 logger.warning("[hl-%d] no listed symbols in this shard (%s) — idling", shard, wanted)
-                await asyncio.sleep(HL_UNIVERSE_TTL)
+                await self._sleep_unless_stopped(HL_UNIVERSE_TTL)
                 return
+            state.idle = False
             # heartbeat=20 so a half-open HL socket raises instead of silently
             # freezing the CVD buckets (the other venue/socket already does this).
             ws = await session.ws_connect(WS_URL, heartbeat=20)
             self._hl_sockets[shard] = ws
+            state.connected_at = time.time()
+            state.down_since = 0.0
             self._venue_connected("hyperliquid")
             logger.info("[hl-%d] WebSocket connected to %s (%d symbols)", shard, WS_URL, len(symbols))
 
@@ -790,6 +895,9 @@ class OrderFlowEngine:
         finally:
             self._hl_sockets.pop(shard, None)
             self._hl_sessions.pop(shard, None)
+            if state.connected_at > 0:
+                state.connected_at = 0.0
+                state.down_since = time.time()
             if not self._hl_sockets:
                 self._venue_disconnected("hyperliquid")
             # shield: a cancellation arriving mid-close must not abandon the
@@ -800,6 +908,16 @@ class OrderFlowEngine:
             finally:
                 if not session.closed:
                     await asyncio.shield(session.close())
+
+    async def _sleep_unless_stopped(self, seconds: float) -> None:
+        """asyncio.sleep that returns as soon as stop() is called."""
+        if self._stop_event is None:
+            await asyncio.sleep(seconds)
+            return
+        try:
+            await asyncio.wait_for(self._stop_event.wait(), timeout=seconds)
+        except asyncio.TimeoutError:
+            pass
 
     def _handle_message(self, data: dict) -> None:
         """Parse a WebSocket JSON message and create Trade objects.
@@ -973,10 +1091,24 @@ class OrderFlowEngine:
     # -- add / remove symbols at runtime ------------------------------------
 
     def add_symbol(self, symbol: str) -> None:
-        """Register a new symbol (buckets only; WS re-subscribe happens on
-        next reconnect or can be done manually)."""
+        """Register a new symbol's buckets and CVD series.
+
+        Hyperliquid subscriptions are NOT added: the shard plan is fixed at
+        start() (one socket loop per shard), so re-partitioning the grown
+        list on reconnect would hand existing shards different symbols and
+        leave the overflow shard with no loop. A symbol added while running
+        gets Binance trades if it is in _BINANCE_SYMBOL_MAP and no HL trades
+        until restart — said so in the log. (The one live call site,
+        _handle_binance_trade, cannot fire today: every mapped Binance
+        symbol is already in DEFAULT_SYMBOLS.)
+        """
         if symbol in self.buckets:
             return
+        if self._running:
+            logger.warning(
+                "[orderflow] %s added while running — the Hyperliquid shard plan is fixed at "
+                "start(), so it gets no HL trades subscription until restart", symbol,
+            )
         self.symbols.append(symbol)
         self.buckets[symbol] = {
             tf: TimeframeBucket(symbol, tf, secs)
