@@ -266,11 +266,16 @@ class TestAddressPersistence:
         assert mixed not in scanner.discovered_addresses
 
     def test_retention_cap_expires_oldest(self, monkeypatch):
+        """The cap is enforced by the periodic prune(), not on every write
+        (a COUNT(*) per discovery batch on the event loop was the H6 stall)."""
         monkeypatch.setattr(address_store, "MAX_TRACKED_ADDRESSES", 3)
         for i in range(5):
             address_store.add_addresses([_addr(f"{i}{i}{i}")], source="test")
+        assert len(address_store.get_all_addresses()) == 5
+        assert address_store.prune() == 2
         remaining = address_store.get_all_addresses()
         assert len(remaining) == 3
+        assert _addr("444") in remaining  # most recently seen survive
 
     def test_store_validator(self):
         assert address_store.is_valid_address(_addr("abc"))

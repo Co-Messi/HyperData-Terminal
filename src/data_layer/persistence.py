@@ -165,19 +165,16 @@ class DataStore:
                 CREATE INDEX IF NOT EXISTS idx_trade_ts ON trades(timestamp);
                 CREATE INDEX IF NOT EXISTS idx_trade_symbol ON trades(symbol);
 
-                CREATE TABLE IF NOT EXISTS snapshots (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp REAL NOT NULL,
-                    symbol TEXT NOT NULL,
-                    timeframe TEXT NOT NULL,
-                    cvd REAL,
-                    buy_volume REAL,
-                    sell_volume REAL,
-                    ofi REAL,
-                    signal TEXT,
-                    trades_per_sec REAL
+                -- Discovered wallet addresses. Written by data_layer.address_store
+                -- (its own connection to this same file); declared here so the
+                -- table is part of the versioned schema instead of being created
+                -- ad hoc by a second module.
+                CREATE TABLE IF NOT EXISTS discovered_addresses (
+                    address TEXT PRIMARY KEY,
+                    source TEXT,
+                    first_seen REAL,
+                    last_seen REAL
                 );
-                CREATE INDEX IF NOT EXISTS idx_snap_ts ON snapshots(timestamp);
 
                 CREATE TABLE IF NOT EXISTS wallets (
                     address TEXT PRIMARY KEY,
@@ -244,24 +241,6 @@ class DataStore:
                 CREATE INDEX IF NOT EXISTS idx_hlp_trade_ts ON hlp_trades(timestamp);
                 CREATE INDEX IF NOT EXISTS idx_hlp_trade_liq ON hlp_trades(is_liquidation);
 
-                CREATE TABLE IF NOT EXISTS paper_trades (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp REAL NOT NULL,
-                    symbol TEXT NOT NULL,
-                    action TEXT NOT NULL,
-                    entry_price REAL NOT NULL,
-                    exit_price REAL NOT NULL,
-                    size_usd REAL NOT NULL,
-                    pnl REAL NOT NULL,
-                    pnl_pct REAL NOT NULL,
-                    exit_reason TEXT NOT NULL,
-                    validation_tier TEXT NOT NULL,
-                    strategy_source TEXT NOT NULL,
-                    created_at REAL NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS idx_paper_ts ON paper_trades(timestamp);
-                CREATE INDEX IF NOT EXISTS idx_paper_tier ON paper_trades(validation_tier);
-
                 CREATE TABLE IF NOT EXISTS funding_rates (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     timestamp REAL NOT NULL,
@@ -303,17 +282,62 @@ class DataStore:
             self._run_migrations()
             self._conn.commit()
 
-    # Bump when adding a migration below. The schema_version table lets a
-    # future release tell an old DB from a new one instead of guessing from
-    # ALTER TABLE failures.
-    SCHEMA_VERSION = 2
+    # Bump when adding a migration to _MIGRATIONS below. The schema_version
+    # table lets a release tell an old DB from a new one, and _run_migrations
+    # only runs the steps ABOVE the DB's recorded version — so a migration
+    # does not need to be idempotent-by-accident to be safe on restart.
+    #
+    # History:
+    #   v1  original schema (implicit for pre-versioning DBs)
+    #   v2  added columns to the `snapshots` / `paper_trades` tables — both
+    #       tables were dead (no writer anywhere) and were removed in v3, so
+    #       v2 is now a no-op.
+    #   v3  drop the dead `snapshots` / `paper_trades` tables (only if empty)
+    SCHEMA_VERSION = 3
+
+    # Tables that no code path has ever written to. Dropped in v3 when empty;
+    # a non-empty one is left in place and reported rather than destroyed.
+    _DEAD_TABLES = ("snapshots", "paper_trades")
+
+    def _add_column(self, table: str, col: str, col_type: str) -> None:
+        """ALTER TABLE ADD COLUMN that tolerates the column already existing
+        (a fresh DB creates it in _init_tables; an upgraded DB adds it here).
+        Table/column names are hardcoded literals — no injection."""
+        try:
+            self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column" not in str(exc).lower():
+                logger.error("Migration failed for %s.%s: %s", table, col, exc)
+                raise
+
+    def _migrate_v3(self) -> None:
+        for table in self._DEAD_TABLES:
+            exists = self._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+            ).fetchone()
+            if not exists:
+                continue
+            rows = self._conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            if rows:
+                logger.warning(
+                    "Legacy table %s has %d rows; leaving it in place (nothing "
+                    "reads or writes it any more — drop it manually if unwanted)",
+                    table, rows,
+                )
+                continue
+            self._conn.execute(f"DROP TABLE {table}")
+            logger.info("Dropped empty legacy table %s", table)
+
+    # version -> migration step. Steps run in order for every version above
+    # the DB's recorded one, each followed by a schema_version row.
+    _MIGRATIONS = {3: _migrate_v3}
 
     def _run_migrations(self) -> None:
-        """Versioned, idempotent migrations. Caller holds the lock.
+        """Versioned migrations. Caller holds the lock.
 
-        Only "duplicate column" is treated as already-applied; any other
-        migration failure is a real error and is raised so the app doesn't
-        keep running against a half-migrated schema.
+        Runs only the steps above the DB's recorded version. Any migration
+        failure is raised so the app doesn't keep running against a
+        half-migrated schema.
         """
         self._conn.execute(
             "CREATE TABLE IF NOT EXISTS schema_version "
@@ -322,24 +346,13 @@ class DataStore:
         row = self._conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
         current = row[0] or 0
 
-        # v1: original schema (implicit for pre-versioning DBs).
-        # v2: extra columns on snapshots / paper_trades.
-        for table, col, col_type in [
-            ("snapshots", "premium_pct", "REAL DEFAULT 0.0"),
-            ("snapshots", "basis_pct", "REAL DEFAULT 0.0"),
-            ("paper_trades", "funding_collected", "REAL DEFAULT 0.0"),
-        ]:
-            try:
-                self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
-            except sqlite3.OperationalError as exc:
-                if "duplicate column" not in str(exc).lower():
-                    logger.error("Migration failed for %s.%s: %s", table, col, exc)
-                    raise
-
-        if current < self.SCHEMA_VERSION:
+        for version in range(current + 1, self.SCHEMA_VERSION + 1):
+            step = self._MIGRATIONS.get(version)
+            if step is not None:
+                step(self)
             self._conn.execute(
                 "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
-                (self.SCHEMA_VERSION, time.time()),
+                (version, time.time()),
             )
 
     def get_schema_version(self) -> int:
@@ -401,7 +414,7 @@ class DataStore:
 
     # Time-series tables that grow unbounded and are safe to age out.
     _PRUNABLE_TABLES = (
-        "liquidations", "trades", "snapshots", "smart_money_signals",
+        "liquidations", "trades", "smart_money_signals",
         "hlp_snapshots", "hlp_trades", "funding_rates",
         "long_short_ratios", "options_data",
     )
@@ -706,44 +719,8 @@ class DataStore:
             for r in rows
         ]
 
-    # ── Paper Trading Persistence ─────────────────────────────
-
-    def save_paper_trade(self, trade) -> None:
-        """Save a closed paper trade to the database."""
-        with self._lock:
-            self._conn.execute(
-                """INSERT INTO paper_trades
-                   (timestamp, symbol, action, entry_price, exit_price,
-                    size_usd, pnl, pnl_pct, exit_reason, validation_tier,
-                    strategy_source, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (trade.exit_timestamp, trade.symbol, trade.action,
-                 trade.entry_price, trade.exit_price, trade.size_usd,
-                 trade.pnl, trade.pnl_pct, trade.exit_reason,
-                 trade.validation_tier, trade.strategy_source,
-                 time.time()),
-            )
-            self._conn.commit()
-
-    def get_paper_trades(self, hours: float = 24, limit: int = 500) -> list[dict]:
-        """Get recent paper trades from the last N hours."""
-        cutoff = time.time() - (hours * 3600)
-        with self._lock:
-            rows = self._conn.execute(
-                """SELECT timestamp, symbol, action, entry_price, exit_price,
-                          size_usd, pnl, pnl_pct, exit_reason, validation_tier,
-                          strategy_source
-                   FROM paper_trades WHERE timestamp > ?
-                   ORDER BY timestamp DESC LIMIT ?""",
-                (cutoff, limit),
-            ).fetchall()
-        return [
-            {"timestamp": r[0], "symbol": r[1], "action": r[2],
-             "entry_price": r[3], "exit_price": r[4], "size_usd": r[5],
-             "pnl": r[6], "pnl_pct": r[7], "exit_reason": r[8],
-             "validation_tier": r[9], "strategy_source": r[10]}
-            for r in rows
-        ]
+    # NOTE: paper trades are persisted by src/strategies/paper_trader.py into
+    # its own data/paper_trades.db — they are deliberately NOT in this store.
 
     def save_funding_rate(self, snap) -> None:
         """Save a funding rate snapshot."""

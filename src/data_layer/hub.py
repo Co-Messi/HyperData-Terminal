@@ -30,6 +30,7 @@ from typing import Any, Callable
 
 from config.settings import DEFAULT_SYMBOLS
 from src.api_server import HyperDataAPI
+from src.data_layer import address_store
 from src.data_layer.alerts import AlertManager
 from src.data_layer.deribit import DeribitFeed, DeribitIVSnapshot
 from src.data_layer.funding_rates import FundingRateCollector, FundingRateSnapshot
@@ -148,6 +149,12 @@ class HyperDataHub:
         self.market_refresh_interval = market_refresh_interval
 
         # ── Core components ──────────────────────────────────────
+        # DataStore FIRST: it owns data/hyperdata.db, runs the integrity
+        # check + quarantine path, and creates the versioned schema that
+        # address_store (used by PositionScanner below) reads from. Opening
+        # the scanner first would hit a corrupted file before it could be
+        # quarantined.
+        self.store = DataStore()
         self.liquidations = LiquidationFeed()
         self.positions = PositionScanner()
         # Start with top 50 symbols — dynamically expanded after market data loads
@@ -161,7 +168,6 @@ class HyperDataHub:
         self.orderbook = OrderBookEngine()
         self.spot = SpotPriceCollector()
         self.deribit = DeribitFeed()
-        self.store = DataStore()
         self.health = DataHealthMonitor(self)
 
         # ── Status tracking ──────────────────────────────────────
@@ -581,6 +587,10 @@ class HyperDataHub:
                 self.store.prune()
             except Exception:
                 logger.exception("Error pruning DB")
+            try:
+                address_store.prune()
+            except Exception:
+                logger.exception("Error pruning address store")
         # Update persistence stats every 30 seconds
         if _db_tick % 30 == 0:
             try:
