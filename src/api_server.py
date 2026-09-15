@@ -46,6 +46,8 @@ from typing import Any
 
 from aiohttp import WSMsgType, web
 
+from src.data_layer.liquidation_processing import LiquidationProcessor
+
 logger = logging.getLogger(__name__)
 
 # Event types clients can subscribe to
@@ -344,6 +346,10 @@ class HyperDataAPI:
         self._ws_clients: list[_WSClient] = []
         self._hooks_installed = False
         self._rate_limiter = _RateLimiter()
+        # Liquidation dedup / cascade / symbol logic lives in the data layer
+        # (M13); the API only broadcasts what it lets through.
+        self._liq = LiquidationProcessor()
+        self._heartbeat_task: asyncio.Task | None = None
 
     # ── Lifecycle ────────────────────────────────────────────────
 
@@ -442,13 +448,12 @@ class HyperDataAPI:
         self._install_hooks()
 
         # Start heartbeat task for WebSocket clients
-        self.__init_dedup()
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop(), name="ws-heartbeat")
 
         logger.info("API v1 server started on http://%s:%d", self.host, self.port)
 
     async def stop(self) -> None:
-        if hasattr(self, '_heartbeat_task') and self._heartbeat_task:
+        if self._heartbeat_task:
             self._heartbeat_task.cancel()
             try:
                 await self._heartbeat_task
@@ -489,147 +494,52 @@ class HyperDataAPI:
             "timestamp": trade.timestamp,
         })
 
-    # Symbol cleanup: remove numeric prefixes, map weird names
-    _SYM_MAP = {
-        "PLAY": "PLAYAI", "1000CHEE": "CHEE", "1000PEPE": "PEPE",
-        "1000SHIB": "SHIB", "1000FLOKI": "FLOKI", "1000BONK": "BONK",
-        "1000LUNC": "LUNC", "1000X": "X", "1000CAT": "CAT",
-        "1000SATS": "SATS", "1000RATS": "RATS",
-        "\u9f99\u867e": "LOBSTER", "BSB": "BSB", "PTB": "PTB",
-        "ON": "ON", "NOM": "NOM",
-    }
-    _MIN_LIQ_SIZE_USD = 500
-    _DEDUP_WINDOW = 3
-    _DEDUP_MAX = 500
-    _CASCADE_WINDOW = 30
-    _CASCADE_BYPASS_DURATION = 30
-    _CASCADE_TRACKER_MAX = 200  # entries kept per symbol/side/exchange key
+    # ── Liquidation processing — delegates to LiquidationProcessor (M13) ──
+    # Constants and state are exposed under their historical names so
+    # existing callers/tests (`api._cascade_bypass[key]`, ...) keep working.
+    _SYM_MAP = LiquidationProcessor.SYM_MAP
+    _MIN_LIQ_SIZE_USD = LiquidationProcessor.MIN_LIQ_SIZE_USD
+    _DEDUP_WINDOW = LiquidationProcessor.DEDUP_WINDOW
+    _DEDUP_MAX = LiquidationProcessor.DEDUP_MAX
+    _CASCADE_WINDOW = LiquidationProcessor.CASCADE_WINDOW
+    _CASCADE_BYPASS_DURATION = LiquidationProcessor.CASCADE_BYPASS_DURATION
+    _CASCADE_TRACKER_MAX = LiquidationProcessor.CASCADE_TRACKER_MAX
+    _TS_SANE_MIN = LiquidationProcessor.TS_SANE_MIN
+    _TS_SANE_MAX = LiquidationProcessor.TS_SANE_MAX
 
-    def __init_dedup(self):
-        if not hasattr(self, '_liq_seen'):
-            self._liq_seen: dict[str, float] = {}
-            self._liq_count = {"hyperliquid": 0, "binance": 0, "okx": 0, "bybit": 0}
-            self._heartbeat_task: asyncio.Task | None = None
-            self._cascade_tracker: dict[str, list] = {}
-            self._cascade_bypass: dict[str, float] = {}
-            self._cascade_bypass_started: dict[str, float] = {}
-            self._liq_stats = {"received": 0, "broadcast": 0, "deduped": 0, "filtered": 0}
-            self._liq_stats_ts = time.time()
+    @property
+    def _liq_seen(self) -> dict[str, float]:
+        return self._liq.liq_seen
 
-    # Plausible epoch-seconds range for exchange event times (2001..5138).
-    # A timestamp outside this range means a connector skipped ms→s
-    # normalization (or sent 0) — such events cannot be safely hashed.
-    _TS_SANE_MIN = 1e9
-    _TS_SANE_MAX = 1e11
+    @property
+    def _liq_count(self) -> dict[str, int]:
+        return self._liq.liq_count
+
+    @property
+    def _liq_stats(self) -> dict[str, int]:
+        return self._liq.liq_stats
+
+    @property
+    def _cascade_bypass(self) -> dict[str, float]:
+        return self._liq.cascade_bypass
+
+    @property
+    def _cascade_bypass_started(self) -> dict[str, float]:
+        return self._liq.cascade_bypass_started
 
     def _is_duplicate_liq(self, ev) -> bool:
-        """Duplicate check within the dedup window, keyed per exchange.
-
-        Buckets on the EXCHANGE event timestamp (not local receive time) so
-        two records of the same event dedup identically regardless of local
-        delivery jitter. Events without a plausible exchange timestamp are
-        never deduped — substituting the local clock would collide distinct
-        events that merely arrived together. The hash uses the exact size:
-        replayed duplicates carry identical payloads, while distinct events
-        of similar size must not collapse into one. The cascade bypass is
-        also per-exchange: a Binance cascade must not let Hyperliquid's
-        heuristic events skip dedup.
-        """
-        self.__init_dedup()
-        now = time.time()
-
-        ev_ts = ev.timestamp
-        if not (self._TS_SANE_MIN < ev_ts < self._TS_SANE_MAX):
-            logger.warning(
-                "[liq] %s event has implausible timestamp %r — skipping dedup",
-                ev.exchange, ev_ts,
-            )
-            return False
-
-        bypass_key = f"{ev.symbol}_{ev.side}_{ev.exchange}"
-        if bypass_key in self._cascade_bypass and now < self._cascade_bypass[bypass_key]:
-            return False
-
-        h = f"{ev.symbol}_{ev.side}_{ev.size_usd:.2f}_{ev.exchange}_{int(ev_ts // self._DEDUP_WINDOW)}"
-
-        if len(self._liq_seen) > self._DEDUP_MAX:
-            cutoff = now - self._DEDUP_WINDOW * 2
-            self._liq_seen = {k: v for k, v in self._liq_seen.items() if v > cutoff}
-
-        if h in self._liq_seen:
-            return True
-        self._liq_seen[h] = now
-        return False
+        return self._liq.is_duplicate(ev)
 
     def _check_cascade(self, ev) -> str | None:
-        """Track rapid successive liquidations. Returns cascade label if detected.
-
-        Keys on the RAW event fields (symbol/side/exchange) — the same domain
-        _is_duplicate_liq reads its bypass with — so a detected cascade
-        actually lifts dedup for the venue that is cascading.
-        """
-        self.__init_dedup()
-        now = time.time()
-        key = f"{ev.symbol}_{ev.side}_{ev.exchange}"
-
-        if key not in self._cascade_tracker:
-            self._cascade_tracker[key] = []
-
-        self._cascade_tracker[key] = [
-            (ts, sz) for ts, sz in self._cascade_tracker[key]
-            if now - ts < self._CASCADE_WINDOW
-        ]
-
-        self._cascade_tracker[key].append((now, ev.size_usd))
-        # Bound per-key memory: only the most recent window entries matter.
-        if len(self._cascade_tracker[key]) > self._CASCADE_TRACKER_MAX:
-            self._cascade_tracker[key] = self._cascade_tracker[key][-self._CASCADE_TRACKER_MAX:]
-
-        entries = self._cascade_tracker[key]
-        if len(entries) >= 3:
-            # Bypass dedup only for this exchange's stream: cascades on one
-            # venue say nothing about duplicates on another. The bypass has
-            # an ABSOLUTE cap: without it, events passing dedup during the
-            # bypass re-trigger cascade detection and extend it forever
-            # (replayed duplicates would keep the floodgate open).
-            first = self._cascade_bypass_started.setdefault(key, now)
-            cap = first + 2 * self._CASCADE_BYPASS_DURATION
-            self._cascade_bypass[key] = min(now + self._CASCADE_BYPASS_DURATION, cap)
-            total = sum(sz for _, sz in entries)
-            return f"cascade ${total:,.0f} ({len(entries)}x in {self._CASCADE_WINDOW}s)"
-
-        # Quiet again: allow a future cascade to start a fresh bypass window.
-        if key in self._cascade_bypass_started and now > self._cascade_bypass.get(key, 0):
-            del self._cascade_bypass_started[key]
-
-        return None
+        return self._liq.check_cascade(ev)
 
     def _log_liq_stats(self) -> None:
-        """Log 60-second liquidation throughput stats."""
-        self.__init_dedup()
-        now = time.time()
-        if now - self._liq_stats_ts >= 60:
-            s = self._liq_stats
-            total = s["received"]
-            if total > 0:
-                drop_pct = s["deduped"] / total * 100
-                logger.info(
-                    "[LIQ] 60s: received=%d broadcast=%d deduped=%d filtered=%d (%.0f%% drop)",
-                    s["received"], s["broadcast"], s["deduped"], s["filtered"], drop_pct,
-                )
-            self._liq_stats = {"received": 0, "broadcast": 0, "deduped": 0, "filtered": 0}
-            self._liq_stats_ts = now
+        self._liq.log_stats()
 
     def _clean_symbol(self, sym: str) -> str:
-        sym = sym.upper()
-        if sym in self._SYM_MAP:
-            return self._SYM_MAP[sym]
-        if sym.startswith("1000") and len(sym) > 4:
-            return sym[4:]
-        return sym
+        return self._liq.clean_symbol(sym)
 
     def _on_liquidation(self, ev) -> None:
-        self.__init_dedup()
         self._liq_stats["received"] += 1
         self._log_liq_stats()
 
@@ -651,13 +561,7 @@ class HyperDataAPI:
         symbol = self._clean_symbol(ev.symbol)
 
         # Estimate leverage
-        leverage = None
-        if ev.price > 0 and ev.quantity > 0:
-            notional = ev.price * ev.quantity
-            if notional > 0 and ev.size_usd > 0:
-                est_lev = round(notional / max(ev.size_usd, 1))
-                if 2 <= est_lev <= 200:
-                    leverage = est_lev
+        leverage = LiquidationProcessor.estimate_leverage(ev)
 
         ex_map = {"binance": "BIN", "bybit": "BYB", "okx": "OKX", "hyperliquid": "HYP"}
         ex_short = ex_map.get(ev.exchange, ev.exchange[:3].upper())
@@ -750,7 +654,6 @@ class HyperDataAPI:
                 if not self._ws_clients:
                     continue
 
-                self.__init_dedup()
                 stats = self.hub.liquidations.get_stats(window_minutes=60)
                 msg = json.dumps({"type": "heartbeat", "data": {
                     "ws_clients": len(self._ws_clients),
