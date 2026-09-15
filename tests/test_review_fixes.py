@@ -1187,3 +1187,171 @@ class TestM9MarkupSafety:
         out = recorder.export_text()
         assert "[bold red]PUMP[/] because [oops" in out
         assert "[bold]strat" in out
+
+
+# ── M8: scoring math ─────────────────────────────────────────────
+
+class TestM8Scoring:
+    @staticmethod
+    def _engine():
+        from data_layer.smart_money import SmartMoneyEngine
+        return SmartMoneyEngine()
+
+    def test_pnl_score_is_monotonic_bounded_and_uses_its_weight(self):
+        """Pre-fix: log10(1+pnl)/10 mapped $1k..$1M into 0.30..0.60, so BETA's
+        0.40 weight had ~0.12 of real discriminating range."""
+        e = self._engine()
+        pnls = [-1e8, -1e6, -1e4, -1e3, 0.0, 1e3, 1e4, 1e5, 1e6, 1e8]
+        scores = [e._compute_pnl_score(p) for p in pnls]
+        assert scores == sorted(scores)
+        assert all(-1.0 <= s <= 1.0 for s in scores)
+        assert e._compute_pnl_score(1e6) == pytest.approx(1.0)
+        assert e._compute_pnl_score(-1e6) == pytest.approx(-1.0)
+        assert e._compute_pnl_score(1e3) == pytest.approx(0.5, abs=0.01)
+        # $1k -> $1M now spans ~0.5 of score, not ~0.3.
+        assert e._compute_pnl_score(1e6) - e._compute_pnl_score(1e3) > 0.45
+
+    def test_risk_ratio_is_return_based_and_small_sample_shrunk(self):
+        """Pre-fix: mean/std of DOLLAR PnL with no shrinkage — ten similar $50
+        scalps produced a huge ratio that clamped to the +1.0 maximum."""
+        e = self._engine()
+        assert e._compute_risk_adjusted([0.001] * 10) == 0.0            # zero dispersion says nothing
+        assert e._compute_risk_adjusted([0.5]) == 0.0                   # n < 2
+        # Same distribution, more samples -> less shrinkage -> larger ratio.
+        pattern = [0.010, 0.012, 0.009, 0.011]
+        small = e._compute_risk_adjusted(pattern)
+        large = e._compute_risk_adjusted(pattern * 50)
+        assert 0 < small < large
+        assert small == pytest.approx(large * (4 / 24) / (200 / 220), rel=1e-6)
+        # Sign follows the mean.
+        assert e._compute_risk_adjusted([-0.01, -0.012, -0.009]) < 0
+
+    def test_composite_is_bounded(self):
+        from data_layer.smart_money import WalletProfile
+        e = self._engine()
+        best = WalletProfile(address="0x" + "1" * 40, discovered_at=0, last_seen=0, last_analyzed=0,
+                             win_rate=1.0, total_realized_pnl=1e12, sharpe_ratio=1e6)
+        worst = WalletProfile(address="0x" + "2" * 40, discovered_at=0, last_seen=0, last_analyzed=0,
+                              win_rate=0.0, total_realized_pnl=-1e12, sharpe_ratio=-1e6)
+        assert e._compute_composite(best) == pytest.approx(1.0)
+        assert e._compute_composite(worst) == pytest.approx(-0.65)
+        assert e.ALPHA + e.BETA + e.GAMMA == pytest.approx(1.0)
+
+    @pytest.mark.asyncio
+    async def test_analyze_wallet_feeds_returns_not_dollars(self, monkeypatch):
+        e = self._engine()
+        fills = []
+        for i, (pnl, px, sz) in enumerate([(50, 50_000, 1.0), (60, 50_000, 1.0), (40, 50_000, 1.0),
+                                           (55, 50_000, 1.0), (45, 50_000, 1.0)]):
+            fills.append({"time": 1_700_000_000_000 + i, "dir": "Open Long", "coin": "BTC",
+                          "px": str(px), "sz": str(sz), "closedPnl": "0"})
+            fills.append({"time": 1_700_000_000_000 + i, "dir": "Close Long", "coin": "BTC",
+                          "px": str(px), "sz": str(sz), "closedPnl": str(pnl)})
+
+        async def fake_fills(address):
+            return fills
+
+        async def none(address):
+            return None
+
+        async def no_signals(address, fills):
+            return None
+
+        monkeypatch.setattr(e, "_fetch_fills", fake_fills)
+        monkeypatch.setattr(e, "_fetch_clearinghouse", none)
+        monkeypatch.setattr(e, "check_signals", no_signals)
+        w = await e.analyze_wallet("0x" + "3" * 40)
+        expected = e._compute_risk_adjusted([50 / 50_000, 60 / 50_000, 40 / 50_000, 55 / 50_000, 45 / 50_000])
+        assert w.sharpe_ratio == pytest.approx(expected)
+        assert w.total_trades == 5
+
+
+# ── H3: LLM transport is cancellable; refunds only for unreachable provider ──
+
+class TestH3LLMTransport:
+    @staticmethod
+    def _agent():
+        from src.strategies.llm_agent import LLMAgent
+        agent = LLMAgent(symbol="BTC")
+        agent.api_key = "k"
+        agent.base_url = "https://llm.example/v1"
+        return agent
+
+    def test_no_worker_thread_and_no_dead_sync_paths(self):
+        """Pre-fix: a single-worker ThreadPoolExecutor whose thread a wait_for
+        timeout could not cancel — one trickling response wedged every later
+        evaluation forever. _async_evaluate existed but was dead code."""
+        from src.strategies.llm_agent import LLMAgent
+        agent = self._agent()
+        assert not hasattr(agent, "_pool")
+        assert not hasattr(LLMAgent, "_sync_evaluate")
+        assert not hasattr(LLMAgent, "_sync_call")
+
+    @pytest.mark.asyncio
+    async def test_timeout_cancels_request_and_keeps_budget_slot(self, monkeypatch, caplog):
+        """Pre-fix: the timeout branch REFUNDED the slot, so a slow-but-billing
+        provider got ~2x the nominal hourly cap."""
+        import asyncio
+
+        agent = self._agent()
+        agent.EVAL_TIMEOUT_S = 0.05
+        cancelled = {"value": False}
+
+        async def slow(hub):
+            try:
+                await asyncio.sleep(5)
+            except asyncio.CancelledError:
+                cancelled["value"] = True
+                raise
+
+        monkeypatch.setattr(agent, "_async_evaluate", slow)
+        with caplog.at_level("WARNING"):
+            assert await agent.evaluate(object()) is None
+        assert cancelled["value"] is True            # the request itself was cancelled
+        assert len(agent._eval_times) == 1           # slot NOT refunded
+        assert "budget slot kept" in caplog.text
+        assert agent._inflight is False
+
+    @pytest.mark.asyncio
+    async def test_unreachable_provider_refunds_slot(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        import aiohttp
+
+        agent = self._agent()
+
+        async def refused(hub):
+            raise aiohttp.ClientConnectorError(MagicMock(), OSError("refused"))
+
+        monkeypatch.setattr(agent, "_async_evaluate", refused)
+        assert await agent.evaluate(object()) is None
+        assert len(agent._eval_times) == 0
+
+    @pytest.mark.asyncio
+    async def test_inflight_guard_skips_instead_of_queueing(self, monkeypatch):
+        import asyncio
+
+        agent = self._agent()
+        started = asyncio.Event()
+
+        async def slow(hub):
+            started.set()
+            await asyncio.sleep(0.2)
+            return None
+
+        monkeypatch.setattr(agent, "_async_evaluate", slow)
+        first = asyncio.create_task(agent.evaluate(object()))
+        await started.wait()
+        # A second tick while the first is in flight is skipped immediately
+        # and consumes NO budget slot.
+        assert await asyncio.wait_for(agent.evaluate(object()), timeout=0.05) is None
+        assert len(agent._eval_times) == 1
+        await first
+        assert agent._inflight is False
+
+    def test_reason_is_bounded(self):
+        from src.strategies.llm_agent import LLMAgent
+        agent = self._agent()
+        sig = agent._parse_response("BUY\n" + "x" * 5000)
+        assert sig is not None
+        assert len(sig.reason) <= len("[LLM] ") + LLMAgent.MAX_REASON_CHARS
