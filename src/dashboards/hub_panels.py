@@ -381,10 +381,14 @@ class HubWhales:
             )
 
         now_str = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        # H4: say how old the displayed scan is; red once it is stale.
+        age = self.hub.positions.oldest_position_age_seconds()
+        age_style = "bold bright_red" if self.hub.positions.is_stale() else "dim"
+        age_note = f"[{age_style}]scan {age:.0f}s ago{' STALE' if age_style != 'dim' else ''}[/]"
         return Panel(
             Group(summary, table),
             title=f"[bold bright_cyan]\U0001f40b WHALES  {len(whales)} positions  {fmt_usd(total_val)}[/]",
-            subtitle=f"[dim]{now_str}  #{self.cycle}[/]",
+            subtitle=f"{age_note}  [dim]{now_str}  #{self.cycle}[/]",
             border_style="bright_cyan", box=box.ROUNDED, padding=(0, 1),
         )
 
