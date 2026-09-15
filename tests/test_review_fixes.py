@@ -1678,3 +1678,106 @@ class TestH6WriterThread:
         assert "asyncio.to_thread(self.store.get_db_stats)" in src
         assert "asyncio.to_thread(self.store.prune)" in src
         assert "asyncio.to_thread(address_store.prune)" in src
+
+
+# ── M13: extraction equivalence (demo generators, liquidation processing) ──
+
+class TestM13Extraction:
+    def test_hub_demo_bodies_moved_and_delegated(self):
+        import inspect
+
+        from src.data_layer import hub_demo
+        from src.data_layer.hub import HyperDataHub
+        for name in ("liquidation_generator", "trade_generator", "position_scan", "smart_money",
+                     "hlp", "market_refresh", "deribit", "basis", "lsr"):
+            assert callable(getattr(hub_demo, f"demo_{name}"))
+            body = inspect.getsource(getattr(HyperDataHub, f"_demo_{name}"))
+            assert f"hub_demo.demo_{name}(self)" in body
+            assert body.count("\n") <= 3                      # a delegator, not a body
+        hub_src = inspect.getsource(HyperDataHub)
+        assert "random.choices" not in hub_src                # no generator code left in the orchestrator
+
+    @pytest.mark.asyncio
+    async def test_demo_generators_still_populate_the_hub(self, tmp_path, monkeypatch):
+        """Behavioural equivalence: the one-shot generators fill the same
+        component state as before, with the C1/C3/H4 fields attached."""
+        import asyncio
+
+        hub = _isolated_hub(tmp_path, monkeypatch)
+        try:
+            hub._running = True
+            await hub._demo_position_scan()
+            assert len(hub.positions.positions) == 60
+            assert all(p.scanned_at > 0 for p in hub.positions.positions)
+            assert hub.positions.last_scan_at > 0 and not hub.positions.is_stale()
+
+            await hub._demo_market_refresh()
+            assert len(hub.market.assets) == 20 and hub.market.assets["BTC"].price > 0
+
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(hub._demo_smart_money(), timeout=0.05)
+            wallets = hub.smart_money.wallets.values()
+            assert len([w for w in wallets if w.rank > 0]) == 150
+            tiers = {t: sum(1 for w in wallets if w.tier == t) for t in ("smart", "average", "dumb")}
+            assert tiers == {"smart": 15, "average": 120, "dumb": 15}
+            assert all(w.confidence > 0 for w in wallets if w.rank > 0)
+        finally:
+            hub.store.close()
+
+    @pytest.mark.asyncio
+    async def test_demo_hub_lifecycle(self, tmp_path, monkeypatch):
+        """The whole demo hub starts, produces data and stops cleanly —
+        previously the orchestrator had no lifecycle test at all."""
+        import asyncio
+
+        from src.data_layer import persistence
+        monkeypatch.setattr(persistence, "DB_PATH", tmp_path / "hub.db")
+        monkeypatch.setattr(address_store, "DATA_DIR", tmp_path)
+        monkeypatch.setattr(address_store, "DB_PATH", tmp_path / "hub.db")
+        monkeypatch.setattr(address_store, "LEGACY_JSON", tmp_path / "legacy.json")
+        monkeypatch.setattr(address_store, "_initialized", False)
+        from src.data_layer.hub import HyperDataHub
+        hub = HyperDataHub(demo=True)
+        await hub.start()
+        try:
+            await asyncio.sleep(0.4)
+            s = hub.status
+            assert s.mode == "demo"
+            assert (s.liquidation_feed, s.orderflow_engine, s.position_scanner, s.market_data) == ("demo",) * 4
+            assert hub.orderflow.synthetic is True
+            assert s.tracked_positions == 60
+            assert len(hub.market.assets) == 20
+            assert s.total_trades_processed > 0
+            assert s.failed_components == []
+        finally:
+            await hub.stop()
+        assert hub.status.mode == "offline"
+
+    def test_liquidation_processor_is_the_single_implementation(self):
+        """The API's dedup/cascade/symbol methods are delegators; the logic
+        (and its tests in TestLiquidationDedup) now exercise the data-layer
+        class through them."""
+        import inspect
+        from unittest.mock import MagicMock
+
+        from src.api_server import HyperDataAPI
+        from src.data_layer.liquidation_processing import LiquidationProcessor
+        api = HyperDataAPI(hub=MagicMock())
+        assert isinstance(api._liq, LiquidationProcessor)
+        for name in ("_is_duplicate_liq", "_check_cascade", "_clean_symbol", "_log_liq_stats"):
+            assert inspect.getsource(getattr(HyperDataAPI, name)).count("\n") <= 3
+        assert api._CASCADE_BYPASS_DURATION == LiquidationProcessor.CASCADE_BYPASS_DURATION
+        assert api._clean_symbol("1000pepe") == "PEPE"
+        assert api._clean_symbol("龙虾") == "LOBSTER"
+        # State views are the processor's own dicts, not copies.
+        assert api._cascade_bypass is api._liq.cascade_bypass
+
+    def test_estimate_leverage(self):
+        from types import SimpleNamespace
+
+        from src.data_layer.liquidation_processing import LiquidationProcessor
+        est = LiquidationProcessor.estimate_leverage
+        assert est(SimpleNamespace(price=100.0, quantity=10.0, size_usd=100.0)) == 10
+        assert est(SimpleNamespace(price=100.0, quantity=10.0, size_usd=1000.0)) is None   # 1x: implausible
+        assert est(SimpleNamespace(price=100.0, quantity=10.0, size_usd=1.0)) is None      # 1000x: implausible
+        assert est(SimpleNamespace(price=0.0, quantity=10.0, size_usd=1.0)) is None
