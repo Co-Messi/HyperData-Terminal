@@ -910,6 +910,16 @@ class TestH7HealthStatus:
         assert (await self._health("live", ok, {"liquidation_feed": "connecting"}))["status"] == "ok"
 
     @pytest.mark.asyncio
+    async def test_persistence_counters_are_fields_not_just_stats(self):
+        """Nit: get_db_stats() returned write_queue_pending / dropped_writes
+        but no /v1/health field carried them."""
+        body = await self._health("live", {"overall": "ok"},
+                                  {"write_queue_pending": 17, "dropped_writes": 3})
+        assert body["persistence"]["write_queue_pending"] == 17
+        assert body["persistence"]["dropped_writes"] == 3
+        assert body["status"] == "ok"                      # informational, not gating
+
+    @pytest.mark.asyncio
     async def test_docs_url_is_the_real_repo(self):
         """M12: the advertised docs URL 404'd."""
         body = await self._health("demo", None)
@@ -1896,6 +1906,7 @@ class TestH6WriterThread:
         from src.data_layer.hub import HyperDataHub
         src = inspect.getsource(HyperDataHub._status_update_tick)
         assert "asyncio.to_thread(self.store.get_db_stats)" in src
+        assert 'self.status.dropped_writes = db_stats["dropped_writes"]' in src
         assert "asyncio.to_thread(self.store.prune)" in src
         assert "asyncio.to_thread(address_store.prune)" in src
 

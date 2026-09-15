@@ -859,6 +859,15 @@ class HyperDataAPI:
             "tracked_positions": s.tracked_positions,
             "ws_clients": len(self._ws_clients),
             "feeds": feeds,
+            # Writer-thread health: pending backlog and cumulative drops.
+            # Informational (does not gate `status`): a drop is a persistence
+            # loss, not a live-data fault, and the counter never resets.
+            "persistence": {
+                "db_size_mb": s.db_size_mb,
+                "events_persisted": s.events_persisted,
+                "write_queue_pending": s.write_queue_pending,
+                "dropped_writes": s.dropped_writes,
+            },
             "data_health": data_health,
             "docs": "https://github.com/Co-Messi/HyperData-Terminal",
         })
