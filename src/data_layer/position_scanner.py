@@ -137,7 +137,11 @@ class PositionScanner:
                 continue
 
         self.discovered_addresses.update(new_addresses)
-        self._save_discovered_addresses()
+        # Persist only what this cycle found — the store is an upsert per
+        # row, so re-writing the whole known set every 30 minutes was O(N)
+        # event-loop work for nothing.
+        if new_addresses:
+            address_store.add_addresses(new_addresses, source="position_scanner")
         return self.discovered_addresses
 
     # ── Per-address positions ────────────────────────────────────
@@ -310,12 +314,12 @@ class PositionScanner:
     # ── Address persistence (SQLite-backed) ──────────────────────
 
     def _load_discovered_addresses(self):
-        """Load addresses from SQLite store."""
-        self.discovered_addresses = address_store.get_all_addresses()
+        """Load addresses from the SQLite store.
 
-    def _save_discovered_addresses(self):
-        """Persist current in-memory set to SQLite."""
-        address_store.add_addresses(self.discovered_addresses, source="position_scanner")
+        Propagates a read failure: an unreadable store must fail loudly at
+        construction, not be mistaken for "no addresses yet".
+        """
+        self.discovered_addresses = address_store.get_all_addresses()
 
     def add_addresses(self, addresses: list[str]):
         """Manually add addresses to track (validated + normalized)."""
