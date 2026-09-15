@@ -1825,6 +1825,59 @@ class TestH6WriterThread:
             release.set()
             store.close()
 
+    def test_incomplete_drain_is_an_error_and_flush_close_report_it(self, tmp_path, monkeypatch, caplog):
+        """S4: flush() ignored _drain()'s bool and close() then closed the
+        connection regardless, so a drain that timed out lost everything in
+        the queue with one WARNING on a logger with no stdout handler."""
+        import threading
+
+        from src.data_layer import persistence
+        monkeypatch.setattr(persistence, "DRAIN_TIMEOUT_SECONDS", 0.05)
+        store = DataStore(tmp_path / "wedged.db")
+        release = threading.Event()
+        real_apply = store._apply
+
+        def wedged_apply(batch):
+            release.wait(60)                       # the writer is stuck until the test says otherwise
+            real_apply(batch)
+
+        store._apply = wedged_apply
+        store._save_liquidation(_Liq(0))
+        store._save_liquidation(_Liq(1))
+        with caplog.at_level("ERROR"):
+            assert store.flush() is False
+        assert "drain incomplete" in caplog.text
+        assert caplog.records[-1].levelname == "ERROR"
+        assert store.pending_writes() == 2
+        assert store.get_db_stats()["write_queue_pending"] >= 0   # read still answers
+        caplog.clear()
+        wedged_writer = store._writer
+        with caplog.at_level("ERROR"):
+            assert store.close() is False
+        assert "queued writes lost" in caplog.text or "NOT persisted" in caplog.text
+        # Let the wedged writer hit the closed connection and log it (that
+        # IS the loss the line above announced) before the control starts.
+        release.set()
+        wedged_writer.join(5)
+
+        # Control: a healthy store flushes and closes True, without errors.
+        caplog.clear()
+        ok = DataStore(tmp_path / "healthy.db")
+        ok._save_liquidation(_Liq(0))
+        with caplog.at_level("ERROR"):
+            assert ok.flush() is True
+            assert ok.close() is True
+        assert not caplog.records
+
+    @pytest.mark.asyncio
+    async def test_hub_stop_reports_lost_writes(self, tmp_path, monkeypatch, caplog):
+        hub = _isolated_hub(tmp_path, monkeypatch)
+        monkeypatch.setattr(hub.store, "close", lambda: False)
+        with caplog.at_level("ERROR"):
+            await hub.stop()
+        assert "unflushed persistence writes" in caplog.text
+        hub.store._conn.close()
+
     def test_close_stops_writer_and_persists_everything(self, tmp_path):
         path = tmp_path / "c.db"
         store = DataStore(path)
