@@ -39,6 +39,20 @@ PARSE_ERROR_LOG_INTERVAL = 60.0
 
 VENUES = ("hyperliquid", "binance")
 
+# Hyperliquid closes a WebSocket (code 1006, no close frame) once it carries
+# roughly ten `trades` subscriptions — measured live: 8 subscriptions stay up
+# indefinitely, the 10th kills the socket within ~0.2s even when sent 1s
+# apart. The single 50-symbol socket therefore died 0.6s after EVERY connect
+# and the old zero-sleep reconnect loop re-harvested it ~1.5x/second (107
+# connects in a 75s run), which read as "connected" throughout. Symbols are
+# sharded across sockets of at most this many subscriptions.
+HL_SUBSCRIPTIONS_PER_SOCKET = 8
+
+# Backoff ceiling after a short-lived clean close (server dropped us right
+# after subscribing). Lower than the error ceiling on purpose: a flaky shard
+# must not take its symbols dark for a minute at a time.
+HL_SHORT_CLOSE_MAX_BACKOFF = 15.0
+
 # Upper bound on remembered trade IDs per venue (oldest evicted first).
 MAX_SEEN_IDS = 100_000
 
@@ -248,10 +262,12 @@ class OrderFlowEngine:
         self.synthetic: bool = False
 
         self._callbacks: list[Callable[[Trade], None]] = []
-        self._ws: aiohttp.ClientWebSocketResponse | None = None
-        self._session: aiohttp.ClientSession | None = None
         self._running: bool = False
-        self._task: asyncio.Task | None = None
+        # Hyperliquid: one socket per shard of HL_SUBSCRIPTIONS_PER_SOCKET
+        # symbols (see that constant). shard index -> open socket / session.
+        self._hl_tasks: list[asyncio.Task] = []
+        self._hl_sockets: dict[int, aiohttp.ClientWebSocketResponse] = {}
+        self._hl_sessions: dict[int, aiohttp.ClientSession] = {}
         self._binance_task: asyncio.Task | None = None
 
     # -- public API ---------------------------------------------------------
@@ -284,16 +300,45 @@ class OrderFlowEngine:
     # -- venue liveness bookkeeping -------------------------------------------
 
     def _venue_connected(self, venue: str) -> None:
+        """A socket for `venue` opened. `connects` counts every socket; the
+        venue-level connected/connected_at flips only on the first one (HL
+        runs several shards — one shard reconnecting is not the venue
+        reconnecting)."""
         st = self.venues[venue]
-        st.connected = True
-        st.connected_at = time.time()
         st.connects += 1
+        if not st.connected:
+            st.connected = True
+            st.connected_at = time.time()
 
     def _venue_disconnected(self, venue: str) -> None:
+        """Called when the LAST socket for `venue` is gone."""
         st = self.venues[venue]
         if st.connected:
             st.disconnected_at = time.time()
         st.connected = False
+
+    def _hl_shards(self) -> list[list[str]]:
+        """Partition the symbol list into subscription shards, one socket each."""
+        n = HL_SUBSCRIPTIONS_PER_SOCKET
+        return [self.symbols[i:i + n] for i in range(0, len(self.symbols), n)]
+
+    @property
+    def hl_sockets_open(self) -> int:
+        return sum(1 for ws in self._hl_sockets.values() if not ws.closed)
+
+    async def force_reconnect(self) -> int:
+        """Close every open Hyperliquid socket so the shard loops rebuild
+        them (the hub's watchdog calls this on a dead-but-open feed).
+        Returns the number of sockets closed."""
+        closed = 0
+        for ws in list(self._hl_sockets.values()):
+            if not ws.closed:
+                try:
+                    await ws.close()
+                    closed += 1
+                except Exception:
+                    logger.debug("force_reconnect: close failed", exc_info=True)
+        return closed
 
     def _venue_frame(self, venue: str) -> None:
         """Any inbound text frame — including subscription acks and error
@@ -410,25 +455,34 @@ class OrderFlowEngine:
             logger.warning("OrderFlowEngine already running")
             return
         self._running = True
-        self._task = asyncio.create_task(self._run_forever())
-        self._binance_task = asyncio.create_task(self._binance_trade_loop())
-        logger.info("OrderFlowEngine started for %s (HL + Binance)", self.symbols)
+        shards = self._hl_shards()
+        self._hl_tasks = [
+            asyncio.create_task(self._run_forever(i), name=f"orderflow-hl-{i}")
+            for i in range(len(shards))
+        ]
+        self._binance_task = asyncio.create_task(self._binance_trade_loop(), name="orderflow-binance")
+        logger.info(
+            "OrderFlowEngine started for %d symbols: Hyperliquid on %d sockets of <=%d subscriptions + Binance",
+            len(self.symbols), len(shards), HL_SUBSCRIPTIONS_PER_SOCKET,
+        )
 
     async def stop(self) -> None:
         """Gracefully disconnect."""
         self._running = False
-        if self._ws and not self._ws.closed:
-            await self._ws.close()
-        if self._session and not self._session.closed:
-            await self._session.close()
-        for task in [self._task, getattr(self, "_binance_task", None)]:
+        for ws in list(self._hl_sockets.values()):
+            if not ws.closed:
+                await ws.close()
+        for session in list(self._hl_sessions.values()):
+            if not session.closed:
+                await session.close()
+        for task in [*self._hl_tasks, self._binance_task]:
             if task:
                 task.cancel()
                 try:
                     await task
                 except asyncio.CancelledError:
                     pass
-        self._task = None
+        self._hl_tasks = []
         self._binance_task = None
         logger.info("OrderFlowEngine stopped")
 
@@ -562,15 +616,16 @@ class OrderFlowEngine:
 
     # -- internal: WebSocket loop -------------------------------------------
 
-    async def _run_forever(self) -> None:
-        """Main loop with auto-reconnect and exponential backoff.
+    async def _run_forever(self, shard: int = 0) -> None:
+        """Reconnect loop for one Hyperliquid shard, with exponential backoff.
 
         Backoff applies to a CLEAN close too when the connection was
-        short-lived: a server that closes right after the 50-symbol subscribe
-        burst used to be reconnected in a tight loop (observed: 138
-        reconnects in 92s), which then trips the venue's message rate limit
-        and keeps the storm going. Only a connection that lived past
-        STALE_AFTER_SECONDS resets the backoff.
+        short-lived: the old loop reset to 1s and slept 0s after a clean
+        close, so a socket the server drops right after subscribing was
+        reconnected ~1.5x/second forever and read as "connected". Only a
+        connection that lived past STALE_AFTER_SECONDS resets the backoff;
+        short-lived closes back off up to HL_SHORT_CLOSE_MAX_BACKOFF, errors
+        up to 60s.
         """
         backoff = 1.0
         max_backoff = 60.0
@@ -578,7 +633,7 @@ class OrderFlowEngine:
         while self._running:
             started = time.time()
             try:
-                await self._connect_and_listen()
+                await self._connect_and_listen(shard)
                 lived = time.time() - started
                 if lived >= STALE_AFTER_SECONDS:
                     backoff = 1.0          # healthy session; server-side churn is normal
@@ -586,11 +641,11 @@ class OrderFlowEngine:
                 if not self._running:
                     break
                 logger.info(
-                    "WebSocket closed by server after %.1fs (short-lived) — reconnecting in %.1fs",
-                    lived, backoff,
+                    "[hl-%d] WebSocket closed by server after %.1fs (short-lived) — reconnecting in %.1fs",
+                    shard, lived, backoff,
                 )
                 await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, max_backoff)
+                backoff = min(backoff * 2, HL_SHORT_CLOSE_MAX_BACKOFF)
             except (
                 aiohttp.WSServerHandshakeError,
                 aiohttp.ClientError,
@@ -599,38 +654,42 @@ class OrderFlowEngine:
                 OSError,
             ) as exc:
                 logger.warning(
-                    "WebSocket error (%s), reconnecting in %.1fs", exc, backoff
+                    "[hl-%d] WebSocket error (%s), reconnecting in %.1fs", shard, exc, backoff
                 )
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, max_backoff)
             except asyncio.CancelledError:
                 break
             except Exception:
-                logger.exception("Unexpected error in WS loop, reconnecting in %.1fs", backoff)
+                logger.exception("[hl-%d] Unexpected error in WS loop, reconnecting in %.1fs", shard, backoff)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, max_backoff)
 
-    async def _connect_and_listen(self) -> None:
-        """Single connection lifecycle: connect, subscribe, read messages."""
-        self._session = aiohttp.ClientSession()
+    async def _connect_and_listen(self, shard: int = 0) -> None:
+        """One connection lifecycle for one shard: connect, subscribe its
+        symbols, read messages until the socket closes."""
+        shards = self._hl_shards()
+        symbols = shards[shard] if shard < len(shards) else []
+        session = aiohttp.ClientSession()
+        self._hl_sessions[shard] = session
+        ws = None
         try:
             # heartbeat=20 so a half-open HL socket raises instead of silently
             # freezing the CVD buckets (the other venue/socket already does this).
-            self._ws = await self._session.ws_connect(WS_URL, heartbeat=20)
+            ws = await session.ws_connect(WS_URL, heartbeat=20)
+            self._hl_sockets[shard] = ws
             self._venue_connected("hyperliquid")
-            logger.info("WebSocket connected to %s", WS_URL)
+            logger.info("[hl-%d] WebSocket connected to %s (%d symbols)", shard, WS_URL, len(symbols))
 
-            # Subscribe to trades for every symbol.
-            for sym in self.symbols:
-                msg = {
+            for sym in symbols:
+                await ws.send_json({
                     "method": "subscribe",
                     "subscription": {"type": "trades", "coin": sym},
-                }
-                await self._ws.send_json(msg)
-                logger.debug("Subscribed to trades for %s", sym)
+                })
+                logger.debug("[hl-%d] Subscribed to trades for %s", shard, sym)
 
             # Read loop.
-            async for ws_msg in self._ws:
+            async for ws_msg in ws:
                 if not self._running:
                     break
                 if ws_msg.type == aiohttp.WSMsgType.TEXT:
@@ -641,11 +700,14 @@ class OrderFlowEngine:
                 ):
                     break
         finally:
-            self._venue_disconnected("hyperliquid")
-            if self._ws and not self._ws.closed:
-                await self._ws.close()
-            if self._session and not self._session.closed:
-                await self._session.close()
+            self._hl_sockets.pop(shard, None)
+            self._hl_sessions.pop(shard, None)
+            if not self._hl_sockets:
+                self._venue_disconnected("hyperliquid")
+            if ws is not None and not ws.closed:
+                await ws.close()
+            if not session.closed:
+                await session.close()
 
     def _handle_message(self, data: dict) -> None:
         """Parse a WebSocket JSON message and create Trade objects.
