@@ -916,7 +916,9 @@ class HyperDataAPI:
                 "hyperliquid": cvd["hyperliquid"], "binance": cvd["binance"],
             },
             "venue_coverage": coverage,
-            "venues_contributing": [v for v, s in coverage.items() if s == "ok"],
+            "venues_contributing": [
+                v for v, s in coverage.items() if s in self.hub.orderflow.CONTRIBUTING_STATUSES
+            ],
             "trades_per_second": tps, "aggregate_signal": agg,
             "timeframes": result,
         })
