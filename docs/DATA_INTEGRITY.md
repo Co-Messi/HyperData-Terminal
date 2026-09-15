@@ -79,9 +79,15 @@ raises and reconnects instead of silently freezing. On top of that:
   addresses (round-robin) and serves the rest from a per-address cache whose
   distance-to-liquidation is recomputed from fresh mids. Every position
   carries `scanned_at`; `/v1/whales` and `/v1/positions/danger-zone` carry
-  `as_of`; `/v1/health` carries `position_scan.scan_age_seconds`. A scanner
-  that has not re-fetched a displayed position within 10 minutes reads
-  `stale` (feed status, health check, whales panel) — never `connected`.
+  `as_of`; `/v1/health` carries `position_scan.scan_age_seconds`,
+  `stale_after_seconds` and `full_pass_worst_case_seconds`. The tracked set
+  is capped (3,000 in the store, re-synced into the scanner after every
+  hourly prune, plus at most what discovery adds in between), and the
+  staleness threshold is **derived** from the worst-case healthy full pass
+  over that cap with a 1.5× margin — about 25 minutes — rather than
+  hand-picked. A scanner that has not re-fetched a displayed position within
+  that window reads `stale` (feed status, health check, whales panel) —
+  never `connected`; a healthy one never does.
 - The dashboard header badge reflects this: **✓ LIVE** / **⚠ PARTIAL** /
   **⚠ STALE** / **⚠ DRIFT**.
 
@@ -102,7 +108,7 @@ only) and caches the result; the dashboard badge and `/v1/health` read it.
 | Order flow freshness (blended) | engine `is_stale()` | some venue delivering trades |
 | Order flow freshness per venue | engine `venue_freshness()` | `ok` (warn if this venue is out, fail if all are) |
 | Orderbook freshness | engine `is_stale()` | not stale |
-| Position scanner freshness | scanner `is_stale()` | last cycle and every displayed position under 10 min old (warn before the first cycle) |
+| Position scanner freshness | scanner `is_stale()` | last cycle and every displayed position younger than `POSITION_STALE_AFTER_SECONDS` (~25 min, derived from the tracked-set cap) (warn before the first cycle) |
 | Market data freshness | hub refresh stamp | < 30s |
 | Funding/consistency | hub | sane bands, funding sign vs L/S agree |
 
