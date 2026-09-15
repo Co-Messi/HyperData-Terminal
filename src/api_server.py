@@ -944,6 +944,8 @@ class HyperDataAPI:
             "status": status,
             "failed_components": list(s.failed_components),
             "orderflow_venues": orderflow_venues,
+            # H4: how old the whale/danger-zone data actually is.
+            "position_scan": self.hub.positions.freshness(),
             "version": "1.0.0",
             "mode": s.mode,
             "uptime": f"{h}h {m}m",
@@ -1117,6 +1119,10 @@ class HyperDataAPI:
         whales = self.hub.get_whale_positions(min_size_usd=min_size)[:limit]
         return web.json_response({
             "count": len(whales),
+            # Oldest scan stamp among the returned positions: the honest
+            # "as of" for this payload (each position also carries scanned_at).
+            "as_of": self.hub.positions.as_of(whales),
+            "scan_age_seconds": _serialize(self.hub.positions.scan_age_seconds()),
             "positions": [_serialize(p) for p in whales],
         })
 
@@ -1126,6 +1132,8 @@ class HyperDataAPI:
         return web.json_response({
             "threshold_pct": threshold,
             "count": len(positions),
+            "as_of": self.hub.positions.as_of(positions),
+            "scan_age_seconds": _serialize(self.hub.positions.scan_age_seconds()),
             "positions": [_serialize(p) for p in positions],
         })
 

@@ -745,6 +745,12 @@ class HyperDataHub:
                     "stale" if self.orderbook.is_stale() else "connected"
                 )
 
+        # Position scanner (H4): 'connected' only while every displayed
+        # position was re-fetched recently; a scanner that fell behind its
+        # budget or stopped completing cycles reads 'stale', not 'connected'.
+        if self.status.position_scanner in ("connected", "stale"):
+            self.status.position_scanner = "stale" if self.positions.is_stale() else "connected"
+
         # Liquidations: promote on the first real event, never age out.
         if self.status.liquidation_feed == "connecting" and self.status.last_liq_event > 0:
             self.status.liquidation_feed = "connected"
@@ -859,10 +865,12 @@ class HyperDataHub:
                 leverage=leverage,
                 unrealized_pnl=size_usd * pnl_pct,
                 margin_used=size_usd / leverage,
+                scanned_at=time.time(),
             ))
 
         self.positions.positions = sorted(positions, key=lambda p: p.distance_pct)
         self.positions.market_prices = {s: p for s, p in symbol_prices.items()}
+        self.positions.last_scan_at = time.time()
         self.status.tracked_positions = len(positions)
 
     async def _demo_smart_money(self) -> None:

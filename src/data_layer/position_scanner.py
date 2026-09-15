@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import time as _time  # wall-clock stamps (time.monotonic is used for rate limiting)
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -17,6 +18,22 @@ DATA_DIR = Path(__file__).resolve().parents[2] / "data"
 
 RATE_LIMIT_PER_SEC = 10
 META_CACHE_TTL = 300  # 5 minutes
+
+# Per-cycle address budget (H4). scan() used to walk EVERY tracked address
+# at 10 req/s, so cycle time grew linearly with the store — 50k addresses
+# was an 83-minute cycle behind a 15s scan_interval, and nothing reported
+# it. Now each cycle scans at most this many addresses (15 batches ≈ 15s),
+# round-robin across cycles, and serves the rest from a per-address cache
+# whose distance-to-liquidation is recomputed from fresh prices every
+# cycle. Every position carries the time it was actually scanned.
+SCAN_ADDRESS_BUDGET = 150
+
+# A position whose last real scan is older than this — or a scanner whose
+# last cycle finished longer ago than this — is stale: its size/entry/liq
+# may have changed and its distance is being extrapolated from cached
+# state. With SCAN_ADDRESS_BUDGET per ~30s cycle this bounds the tracked
+# set to ~3,000 addresses (address_store.MAX_TRACKED_ADDRESSES).
+POSITION_STALE_AFTER_SECONDS = 600.0
 
 # Explicit deadline on every request so a hung endpoint fails the scan cycle
 # instead of blocking the hub's position-scan loop indefinitely. Split
@@ -37,6 +54,10 @@ class TrackedPosition:
     leverage: float
     unrealized_pnl: float
     margin_used: float
+    # Wall-clock time this position was last fetched from the exchange.
+    # current_price/distance_pct may be newer (recomputed from fresh mids);
+    # size, entry, liq price and PnL are as of this moment.
+    scanned_at: float = 0.0
 
 
 @dataclass
@@ -45,10 +66,19 @@ class PositionScanner:
     discovered_addresses: set[str] = field(default_factory=set)
     market_prices: dict[str, float] = field(default_factory=dict)
     market_meta: dict = field(default_factory=dict)
+    scan_budget: int = SCAN_ADDRESS_BUDGET
+    # End of the last completed scan() cycle (0 = never).
+    last_scan_at: float = 0.0
+    # When the round-robin cursor last wrapped, i.e. every tracked address
+    # had been visited at least once since the previous wrap (0 = never).
+    last_full_pass_at: float = 0.0
 
     _meta_updated_at: float = field(default=0.0, repr=False)
     _request_times: list[float] = field(default_factory=list, repr=False)
     _session: aiohttp.ClientSession | None = field(default=None, repr=False)
+    # address -> positions from its last successful scan (possibly []).
+    _position_cache: dict[str, list[TrackedPosition]] = field(default_factory=dict, repr=False)
+    _scan_cursor: int = field(default=0, repr=False)
 
     def __post_init__(self):
         self._load_discovered_addresses()
@@ -56,7 +86,14 @@ class PositionScanner:
     # ── Core scan ────────────────────────────────────────────────
 
     async def scan(self) -> list[TrackedPosition]:
-        """Full scan: update prices, scan all known addresses, return sorted by distance."""
+        """One bounded scan cycle.
+
+        Refreshes prices/meta, runs discovery when due, fetches positions for
+        the next SCAN_ADDRESS_BUDGET addresses in round-robin order, then
+        rebuilds self.positions from the whole cache with distance_pct
+        recomputed against the fresh mids. Cycle time is therefore bounded
+        by the budget, not by the size of the address store.
+        """
         async with aiohttp.ClientSession() as session:
             self._session = session
             try:
@@ -72,7 +109,6 @@ class PositionScanner:
                         logger.warning("[scanner] %s failed: %r", name, res)
 
                 # Discover new addresses: always on first run, then every 30 minutes
-                import time as _time
                 should_rediscover = (
                     not self.discovered_addresses
                     or (_time.time() - getattr(self, '_last_discovery', 0)) > 1800
@@ -81,26 +117,104 @@ class PositionScanner:
                     await self.discover_addresses()
                     self._last_discovery = _time.time()
 
-                all_positions: list[TrackedPosition] = []
-                addresses = list(self.discovered_addresses)
+                # Forget cached positions of addresses that were pruned.
+                for addr in [a for a in self._position_cache if a not in self.discovered_addresses]:
+                    del self._position_cache[addr]
 
-                for batch_start in range(0, len(addresses), RATE_LIMIT_PER_SEC):
-                    batch = addresses[batch_start : batch_start + RATE_LIMIT_PER_SEC]
-                    results = await asyncio.gather(
-                        *[self.get_positions_for_address(addr) for addr in batch],
-                        return_exceptions=True,
-                    )
-                    for result in results:
-                        if isinstance(result, list):
-                            all_positions.extend(result)
+                # Round-robin slice of the tracked set for this cycle.
+                addresses = sorted(self.discovered_addresses)
+                n = len(addresses)
+                if n:
+                    start = self._scan_cursor % n
+                    take = min(self.scan_budget, n)
+                    slice_ = [addresses[(start + i) % n] for i in range(take)]
+                    if start + take >= n:
+                        self.last_full_pass_at = _time.time()
+                    self._scan_cursor = (start + take) % n
 
-                    if batch_start + RATE_LIMIT_PER_SEC < len(addresses):
-                        await asyncio.sleep(1.0)
+                    for batch_start in range(0, len(slice_), RATE_LIMIT_PER_SEC):
+                        batch = slice_[batch_start: batch_start + RATE_LIMIT_PER_SEC]
+                        results = await asyncio.gather(
+                            *[self.get_positions_for_address(addr) for addr in batch],
+                            return_exceptions=True,
+                        )
+                        fetched_at = _time.time()
+                        for addr, result in zip(batch, results):
+                            if isinstance(result, list):
+                                for p in result:
+                                    p.scanned_at = fetched_at
+                                self._position_cache[addr] = result
+                            # A failed request keeps the previous cached entry
+                            # (still carrying its older scanned_at) rather than
+                            # silently reading as "no positions".
 
-                self.positions = sorted(all_positions, key=lambda p: p.distance_pct)
+                        if batch_start + RATE_LIMIT_PER_SEC < len(slice_):
+                            await asyncio.sleep(1.0)
+
+                self.positions = self._assemble_positions()
+                self.last_scan_at = _time.time()
                 return self.positions
             finally:
                 self._session = None
+
+    def _assemble_positions(self) -> list[TrackedPosition]:
+        """Every cached position, distance re-derived from the freshest mids."""
+        out: list[TrackedPosition] = []
+        for plist in self._position_cache.values():
+            for p in plist:
+                price = self.market_prices.get(p.symbol, 0.0)
+                if price > 0:
+                    p.current_price = price
+                    p.distance_pct = abs(price - p.liq_price) / price * 100
+                out.append(p)
+        return sorted(out, key=lambda p: p.distance_pct)
+
+    # ── Freshness ────────────────────────────────────────────────
+
+    def scan_age_seconds(self, now: float | None = None) -> float:
+        """Seconds since the last completed cycle (inf if none yet)."""
+        if self.last_scan_at <= 0:
+            return float("inf")
+        return (now if now is not None else time.time()) - self.last_scan_at
+
+    def oldest_position_age_seconds(self, now: float | None = None) -> float:
+        """Age of the least recently scanned position on display (0 if none)."""
+        if not self.positions:
+            return 0.0
+        now = now if now is not None else time.time()
+        return max(0.0, now - min(p.scanned_at for p in self.positions))
+
+    def is_stale(self, now: float | None = None) -> bool:
+        """True when a cycle has run but the data on display is too old to
+        trust: the scanner has not completed a cycle within
+        POSITION_STALE_AFTER_SECONDS, or some displayed position has not been
+        re-fetched within it. Never stale before the first cycle (that is
+        'starting', not 'stale')."""
+        if self.last_scan_at <= 0:
+            return False
+        return (self.scan_age_seconds(now) > POSITION_STALE_AFTER_SECONDS
+                or self.oldest_position_age_seconds(now) > POSITION_STALE_AFTER_SECONDS)
+
+    @staticmethod
+    def as_of(positions: list[TrackedPosition]) -> float | None:
+        """Oldest scanned_at among the given positions — the honest 'as of'
+        for a response built from them. None when empty or unknown."""
+        stamps = [p.scanned_at for p in positions if p.scanned_at > 0]
+        return min(stamps) if stamps else None
+
+    def freshness(self, now: float | None = None) -> dict:
+        now = now if now is not None else time.time()
+        age = self.scan_age_seconds(now)
+        return {
+            "last_scan_at": self.last_scan_at or None,
+            "scan_age_seconds": None if age == float("inf") else round(age, 1),
+            "oldest_position_age_seconds": round(self.oldest_position_age_seconds(now), 1),
+            "last_full_pass_at": self.last_full_pass_at or None,
+            "tracked_addresses": len(self.discovered_addresses),
+            "scan_budget_per_cycle": self.scan_budget,
+            "stale_after_seconds": POSITION_STALE_AFTER_SECONDS,
+            "stale": self.is_stale(now),
+        }
 
     # ── Address discovery ────────────────────────────────────────
 

@@ -203,6 +203,22 @@ class DataHealthMonitor:
             f"{hub.orderbook.data_age():.0f}s since last book",
         ))
 
+        # Position scanner (H4): liquidation distances are the highest-
+        # consequence numbers on screen, so a scanner that has fallen behind
+        # fails the freshness check rather than quietly serving old state.
+        scanner = hub.positions
+        if scanner.last_scan_at <= 0:
+            out.append(HealthCheck("freshness", "position_scanner", "warn", "no scan completed yet"))
+        else:
+            out.append(HealthCheck(
+                "freshness", "position_scanner",
+                "fail" if scanner.is_stale(now) else "pass",
+                f"last cycle {scanner.scan_age_seconds(now):.0f}s ago; oldest displayed "
+                f"position {scanner.oldest_position_age_seconds(now):.0f}s; "
+                f"{len(scanner.discovered_addresses)} addresses tracked, "
+                f"{scanner.scan_budget}/cycle",
+            ))
+
         # Market data freshness via the hub's wall-clock refresh stamp.
         mkt_age = (now - hub.status.last_market_refresh) if hub.status.last_market_refresh > 0 else float("inf")
         out.append(HealthCheck(

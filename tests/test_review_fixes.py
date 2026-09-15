@@ -26,6 +26,15 @@ def _addr(seed: str) -> str:
     return "0x" + (seed * 40)[:40]
 
 
+def _scanner(monkeypatch, n_addresses: int = 0):
+    """A real PositionScanner that never touches the repo's SQLite file."""
+    monkeypatch.setattr(address_store, "get_all_addresses", lambda: set())
+    from src.data_layer.position_scanner import PositionScanner
+    s = PositionScanner()
+    s.discovered_addresses = {f"0x{i:040x}" for i in range(n_addresses)}
+    return s
+
+
 def _tables(path) -> set[str]:
     conn = sqlite3.connect(str(path))
     try:
@@ -497,7 +506,7 @@ class TestC3VenueTruth:
         finally:
             hub.store.close()
 
-    def test_health_monitor_emits_per_venue_checks(self):
+    def test_health_monitor_emits_per_venue_checks(self, monkeypatch):
         import time as _t
         from types import SimpleNamespace
         from unittest.mock import MagicMock
@@ -510,6 +519,7 @@ class TestC3VenueTruth:
             orderbook=MagicMock(is_stale=lambda: False, data_age=lambda: 1.0),
             status=SimpleNamespace(last_market_refresh=now),
             deribit=MagicMock(get_latest=lambda s: None),
+            positions=_scanner(monkeypatch),
         )
         checks = {c.name: c for c in DataHealthMonitor(hub)._check_freshness()}
         assert checks["order_flow"].status == "pass"          # blended: HL is flowing
@@ -553,7 +563,7 @@ class TestC3VenueTruth:
         assert body["venues_contributing"] == ["hyperliquid"]
 
     @pytest.mark.asyncio
-    async def test_health_endpoint_reports_silent_venue_without_bare_except(self):
+    async def test_health_endpoint_reports_silent_venue_without_bare_except(self, monkeypatch):
         """L7/C3: /v1/health must carry the per-venue truth, and a broken
         venue_freshness() must raise rather than become `null`."""
         import time as _t
@@ -567,6 +577,7 @@ class TestC3VenueTruth:
         hub = MagicMock()
         hub.status = HubStatus(mode="live")
         hub.orderflow = _silent_binance_engine(_t.time())
+        hub.positions = _scanner(monkeypatch)
         hub.health.latest.return_value = None
         api = HyperDataAPI(hub=hub)
         app = web.Application()
@@ -783,6 +794,10 @@ class TestM11ConnectingStatus:
 # ── H7 / M12: /v1/health top-level status and docs URL ───────────
 
 class TestH7HealthStatus:
+    @pytest.fixture(autouse=True)
+    def _mp(self, monkeypatch):
+        self.monkeypatch = monkeypatch
+
     async def _health(self, mode: str, data_health, feed_overrides: dict | None = None,
                       failed: list | None = None) -> dict:
         from unittest.mock import MagicMock
@@ -797,6 +812,7 @@ class TestH7HealthStatus:
         hub.status = HubStatus(mode=mode, **(feed_overrides or {}))
         hub.status.failed_components = list(failed or [])
         hub.orderflow = OrderFlowEngine(symbols=["BTC"])
+        hub.positions = _scanner(self.monkeypatch)
         hub.health.latest.return_value = data_health
         app = web.Application()
         app.router.add_get("/v1/health", HyperDataAPI(hub=hub).handle_health)
@@ -1115,12 +1131,13 @@ class TestM9MarkupSafety:
     (`[bold red]PUMP[/]`). Pre-fix each of these raised inside the Live loop."""
 
     @pytest.mark.parametrize("symbol", [UNBALANCED, STYLED])
-    def test_hub_panels(self, symbol):
+    def test_hub_panels(self, symbol, monkeypatch):
         from unittest.mock import MagicMock
 
         from src.dashboards.hub_panels import HubHLP, HubLiqWatch, HubMarket, HubWhales
         from src.data_layer.hlp_tracker import HLPPosition
         hub = MagicMock()
+        hub.positions = _scanner(monkeypatch)
         hub.status.mode = "live"
         hub.status.tracked_positions = 1
         hub.get_btc_price.return_value = 1.0
@@ -1355,3 +1372,201 @@ class TestH3LLMTransport:
         sig = agent._parse_response("BUY\n" + "x" * 5000)
         assert sig is not None
         assert len(sig.reason) <= len("[LLM] ") + LLMAgent.MAX_REASON_CHARS
+
+
+# ── H4: bounded scan cycle, per-address cache, scan-age everywhere ──
+
+class TestH4ScanBudget:
+    @staticmethod
+    def _quiet(monkeypatch, s):
+        """No network: prices/meta/discovery are no-ops, batch sleeps are instant."""
+        import asyncio
+        import time as _t
+        from unittest.mock import AsyncMock
+
+        from src.data_layer import position_scanner as ps
+        monkeypatch.setattr(s, "update_prices", AsyncMock())
+        monkeypatch.setattr(s, "update_meta", AsyncMock())
+        s._last_discovery = _t.time()
+        monkeypatch.setattr(ps.asyncio, "sleep", AsyncMock())
+        assert asyncio.sleep is ps.asyncio.sleep
+
+    @pytest.mark.asyncio
+    async def test_cycle_is_bounded_and_round_robins(self, monkeypatch):
+        """Pre-fix: scan() walked every tracked address every cycle — 50k
+        addresses at 10 req/s was an 83-minute cycle behind a 15s interval."""
+        s = _scanner(monkeypatch, 400)
+        self._quiet(monkeypatch, s)
+        seen: list[str] = []
+
+        async def fake_get(addr):
+            seen.append(addr)
+            return []
+
+        monkeypatch.setattr(s, "get_positions_for_address", fake_get)
+        await s.scan()
+        assert len(seen) == s.scan_budget == 150 and len(set(seen)) == 150
+        assert s.last_scan_at > 0 and s.last_full_pass_at == 0.0
+        await s.scan()
+        assert len(set(seen)) == 300
+        await s.scan()                                   # wraps: 300..399 then 0..49
+        assert len(set(seen)) == 400
+        assert s.last_full_pass_at > 0
+
+    @pytest.mark.asyncio
+    async def test_cached_positions_get_fresh_distance_but_keep_scan_stamp(self, monkeypatch):
+        s = _scanner(monkeypatch, 2)
+        self._quiet(monkeypatch, s)
+        s.scan_budget = 1
+        a, b = sorted(s.discovered_addresses)
+        pos = _position("BTC")
+        pos.liq_price = 90.0
+        prices = {"BTC": 100.0}
+
+        async def fake_prices():
+            s.market_prices = dict(prices)
+
+        async def fake_get(addr):
+            return [pos] if addr == a else []
+
+        monkeypatch.setattr(s, "update_prices", fake_prices)
+        monkeypatch.setattr(s, "get_positions_for_address", fake_get)
+
+        await s.scan()                                   # cycle 1 scans `a`
+        assert s.positions == [pos]
+        stamp = pos.scanned_at
+        assert stamp > 0
+        assert pos.distance_pct == pytest.approx(10.0)
+
+        prices["BTC"] = 95.0
+        await s.scan()                                   # cycle 2 scans `b`; `a` served from cache
+        assert s.positions == [pos]
+        assert pos.current_price == 95.0
+        assert pos.distance_pct == pytest.approx(abs(95.0 - 90.0) / 95.0 * 100)
+        assert pos.scanned_at == stamp                   # honest: NOT re-fetched
+        assert s.as_of(s.positions) == stamp
+
+    @pytest.mark.asyncio
+    async def test_failed_request_keeps_previous_cache_entry(self, monkeypatch):
+        s = _scanner(monkeypatch, 1)
+        self._quiet(monkeypatch, s)
+        (a,) = s.discovered_addresses
+        pos = _position("BTC")
+        calls = {"n": 0}
+
+        async def flaky(addr):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return [pos]
+            raise RuntimeError("HTTP 429")
+
+        monkeypatch.setattr(s, "get_positions_for_address", flaky)
+        await s.scan()
+        await s.scan()
+        assert s.positions == [pos]                      # not silently "no positions"
+
+    def test_staleness_semantics(self, monkeypatch):
+        s = _scanner(monkeypatch)
+        assert s.is_stale() is False                     # never scanned = starting, not stale
+        now = 1000.0
+        p = _position("BTC")
+        s.positions = [p]
+        s.last_scan_at = now - 1
+        p.scanned_at = now - 1
+        assert s.is_stale(now) is False
+        p.scanned_at = now - 700                         # a displayed position fell behind
+        assert s.is_stale(now) is True
+        p.scanned_at = now - 1
+        s.last_scan_at = now - 700                       # cycles stopped completing
+        assert s.is_stale(now) is True
+        f = s.freshness(now)
+        assert f["stale"] is True and f["scan_age_seconds"] == 700.0
+
+    @pytest.mark.asyncio
+    async def test_api_exposes_scan_age_and_as_of(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        from aiohttp import web
+        from aiohttp.test_utils import TestClient, TestServer
+
+        from src.api_server import HyperDataAPI
+        from src.data_layer.hub import HubStatus
+        from src.data_layer.orderflow_engine import OrderFlowEngine
+        s = _scanner(monkeypatch)
+        p = _position("BTC")
+        p.scanned_at = 123.0
+        s.positions = [p]
+        s.last_scan_at = 130.0
+        hub = MagicMock()
+        hub.status = HubStatus(mode="demo")
+        hub.orderflow = OrderFlowEngine(symbols=["BTC"])
+        hub.positions = s
+        hub.get_whale_positions.return_value = [p]
+        hub.health.latest.return_value = None
+        api = HyperDataAPI(hub=hub)
+        app = web.Application()
+        app.router.add_get("/v1/health", api.handle_health)
+        app.router.add_get("/v1/whales", api.handle_whales)
+        app.router.add_get("/v1/positions/danger-zone", api.handle_danger_zone)
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            health = await (await client.get("/v1/health")).json()
+            assert health["position_scan"]["scan_age_seconds"] > 0
+            assert health["position_scan"]["stale"] is True
+            whales = await (await client.get("/v1/whales")).json()
+            assert whales["as_of"] == 123.0
+            assert whales["positions"][0]["scanned_at"] == 123.0
+            dz = await (await client.get("/v1/positions/danger-zone?threshold=50")).json()
+            assert dz["as_of"] == 123.0
+        finally:
+            await client.close()
+
+    @pytest.mark.asyncio
+    async def test_hub_flips_scanner_to_stale(self, tmp_path, monkeypatch):
+        """Pre-fix: _update_feed_staleness never looked at the scanner, so
+        'connected' stayed on a scanner whose last result was an hour old."""
+        import time as _t
+
+        hub = _isolated_hub(tmp_path, monkeypatch)
+        try:
+            hub.status.position_scanner = "connected"
+            hub.positions.last_scan_at = _t.time() - 700
+            await hub._update_feed_staleness()
+            assert hub.status.position_scanner == "stale"
+            hub.positions.last_scan_at = _t.time()
+            await hub._update_feed_staleness()
+            assert hub.status.position_scanner == "connected"
+        finally:
+            hub.store.close()
+
+    def test_health_monitor_checks_scanner(self, monkeypatch):
+        import time as _t
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        from src.data_layer.health_monitor import DataHealthMonitor
+        from src.data_layer.orderflow_engine import OrderFlowEngine
+        now = _t.time()
+        s = _scanner(monkeypatch)
+        hub = SimpleNamespace(
+            orderflow=OrderFlowEngine(symbols=["BTC"]), positions=s,
+            orderbook=MagicMock(is_stale=lambda: False, data_age=lambda: 1.0),
+            status=SimpleNamespace(last_market_refresh=now),
+            deribit=MagicMock(get_latest=lambda x: None),
+        )
+        checks = {c.name: c for c in DataHealthMonitor(hub)._check_freshness()}
+        assert checks["position_scanner"].status == "warn"      # no scan yet
+        s.last_scan_at = now - 700
+        checks = {c.name: c for c in DataHealthMonitor(hub)._check_freshness()}
+        assert checks["position_scanner"].status == "fail"
+        s.last_scan_at = now - 5
+        checks = {c.name: c for c in DataHealthMonitor(hub)._check_freshness()}
+        assert checks["position_scanner"].status == "pass"
+
+    def test_retention_cap_is_scan_rate_derived(self):
+        """3,000 addresses at 150/cycle is 20 cycles ≈ 10 min — the stale
+        threshold. The old 50,000 cap implied an 83-minute cycle."""
+        from src.data_layer.position_scanner import POSITION_STALE_AFTER_SECONDS, SCAN_ADDRESS_BUDGET
+        cycles_to_cover = address_store.MAX_TRACKED_ADDRESSES / SCAN_ADDRESS_BUDGET
+        assert cycles_to_cover * 30 <= POSITION_STALE_AFTER_SECONDS   # ~30s per cycle
