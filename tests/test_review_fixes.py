@@ -778,3 +778,66 @@ class TestM11ConnectingStatus:
             assert hub.status.orderflow_engine == "stale"
         finally:
             hub.store.close()
+
+
+# ── H7 / M12: /v1/health top-level status and docs URL ───────────
+
+class TestH7HealthStatus:
+    async def _health(self, mode: str, data_health, feed_overrides: dict | None = None,
+                      failed: list | None = None) -> dict:
+        from unittest.mock import MagicMock
+
+        from aiohttp import web
+        from aiohttp.test_utils import TestClient, TestServer
+
+        from src.api_server import HyperDataAPI
+        from src.data_layer.hub import HubStatus
+        from src.data_layer.orderflow_engine import OrderFlowEngine
+        hub = MagicMock()
+        hub.status = HubStatus(mode=mode, **(feed_overrides or {}))
+        hub.status.failed_components = list(failed or [])
+        hub.orderflow = OrderFlowEngine(symbols=["BTC"])
+        hub.health.latest.return_value = data_health
+        app = web.Application()
+        app.router.add_get("/v1/health", HyperDataAPI(hub=hub).handle_health)
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            return await (await client.get("/v1/health")).json()
+        finally:
+            await client.close()
+
+    @pytest.mark.asyncio
+    async def test_no_checks_yet_is_initializing_not_ok(self):
+        """Pre-fix: the first ~45s of every live session reported 'ok'."""
+        assert (await self._health("live", None))["status"] == "initializing"
+        # Demo mode never runs the monitor; that is not "initializing".
+        assert (await self._health("demo", None))["status"] == "ok"
+
+    @pytest.mark.asyncio
+    async def test_warn_is_not_ok(self):
+        """Pre-fix: 'warn' (BTC price unavailable, no funding symbols, one
+        venue silent, ...) mapped to top-level 'ok'."""
+        assert (await self._health("live", {"overall": "warn"}))["status"] == "warn"
+        assert (await self._health("live", {"overall": "ok"}))["status"] == "ok"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("overall", ["stale", "drift", "fail"])
+    async def test_bad_overall_is_degraded(self, overall):
+        assert (await self._health("live", {"overall": overall}))["status"] == "degraded"
+
+    @pytest.mark.asyncio
+    async def test_feed_states_feed_into_status(self):
+        ok = {"overall": "ok"}
+        assert (await self._health("live", ok, {"orderflow_engine": "partial"}))["status"] == "warn"
+        assert (await self._health("live", ok, {"orderflow_engine": "stale"}))["status"] == "degraded"
+        assert (await self._health("live", ok, {"market_data": "error"}))["status"] == "degraded"
+        assert (await self._health("live", ok, failed=["alerts"]))["status"] == "degraded"
+        # 'connecting' is neutral: a sporadic feed may sit there on a quiet market.
+        assert (await self._health("live", ok, {"liquidation_feed": "connecting"}))["status"] == "ok"
+
+    @pytest.mark.asyncio
+    async def test_docs_url_is_the_real_repo(self):
+        """M12: the advertised docs URL 404'd."""
+        body = await self._health("demo", None)
+        assert body["docs"] == "https://github.com/Co-Messi/HyperData-Terminal"
