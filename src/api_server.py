@@ -884,15 +884,30 @@ class HyperDataAPI:
         # must break loudly rather than report `null`.
         orderflow_venues = self.hub.orderflow.venue_freshness()
 
-        # Top-level status reflects data health when available: 'ok' only when
-        # nothing is stale/drifting. 'degraded' otherwise (server is still up).
-        # Components that failed to start OR whose loops are currently erroring
-        # (position scanner / market data flip to 'error' at runtime without
-        # touching failed_components) also force 'degraded'.
+        # Top-level status — the automation surface, so it must never say
+        # "ok" for a terminal that is not:
+        #   initializing  live mode, the self-verification has not run yet
+        #   ok            every check passed and every feed fully delivering
+        #   warn          something is missing but nothing is wrong: a health
+        #                 check warned (sparse coverage, one order-flow venue
+        #                 silent, ...) or a feed is 'partial'
+        #   degraded      a feed is stale/erroring, a cross-reference drifted,
+        #                 or a component failed to start
+        # Pre-fix, None and "warn" both mapped to "ok".
         overall = data_health.get("overall") if data_health else None
-        status = "ok" if overall in (None, "ok", "warn") else "degraded"
-        if s.failed_components or any(v == "error" for v in feeds.values()):
+        if data_health is None and s.mode == "live":
+            status = "initializing"
+        elif overall in (None, "ok"):
+            status = "ok"
+        elif overall == "warn":
+            status = "warn"
+        else:
             status = "degraded"
+        if (s.failed_components
+                or any(v in ("error", "stale") for v in feeds.values())):
+            status = "degraded"
+        elif status != "degraded" and any(v == "partial" for v in feeds.values()):
+            status = "warn"
 
         return web.json_response({
             "status": status,
@@ -909,7 +924,7 @@ class HyperDataAPI:
             "ws_clients": len(self._ws_clients),
             "feeds": feeds,
             "data_health": data_health,
-            "docs": "https://github.com/siewbrayden/hyperdata-terminal",
+            "docs": "https://github.com/Co-Messi/HyperData-Terminal",
         })
 
     async def handle_market(self, request: web.Request) -> web.Response:
