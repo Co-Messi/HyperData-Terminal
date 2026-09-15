@@ -1718,7 +1718,7 @@ class TestReconnectBackoff:
         e = OrderFlowEngine(symbols=["BTC"])
         calls = {"n": 0}
 
-        async def closes_immediately():
+        async def closes_immediately(shard=0):
             calls["n"] += 1
 
         monkeypatch.setattr(e, "_connect_and_listen", closes_immediately)
@@ -1734,6 +1734,90 @@ class TestReconnectBackoff:
         # 1s backoff -> exactly one connect attempt inside 0.3s (pre-fix: hundreds).
         assert calls["n"] == 1
         assert "short-lived" in caplog.text
+
+
+class TestHLSharding:
+    """Measured live: Hyperliquid drops a socket (1006) at ~10 `trades`
+    subscriptions; the single 50-symbol socket died 0.6s after every connect
+    and the zero-sleep reconnect loop hid it (107 connects / 75s on the base
+    commit). Symbols are now sharded across sockets of <= 8 subscriptions."""
+
+    def test_shards_cover_all_symbols_within_the_cap(self):
+        from config.settings import DEFAULT_SYMBOLS
+        from src.data_layer.orderflow_engine import HL_SUBSCRIPTIONS_PER_SOCKET, OrderFlowEngine
+        e = OrderFlowEngine()                       # all 50 defaults
+        shards = e._hl_shards()
+        assert HL_SUBSCRIPTIONS_PER_SOCKET <= 8    # 10 is the measured kill threshold
+        assert all(0 < len(s) <= HL_SUBSCRIPTIONS_PER_SOCKET for s in shards)
+        assert [s for shard in shards for s in shard] == list(DEFAULT_SYMBOLS)
+        assert len(shards) == -(-len(DEFAULT_SYMBOLS) // HL_SUBSCRIPTIONS_PER_SOCKET)
+
+    @pytest.mark.asyncio
+    async def test_start_runs_one_socket_loop_per_shard(self, monkeypatch):
+        import asyncio
+
+        from src.data_layer.orderflow_engine import OrderFlowEngine
+        e = OrderFlowEngine()
+        seen: list[int] = []
+
+        async def fake_loop(shard=0):
+            seen.append(shard)
+            await asyncio.sleep(10)
+
+        async def fake_binance():
+            await asyncio.sleep(10)
+
+        monkeypatch.setattr(e, "_run_forever", fake_loop)
+        monkeypatch.setattr(e, "_binance_trade_loop", fake_binance)
+        await e.start()
+        await asyncio.sleep(0)
+        try:
+            assert sorted(seen) == list(range(len(e._hl_shards())))
+            assert len(e._hl_tasks) == len(e._hl_shards()) == 7
+        finally:
+            await e.stop()
+        assert e._hl_tasks == []
+
+    def test_venue_state_follows_first_and_last_shard(self):
+        """Seven shards reconnecting independently must not read as the venue
+        reconnecting seven times, and one shard dropping is not 'disconnected'."""
+        from unittest.mock import MagicMock
+
+        from src.data_layer.orderflow_engine import OrderFlowEngine
+        e = OrderFlowEngine()
+        st = e.venues["hyperliquid"]
+        e._venue_connected("hyperliquid")
+        first_at = st.connected_at
+        e._venue_connected("hyperliquid")            # second shard up
+        assert st.connects == 2
+        assert st.connected_at == first_at           # not reset by the second shard
+
+        open_ws = MagicMock(closed=False)
+        e._hl_sockets = {0: open_ws, 1: MagicMock(closed=True)}
+        assert e.hl_sockets_open == 1
+
+    @pytest.mark.asyncio
+    async def test_force_reconnect_closes_every_open_shard(self):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from src.data_layer.orderflow_engine import OrderFlowEngine
+        e = OrderFlowEngine()
+        a, b, c = MagicMock(closed=False), MagicMock(closed=False), MagicMock(closed=True)
+        for ws in (a, b, c):
+            ws.close = AsyncMock()
+        e._hl_sockets = {0: a, 1: b, 2: c}
+        assert await e.force_reconnect() == 2
+        a.close.assert_awaited_once()
+        b.close.assert_awaited_once()
+        c.close.assert_not_awaited()
+
+    def test_hub_watchdog_uses_shard_aware_reconnect(self):
+        import inspect
+
+        from src.data_layer.hub import HyperDataHub
+        src = inspect.getsource(HyperDataHub._update_feed_staleness)
+        assert "orderflow.force_reconnect()" in src
+        assert "orderflow._ws" not in src
 
 
 # ── M13: extraction equivalence (demo generators, liquidation processing) ──

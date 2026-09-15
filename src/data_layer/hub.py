@@ -725,17 +725,13 @@ class HyperDataHub:
             had_data = self.orderflow.last_message_at > 0
             since_last_force = now - getattr(self, "_last_of_force_reconnect", 0.0)
             if had_data and self.orderflow.data_age() > cooldown and since_last_force > cooldown:
-                ws = self.orderflow._ws
-                if ws is not None and not ws.closed:
+                if self.orderflow.hl_sockets_open:
                     self._last_of_force_reconnect = now
                     logger.warning(
-                        "[hub] order flow silent %.0fs — forcing HL reconnect",
-                        self.orderflow.data_age(),
+                        "[hub] order flow silent %.0fs — forcing HL reconnect (%d sockets)",
+                        self.orderflow.data_age(), self.orderflow.hl_sockets_open,
                     )
-                    try:
-                        await ws.close()
-                    except Exception:
-                        pass
+                    await self.orderflow.force_reconnect()
 
         # Orderbook (HL l2Book) — the engine's own watchdog forces reconnects,
         # so here we only reflect freshness into the status.
