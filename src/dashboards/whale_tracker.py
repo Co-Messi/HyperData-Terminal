@@ -233,13 +233,13 @@ class WhaleTrackerDashboard:
             table.add_row(
                 str(idx),
                 side_text,
-                pos.symbol,
+                Text(pos.symbol),          # exchange-supplied: never parse as markup
                 Text(fmt_usd(pos.size_usd), style=size_style),
                 fmt_price(pos.entry_price),
                 Text(pnl_str, style=pnl_style),
                 Text(fmt_pct(pos.distance_pct), style=dist_style),
                 Text(f"{pos.leverage:.0f}x", style="dim bright_white"),
-                shorten_addr(pos.address),
+                Text(shorten_addr(pos.address)),
             )
 
         if not positions:
@@ -325,7 +325,7 @@ class WhaleTrackerDashboard:
 
         for symbol, data in sorted_symbols[:10]:
             table.add_row(
-                symbol,
+                Text(symbol),
                 str(data["count"]),
                 fmt_usd(data["value"]),
                 str(data["long_count"]),
@@ -422,7 +422,7 @@ class WhaleTrackerDashboard:
 
             table.add_row(
                 side_text,
-                pos.symbol,
+                Text(pos.symbol),
                 fmt_usd(pos.size_usd),
                 pnl_str,
                 Text(fmt_pct(pos.distance_pct), style=dist_style),

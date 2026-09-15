@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from rich.console import Console
+from rich.markup import escape
 
 from .base import Signal, Strategy
 
@@ -338,15 +339,19 @@ class PaperTrader:
         apply_mutation()
         self.trades.append(trade)
 
-        # Print to console with Rich
+        # Print to console with Rich. Symbol, strategy name and reason are
+        # external strings (exchange payload / LLM output); escape them so
+        # markup like "[bold red]" or an unbalanced "[" can neither restyle
+        # the line nor raise MarkupError — which would fire AFTER the books
+        # were already mutated above.
         color = "green" if signal.action == "BUY" else "red"
         pnl_str = f"  PnL: ${pnl:+,.2f}" if pnl != 0 else ""
         console.print(
-            f"[bold {color}]{signal.action}[/] {signal.symbol} | "
+            f"[bold {color}]{signal.action}[/] {escape(signal.symbol)} | "
             f"${signal.size_usd:,.2f} @ ${price:,.2f} | "
-            f"[dim]{strategy_name}[/] | "
+            f"[dim]{escape(strategy_name)}[/] | "
             f"Confidence: {signal.confidence:.0%} | "
-            f"{signal.reason}{pnl_str}"
+            f"{escape(signal.reason)}{pnl_str}"
         )
 
         # Reverse: the position is now flat, so re-running the same signal

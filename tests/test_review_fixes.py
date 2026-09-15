@@ -995,3 +995,195 @@ class TestM3ReverseSemantics:
             await trader.start()
         await trader.stop()
         assert "close-only semantics" in caplog.text
+
+
+# ── M4: hub.stop() must log, and keep stopping, when a component raises ──
+
+class TestM4StopLogs:
+    @pytest.mark.asyncio
+    async def test_failing_stop_is_logged_and_others_still_stop(self, tmp_path, monkeypatch, caplog):
+        """Pre-fix: nine consecutive `except Exception: pass` blocks — a
+        component leaking a socket at shutdown produced no evidence."""
+        from unittest.mock import AsyncMock
+
+        hub = _isolated_hub(tmp_path, monkeypatch)
+        hub.liquidations.stop = AsyncMock(side_effect=RuntimeError("socket still open"))
+        for comp in (hub.orderflow, hub.smart_money, hub.hlp, hub.funding,
+                     hub.lsr, hub.orderbook, hub.spot, hub.deribit, hub.alerts):
+            comp.stop = AsyncMock()
+        with caplog.at_level("ERROR"):
+            await hub.stop()
+        assert "Error stopping liquidation_feed" in caplog.text
+        assert "socket still open" in caplog.text
+        for comp in (hub.orderflow, hub.smart_money, hub.hlp, hub.funding,
+                     hub.lsr, hub.orderbook, hub.spot, hub.deribit):
+            assert comp.stop.await_count == 1
+        assert hub.status.mode == "offline"
+
+
+# ── M5 / M6: rate limiter LRU, per-IP WebSocket cap ──────────────
+
+class TestM5RateLimiterLRU:
+    def test_tracked_keys_are_bounded_by_lru_eviction(self):
+        """Pre-fix: above 10k ACTIVE keys nothing was ever removed and a
+        full-dict comprehension ran on every request."""
+        from src.api_server import _RateLimiter
+        limiter = _RateLimiter(max_requests=100, window_s=60, max_tracked_keys=100)
+        for i in range(150):
+            assert limiter.allow(f"ip-{i}", now=1000.0)      # all active, none expired
+        assert len(limiter._hits) == 100
+        assert limiter.evictions == 50
+        assert "ip-0" not in limiter._hits and "ip-149" in limiter._hits
+
+    def test_hot_key_survives_eviction(self):
+        from src.api_server import _RateLimiter
+        limiter = _RateLimiter(max_requests=1000, window_s=60, max_tracked_keys=50)
+        for i in range(200):
+            limiter.allow("hot", now=1000.0)
+            limiter.allow(f"cold-{i}", now=1000.0)
+        assert "hot" in limiter._hits
+        assert len(limiter._hits) == 50
+
+
+class TestM6PerIPWebSocketCap:
+    @pytest.mark.asyncio
+    async def test_one_address_cannot_fill_the_global_budget(self):
+        """Pre-fix: MAX_WS_CONNECTIONS was global only — one client opening
+        10 sockets locked everyone else out."""
+        from unittest.mock import MagicMock
+
+        from src.api_server import MAX_WS_CONNECTIONS, MAX_WS_CONNECTIONS_PER_IP, HyperDataAPI
+
+        def fake_client(remote):
+            c = MagicMock()
+            c.remote = remote
+            c.ws.closed = False
+            return c
+
+        api = HyperDataAPI(hub=MagicMock())
+        api._cors_origins = set()
+        api._ws_clients = [fake_client("10.0.0.1") for _ in range(MAX_WS_CONNECTIONS_PER_IP)]
+
+        req = MagicMock()
+        req.headers = {}
+        req.remote = "10.0.0.1"
+        resp = await api.handle_ws(req)
+        assert resp.status == 429
+        assert b"from this address" in resp.body
+
+        # Another address is judged against the GLOBAL cap only.
+        others = MAX_WS_CONNECTIONS - MAX_WS_CONNECTIONS_PER_IP
+        api._ws_clients += [fake_client(f"10.0.0.{i}") for i in range(2, 2 + others)]
+        assert len(api._ws_clients) == MAX_WS_CONNECTIONS
+        req.remote = "10.0.9.9"
+        resp = await api.handle_ws(req)
+        assert resp.status == 429
+        assert b"from this address" not in resp.body
+
+
+# ── M9: exchange/LLM strings must never be parsed as Rich markup ─
+
+# NOTE: a lone "[bold" is NOT an error for Rich (no closing bracket -> literal
+# text). An unmatched CLOSING tag is what raises MarkupError when parsed.
+UNBALANCED = "[/bold]"               # raises MarkupError when parsed
+STYLED = "[bold red]PUMP[/]"         # silently restyles when parsed
+
+
+def _render(renderable) -> str:
+    from rich.console import Console
+    console = Console(record=True, width=220, force_terminal=False)
+    console.print(renderable)
+    return console.export_text()
+
+
+def _position(symbol: str):
+    from src.data_layer.position_scanner import TrackedPosition
+    return TrackedPosition(address="0x" + "a" * 40, symbol=symbol, side="long", size_usd=250_000.0,
+                           entry_price=100.0, current_price=100.0, liq_price=99.0, distance_pct=1.0,
+                           leverage=10.0, unrealized_pnl=5.0, margin_used=25_000.0)
+
+
+def _asset(symbol: str):
+    from src.data_layer.market_data import AssetInfo
+    return AssetInfo(symbol=symbol, price=1.0, funding_rate=0.001, open_interest=1e6, volume_24h=1e6,
+                     price_change_24h_pct=0.01, mark_price=1.0, index_price=1.0)
+
+
+class TestM9MarkupSafety:
+    """Every render site fed by exchange/LLM strings, with a symbol that
+    would raise MarkupError (`[bold`) and one that would restyle
+    (`[bold red]PUMP[/]`). Pre-fix each of these raised inside the Live loop."""
+
+    @pytest.mark.parametrize("symbol", [UNBALANCED, STYLED])
+    def test_hub_panels(self, symbol):
+        from unittest.mock import MagicMock
+
+        from src.dashboards.hub_panels import HubHLP, HubLiqWatch, HubMarket, HubWhales
+        from src.data_layer.hlp_tracker import HLPPosition
+        hub = MagicMock()
+        hub.status.mode = "live"
+        hub.status.tracked_positions = 1
+        hub.get_btc_price.return_value = 1.0
+        hub.get_all_positions_sorted.return_value = [_position(symbol)]
+        hub.get_whale_positions.return_value = [_position(symbol)]
+        hub.get_all_assets.return_value = [_asset(symbol)]
+        hub.market.assets = {symbol: _asset(symbol)}
+        hub.get_extreme_funding.return_value = []
+        hub.hlp.get_stats.return_value = {
+            "account_value": 1.0, "session_pnl": 0.0, "num_positions": 1, "net_delta": 0.0,
+            "delta_zscore": 0.0, "total_exposure": 1.0, "total_snapshots": 1, "total_trades": 0,
+            "liquidation_absorptions": 0,
+        }
+        hub.hlp.get_latest_snapshot.return_value = object()
+        hub.hlp.get_delta_history.return_value = []
+        hub.hlp.get_liquidation_absorptions.return_value = []
+        hub.hlp.get_top_positions.return_value = [HLPPosition(
+            symbol=symbol, side="long", size=1.0, size_usd=1.0, entry_price=1.0,
+            current_price=1.0, unrealized_pnl=0.0, leverage=1.0)]
+        for panel in (HubLiqWatch(hub), HubWhales(hub), HubMarket(hub), HubHLP(hub)):
+            text = _render(panel.build_compact())
+            assert symbol[:5] in text, type(panel).__name__     # shown literally, not parsed
+
+    @pytest.mark.parametrize("symbol", [UNBALANCED, STYLED])
+    def test_standalone_dashboards(self, symbol):
+        import time as _t
+
+        from src.dashboards.liquidation_stream import LiquidationStreamDashboard
+        from src.dashboards.market_overview import MarketOverviewDashboard
+        from src.dashboards.whale_tracker import WhaleTrackerDashboard
+        from src.data_layer.liquidation_feed import LiquidationEvent, LiquidationFeed
+
+        feed = LiquidationFeed()
+        feed.events.append(LiquidationEvent(_t.time(), "binance", symbol, "long", 1000.0, 1.0, 1.0))
+        assert symbol[:5] in _render(LiquidationStreamDashboard(feed=feed).build_recent_feed())
+
+        mo = MarketOverviewDashboard()
+        mo.assets = [_asset(symbol)]
+        for table in (mo.build_assets_table(mo.assets), mo.build_extreme_funding(mo.assets), mo.build_compact()):
+            assert symbol[:5] in _render(table)
+
+        wt = WhaleTrackerDashboard()
+        wt.positions = [_position(symbol)]
+        for table in (wt.build_whale_table(wt.positions), wt.build_symbol_breakdown(), wt.build_compact()):
+            assert symbol[:5] in _render(table)
+
+    def test_paper_trader_console_line(self, monkeypatch):
+        """`signal.reason` comes verbatim from the LLM; a MarkupError here
+        fired AFTER apply_mutation() had already changed the books."""
+        import io
+        from types import SimpleNamespace
+
+        from rich.console import Console
+
+        from src.strategies import paper_trader as pt
+        from src.strategies.base import Signal
+        recorder = Console(record=True, width=220, file=io.StringIO(), force_terminal=False)
+        monkeypatch.setattr(pt, "console", recorder)
+        trader = _paper_trader()
+        trader.hub.market.assets = {UNBALANCED: SimpleNamespace(price=100.0)}
+        trader._execute_trade("[bold]strat", Signal(UNBALANCED, "BUY", size_usd=10.0,
+                                                    reason=f"{STYLED} because [oops"))
+        assert UNBALANCED in trader.positions
+        out = recorder.export_text()
+        assert "[bold red]PUMP[/] because [oops" in out
+        assert "[bold]strat" in out

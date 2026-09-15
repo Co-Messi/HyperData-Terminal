@@ -305,7 +305,9 @@ class LiquidationStreamDashboard:
                     exchange_text = Text(f"{ev.exchange.capitalize()} ?", style=ex_color)
                     size_text = Text(f"~{fmt_usd(ev.size_usd)}", style="bold yellow")
 
-                table.add_row(ts_str, exchange_text, ev.symbol, side_text, size_text)
+                # Text(): the symbol comes from exchange JSON and must not be
+                # parsed as Rich markup (M9).
+                table.add_row(ts_str, exchange_text, Text(ev.symbol), side_text, size_text)
 
             if any_heuristic:
                 table.caption = "~ / ? = estimated (Hyperliquid heuristic, not a confirmed liquidation)"
