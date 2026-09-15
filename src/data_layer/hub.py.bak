@@ -876,10 +876,9 @@ class HyperDataHub:
                 open_positions=random.randint(0, 5),
                 active_symbols=random.sample(symbols, k=random.randint(0, 3)),
             )
-            # Compute composite + pnl_score + sample-size confidence
+            # Compute composite + pnl_score
             w.pnl_score = self.smart_money._compute_pnl_score(w.total_realized_pnl)
             w.composite_score = self.smart_money._compute_composite(w)
-            w.confidence = self.smart_money._compute_confidence(w)
             self.smart_money.wallets[addr] = w
 
         self.smart_money.rank_all()
@@ -918,7 +917,6 @@ class HyperDataHub:
                         wallet_win_rate=wallet.win_rate,
                         wallet_pnl=wallet.total_realized_pnl,
                         signal_type="follow" if wallet.tier == "smart" else "fade",
-                        wallet_confidence=wallet.confidence,
                     )
                     self.smart_money.signals.append(signal)
                     self.smart_money._emit_signal(signal)

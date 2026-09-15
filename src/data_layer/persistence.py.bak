@@ -191,8 +191,7 @@ class DataStore:
                     composite_score REAL DEFAULT 0.0,
                     rank INTEGER DEFAULT 0,
                     tier TEXT DEFAULT 'unknown',
-                    account_value REAL DEFAULT 0.0,
-                    confidence REAL DEFAULT 0.0
+                    account_value REAL DEFAULT 0.0
                 );
                 CREATE INDEX IF NOT EXISTS idx_wallet_tier ON wallets(tier);
                 CREATE INDEX IF NOT EXISTS idx_wallet_rank ON wallets(rank);
@@ -207,8 +206,7 @@ class DataStore:
                     size_usd REAL NOT NULL,
                     wallet_rank INTEGER NOT NULL,
                     signal_type TEXT NOT NULL,
-                    created_at REAL NOT NULL,
-                    wallet_confidence REAL NOT NULL DEFAULT 0.0
+                    created_at REAL NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_sm_signal_ts ON smart_money_signals(timestamp);
                 CREATE INDEX IF NOT EXISTS idx_sm_signal_type ON smart_money_signals(signal_type);
@@ -294,10 +292,7 @@ class DataStore:
     #   v2  added columns to the `snapshots` / `paper_trades` tables — both
     #       tables were dead (no writer anywhere) and were removed in v3, so
     #       v2 is now a no-op.
-    #   v3  drop the dead `snapshots` / `paper_trades` tables (only if empty);
-    #       add wallets.confidence and smart_money_signals.wallet_confidence
-    #       so a persisted smart/dumb label never travels without its
-    #       sample-size confidence
+    #   v3  drop the dead `snapshots` / `paper_trades` tables (only if empty)
     SCHEMA_VERSION = 3
 
     # Tables that no code path has ever written to. Dropped in v3 when empty;
@@ -316,8 +311,6 @@ class DataStore:
                 raise
 
     def _migrate_v3(self) -> None:
-        self._add_column("wallets", "confidence", "REAL DEFAULT 0.0")
-        self._add_column("smart_money_signals", "wallet_confidence", "REAL NOT NULL DEFAULT 0.0")
         for table in self._DEAD_TABLES:
             exists = self._conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
@@ -552,12 +545,10 @@ class DataStore:
         with self._lock:
             self._conn.execute(
                 "INSERT INTO smart_money_signals (timestamp, address, tier, action, symbol, "
-                "size_usd, wallet_rank, signal_type, created_at, wallet_confidence) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "size_usd, wallet_rank, signal_type, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (signal.timestamp, signal.address, signal.tier, signal.action,
                  signal.symbol, signal.size_usd, signal.wallet_rank,
-                 signal.signal_type, time.time(),
-                 getattr(signal, "wallet_confidence", 0.0)),
+                 signal.signal_type, time.time()),
             )
             self._event_count += 1
             self._maybe_commit()
@@ -569,15 +560,14 @@ class DataStore:
                 """INSERT OR REPLACE INTO wallets
                    (address, discovered_at, last_analyzed, total_trades, winning_trades,
                     losing_trades, total_realized_pnl, total_volume_usd, win_rate,
-                    pnl_score, sharpe_ratio, composite_score, rank, tier, account_value,
-                    confidence)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    pnl_score, sharpe_ratio, composite_score, rank, tier, account_value)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (profile.address, profile.discovered_at, profile.last_analyzed,
                  profile.total_trades, profile.winning_trades, profile.losing_trades,
                  profile.total_realized_pnl, profile.total_volume_usd,
                  profile.win_rate, profile.pnl_score, profile.sharpe_ratio,
                  profile.composite_score, profile.rank, profile.tier,
-                 profile.account_value, getattr(profile, "confidence", 0.0)),
+                 profile.account_value),
             )
             self._conn.commit()
 
@@ -596,7 +586,7 @@ class DataStore:
                 """SELECT address, discovered_at, last_analyzed, total_trades,
                           winning_trades, losing_trades, total_realized_pnl,
                           total_volume_usd, win_rate, pnl_score, sharpe_ratio,
-                          composite_score, rank, tier, account_value, confidence
+                          composite_score, rank, tier, account_value
                    FROM wallets ORDER BY rank ASC"""
             ).fetchall()
 
@@ -619,7 +609,6 @@ class DataStore:
                 rank=r[12] or 0,
                 tier=r[13] or "unknown",
                 account_value=r[14] or 0.0,
-                confidence=r[15] or 0.0,
             ))
         return profiles
 
@@ -629,7 +618,7 @@ class DataStore:
         with self._lock:
             rows = self._conn.execute(
                 """SELECT timestamp, address, tier, action, symbol, size_usd,
-                          wallet_rank, signal_type, wallet_confidence
+                          wallet_rank, signal_type
                    FROM smart_money_signals
                    WHERE timestamp > ?
                    ORDER BY timestamp DESC LIMIT 500""",
@@ -637,8 +626,7 @@ class DataStore:
             ).fetchall()
         return [
             {"timestamp": r[0], "address": r[1], "tier": r[2], "action": r[3],
-             "symbol": r[4], "size_usd": r[5], "wallet_rank": r[6], "signal_type": r[7],
-             "wallet_confidence": r[8]}
+             "symbol": r[4], "size_usd": r[5], "wallet_rank": r[6], "signal_type": r[7]}
             for r in rows
         ]
 

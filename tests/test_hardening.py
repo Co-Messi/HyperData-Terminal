@@ -607,14 +607,16 @@ class TestSmartMoneyThresholds:
         engine.rank_all()
         assert tiny.rank == 0 and tiny.tier == "unknown"
         assert thin.rank == 0 and thin.tier == "unknown"
-        assert solid.rank == 1 and solid.tier == "smart"
+        # One qualified wallet is ranked but there is no population to be
+        # "top" of — it is average, not smart (C1).
+        assert solid.rank == 1 and solid.tier == "average"
 
     def test_disqualified_wallet_loses_stale_tier(self):
         from data_layer.smart_money import SmartMoneyEngine
         engine = SmartMoneyEngine()
         w = self._wallet(engine, "0x" + "4" * 40, trades=20, volume=1e6, score=0.8)
         engine.rank_all()
-        assert w.tier == "smart"
+        assert w.rank == 1 and w.tier == "average"
         w.total_trades = 2  # sample no longer qualifies
         engine.rank_all()
         assert w.rank == 0

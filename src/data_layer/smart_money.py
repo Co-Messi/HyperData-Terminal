@@ -90,6 +90,10 @@ class SmartMoneySignal:
     wallet_win_rate: float
     wallet_pnl: float
     signal_type: str        # "follow" (smart money) or "fade" (dumb money)
+    # Sample-size confidence of the wallet's tier (WalletProfile.confidence,
+    # 0-1). A "smart" label on 10 trades is not the same as one on 500;
+    # every consumer of `tier` must show this next to it.
+    wallet_confidence: float = 0.0
 
 
 # ── Engine ─────────────────────────────────────────────────────────────────
@@ -109,8 +113,17 @@ class SmartMoneyEngine:
     MIN_TRADES_FOR_RANKING = 10
     MIN_VOLUME_FOR_RANKING = 50_000     # Total traded volume (USD)
     FULL_CONFIDENCE_TRADES = 50         # Trades at which confidence saturates
-    SMART_MONEY_TOP_N = 100             # Top 100 = smart money
-    DUMB_MONEY_BOTTOM_N = 100           # Bottom 100 = dumb money
+    # Tiers are PROPORTIONAL: the top and bottom TIER_FRACTION of the
+    # qualified population, each capped at SMART_MONEY_TOP_N /
+    # DUMB_MONEY_BOTTOM_N. Fixed "top 100 / bottom 100" boundaries made
+    # "average" unreachable below 200 qualified wallets — the normal state of
+    # a fresh install — so every ranked wallet was labelled smart or dumb.
+    # Below MIN_TIERED_POPULATION there is no meaningful top/bottom decile at
+    # all: wallets are ranked but every tier is "average".
+    TIER_FRACTION = 0.10
+    MIN_TIERED_POPULATION = 10
+    SMART_MONEY_TOP_N = 100             # Cap on the smart-money tier size
+    DUMB_MONEY_BOTTOM_N = 100           # Cap on the dumb-money tier size
     ANALYSIS_INTERVAL = 300             # Analyze wallets every 5 minutes
     DISCOVERY_INTERVAL = 10             # Discover new addresses every 10 seconds
     MIN_ACCOUNT_VALUE = 1000            # Ignore wallets < $1K
@@ -609,8 +622,19 @@ class SmartMoneyEngine:
 
     # ── Ranking ───────────────────────────────────────────────────────
 
+    def tier_counts(self, population: int) -> tuple[int, int]:
+        """(smart_n, dumb_n) for a qualified population of the given size.
+
+        Top/bottom TIER_FRACTION each, capped at the *_N constants; zero
+        below MIN_TIERED_POPULATION. Always leaves an "average" middle.
+        """
+        if population < self.MIN_TIERED_POPULATION:
+            return 0, 0
+        k = int(population * self.TIER_FRACTION)
+        return min(k, self.SMART_MONEY_TOP_N), min(k, self.DUMB_MONEY_BOTTOM_N)
+
     def rank_all(self) -> None:
-        """Re-rank all wallets by composite_score."""
+        """Re-rank all wallets by composite_score and assign proportional tiers."""
         qualified = [w for w in self.wallets.values() if self._qualifies_for_ranking(w)]
         qualified.sort(key=lambda w: w.composite_score, reverse=True)
 
@@ -623,11 +647,13 @@ class SmartMoneyEngine:
                 if w.tier in ("smart", "average", "dumb"):
                     w.tier = "unknown"
 
+        n = len(qualified)
+        smart_n, dumb_n = self.tier_counts(n)
         for i, w in enumerate(qualified, 1):
             w.rank = i
-            if i <= self.SMART_MONEY_TOP_N:
+            if i <= smart_n:
                 w.tier = "smart"
-            elif i > len(qualified) - self.DUMB_MONEY_BOTTOM_N:
+            elif i > n - dumb_n:
                 w.tier = "dumb"
             else:
                 w.tier = "average"
@@ -687,6 +713,7 @@ class SmartMoneyEngine:
                 wallet_win_rate=wallet.win_rate,
                 wallet_pnl=wallet.total_realized_pnl,
                 signal_type=signal_type,
+                wallet_confidence=wallet.confidence,
             )
 
             # Deduplicate: skip if we already have this exact signal
@@ -745,17 +772,21 @@ class SmartMoneyEngine:
         ranked = sum(1 for w in self.wallets.values() if self._qualifies_for_ranking(w))
         smart = sum(1 for w in self.wallets.values() if w.tier == "smart")
         dumb = sum(1 for w in self.wallets.values() if w.tier == "dumb")
+        average = sum(1 for w in self.wallets.values() if w.tier == "average")
         return {
             "total_wallets": len(self.wallets),
             "ranked_wallets": ranked,
             "smart_wallets": smart,
             "dumb_wallets": dumb,
+            "average_wallets": average,
             "total_signals": len(self.signals),
             # Coverage caveats: rankings come from recent fills only and small
             # samples — consumers should show these limits, not just tiers.
             "ranking_criteria": {
                 "min_trades": self.MIN_TRADES_FOR_RANKING,
                 "min_volume_usd": self.MIN_VOLUME_FOR_RANKING,
+                "tier_fraction": self.TIER_FRACTION,
+                "min_tiered_population": self.MIN_TIERED_POPULATION,
                 "note": (
                     "Performance is computed from recent fills only; tiers are "
                     "heuristic. Check each wallet's `confidence` (0-1 sample-"

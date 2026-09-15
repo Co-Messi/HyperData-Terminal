@@ -19,6 +19,22 @@ from src.utils.helpers import format_price as fmt_price
 from src.utils.helpers import format_usd as fmt_usd
 
 
+def _confidence_text(confidence: float, prefix: str = "") -> Text:
+    """Render a wallet's sample-size confidence (0-1) as a coloured percent.
+
+    Shown beside every smart/dumb label: the tier is a heuristic on recent
+    fills, and a 10-trade "smart" is not the same claim as a 500-trade one.
+    """
+    pct = max(0.0, min(1.0, confidence or 0.0)) * 100
+    if pct >= 80:
+        style = "bright_green"
+    elif pct >= 40:
+        style = "yellow"
+    else:
+        style = "bold bright_red"
+    return Text(f"{prefix}{pct:.0f}%", style=style)
+
+
 class HubLiqWatch:
     """Liquidation Watch — shows ALL positions near liquidation."""
 
@@ -448,12 +464,15 @@ class HubSmartMoney:
         stats_line.append(f"  Signals:{sm_stats['total_signals']:,}\n", style="bright_cyan")
 
         # ── Smart money table ──
+        # CONF = sample-size confidence (0-100%). A tier label is a heuristic
+        # on recent fills; low confidence means "too few trades to trust".
         smart_table = Table(
             box=box.SIMPLE_HEAVY, border_style="bright_green",
             header_style="bold bright_white", expand=True, padding=(0, 0),
         )
         smart_table.add_column("#", style="dim", width=3)
         smart_table.add_column("WIN%", justify="right", min_width=5)
+        smart_table.add_column("CONF", justify="right", min_width=5)
         smart_table.add_column("PnL", justify="right", min_width=8)
         smart_table.add_column("ACCT", justify="right", min_width=7)
         smart_table.add_column("COINS", min_width=8)
@@ -466,12 +485,13 @@ class HubSmartMoney:
                 smart_table.add_row(
                     f"#{w.rank}",
                     Text(f"{w.win_rate * 100:.0f}%", style=wr_style),
+                    _confidence_text(w.confidence),
                     Text(fmt_usd(w.total_realized_pnl), style=pnl_style),
                     fmt_usd(w.account_value),
                     Text(coins, style="bright_cyan"),
                 )
         else:
-            smart_table.add_row("---", "---", "---", "---", "---")
+            smart_table.add_row("---", "---", "---", "---", "---", "---")
 
         # ── Dumb money table ──
         dumb_table = Table(
@@ -480,6 +500,7 @@ class HubSmartMoney:
         )
         dumb_table.add_column("#", style="dim", width=3)
         dumb_table.add_column("WIN%", justify="right", min_width=5)
+        dumb_table.add_column("CONF", justify="right", min_width=5)
         dumb_table.add_column("PnL", justify="right", min_width=8)
         dumb_table.add_column("ACCT", justify="right", min_width=7)
 
@@ -490,11 +511,12 @@ class HubSmartMoney:
                 dumb_table.add_row(
                     f"#{w.rank}",
                     Text(f"{w.win_rate * 100:.0f}%", style=wr_style),
+                    _confidence_text(w.confidence),
                     Text(fmt_usd(w.total_realized_pnl), style=pnl_style),
                     fmt_usd(w.account_value),
                 )
         else:
-            dumb_table.add_row("---", "---", "---", "---")
+            dumb_table.add_row("---", "---", "---", "---", "---")
 
         # ── Signals feed ──
         signal_lines = Text()
@@ -514,6 +536,8 @@ class HubSmartMoney:
                 signal_lines.append(f" {ts} ", style="dim")
                 signal_lines.append(f"{icon} ", style=sig_style)
                 signal_lines.append(f"{label} ", style=sig_style)
+                signal_lines.append_text(_confidence_text(getattr(sig, "wallet_confidence", 0.0), prefix="c"))
+                signal_lines.append(" ")
                 signal_lines.append(f"{sig.action} ", style=action_style)
                 signal_lines.append(f"{sig.symbol} ", style="bright_white")
                 signal_lines.append(f"{fmt_usd(sig.size_usd)}\n", style="bold white")
