@@ -4,11 +4,15 @@ version = "1.0.0"
 description = "Open-source crypto market data terminal with real-time dashboards and REST API"
 requires-python = ">=3.12"
 
+# These ranges MUST contain every pin in requirements.lock —
+# tests/test_dependency_lock.py enforces it, and CI installs `pip install -e .`
+# with dependencies (no --no-deps) so pip would refuse a contradiction.
+# rich 14.x and pandas 3.x are what CI has been testing against all along.
 dependencies = [
     "aiohttp>=3.9.0,<4.0",
-    "rich>=13.7.0,<14.0",
+    "rich>=13.7.0,<15",
     "pyfiglet>=1.0.2,<2.0",
-    "pandas>=2.2.0,<3.0",
+    "pandas>=2.2.0,<4",
     "numpy>=1.26.0,<3.0",
     "python-dotenv>=1.0.0,<2.0",
 ]
