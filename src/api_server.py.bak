@@ -879,10 +879,12 @@ class HyperDataAPI:
         }
 
         # Per-venue orderflow freshness: the combined status above follows the
-        # freshest venue, so a connected-but-silent venue is only visible
-        # here. Not wrapped in a bare except — if this breaks, /v1/health
-        # must break loudly rather than report `null`.
-        orderflow_venues = self.hub.orderflow.venue_freshness()
+        # freshest venue, so a dead venue is only visible here.
+        orderflow_venues = None
+        try:
+            orderflow_venues = self.hub.orderflow.venue_freshness()
+        except Exception:
+            pass
 
         # Top-level status reflects data health when available: 'ok' only when
         # nothing is stale/drifting. 'degraded' otherwise (server is still up).
@@ -951,21 +953,11 @@ class HyperDataAPI:
                     "trade_count": snap.trade_count,
                     "ofi": snap.ofi, "signal": snap.signal,
                 }
-        # Per-venue attribution: `cumulative_cvd` stays the combined figure
-        # for back-compat, but it is never returned alone — a consumer can
-        # see which venues are actually feeding it.
-        cvd = self.hub.orderflow.get_cumulative_cvd(sym)
-        coverage = self.hub.orderflow.venue_coverage()
+        cvd = self.hub.orderflow.cumulative_cvd.get(sym, 0.0)
         tps = self.hub.orderflow.get_trades_per_second(sym)
         agg = self.hub.orderflow.get_multi_timeframe_signal(sym)
         return web.json_response({
-            "symbol": sym,
-            "cumulative_cvd": cvd["combined"],
-            "cumulative_cvd_by_venue": {
-                "hyperliquid": cvd["hyperliquid"], "binance": cvd["binance"],
-            },
-            "venue_coverage": coverage,
-            "venues_contributing": [v for v, s in coverage.items() if s == "ok"],
+            "symbol": sym, "cumulative_cvd": cvd,
             "trades_per_second": tps, "aggregate_signal": agg,
             "timeframes": result,
         })

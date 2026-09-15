@@ -66,7 +66,12 @@ class HubStatus:
     uptime_seconds: float = 0.0
     mode: str = "offline"  # 'live', 'demo', 'offline'
 
-    # Component health: 'connected', 'stale', 'reconnecting', 'offline', 'error'
+    # Component health:
+    #   'connecting'  start() returned (tasks created) but no data has arrived
+    #   'connected'   data flowing from every venue the component covers
+    #   'partial'     data flowing, but at least one venue is not (order flow)
+    #   'stale'       had data, nothing recently
+    #   'error' / 'offline' / 'demo' / 'starting'
     liquidation_feed: str = "offline"
     position_scanner: str = "offline"
     orderflow_engine: str = "offline"
@@ -345,27 +350,31 @@ class HyperDataHub:
         log) instead of being silently swallowed.
         """
         s = self.status
+        # WS-driven components: start() only creates tasks and returns before
+        # any handshake, so a successful start() means 'connecting', not
+        # 'connected'. The staleness watchdog promotes to 'connected' on the
+        # first real data (M11).
         await self._start_component(
             "liquidation_feed", self.liquidations.start(),
-            on_ok=lambda: setattr(s, "liquidation_feed", "connected"),
+            on_ok=lambda: setattr(s, "liquidation_feed", "connecting"),
             on_fail=lambda: setattr(s, "liquidation_feed", "error"),
         )
         await self._start_component(
             "orderflow_engine", self.orderflow.start(),
-            on_ok=lambda: setattr(s, "orderflow_engine", "connected"),
+            on_ok=lambda: setattr(s, "orderflow_engine", "connecting"),
             on_fail=lambda: setattr(s, "orderflow_engine", "error"),
         )
         await self._start_component("smart_money", self.smart_money.start())
         await self._start_component(
             "hlp_tracker", self.hlp.start(),
-            on_ok=lambda: setattr(s, "hlp_status", "connected"),
+            on_ok=lambda: setattr(s, "hlp_status", "connecting"),
             on_fail=lambda: setattr(s, "hlp_status", "error"),
         )
         await self._start_component("funding_rates", self.funding.start())
         await self._start_component("long_short_ratio", self.lsr.start())
         await self._start_component(
             "orderbook", self.orderbook.start(),
-            on_ok=lambda: setattr(s, "orderbook_feed", "connected"),
+            on_ok=lambda: setattr(s, "orderbook_feed", "connecting"),
             on_fail=lambda: setattr(s, "orderbook_feed", "error"),
         )
         await self._start_component(
@@ -387,6 +396,9 @@ class HyperDataHub:
         self.status.position_scanner = "demo"
         self.status.market_data = "demo"
         self.status.hlp_status = "demo"
+        # Demo trades bypass the venue sockets; renderers label the CVD as
+        # synthetic rather than attributing it to a venue.
+        self.orderflow.synthetic = True
 
         self._tasks.append(asyncio.create_task(
             self._demo_liquidation_generator(), name="demo-liqs"
@@ -664,35 +676,56 @@ class HyperDataHub:
                 logger.exception("Health monitor loop error")
             await asyncio.sleep(30)
 
+    # Debounce for per-venue order-flow warnings (a persistent regional block
+    # would otherwise log every status tick).
+    VENUE_WARN_INTERVAL = 300.0
+
     async def _update_feed_staleness(self) -> None:
-        """Flag silent WS feeds as 'stale' and force-reconnect dead sockets.
+        """Reflect real data flow into per-feed status; force-reconnect dead sockets.
 
         Live mode only. A feed already in 'error'/'offline' is left alone — that
         is a connection failure, not a data-flow stall. Liquidations are
         intentionally NOT aged out (they are sporadic; a quiet market is not a
-        broken feed).
+        broken feed) but they ARE promoted from 'connecting' on the first event.
         """
         # Order flow (Hyperliquid + Binance trades).
-        if self.status.orderflow_engine in ("connected", "stale"):
-            self.status.orderflow_engine = (
-                "stale" if self.orderflow.is_stale() else "connected"
-            )
-            # Combined freshness follows the freshest venue, so one dead venue
-            # can hide behind the other. Warn (debounced) when that happens so
-            # "orderflow connected" is never silently half-true.
-            if not self.orderflow.is_stale():
-                now_w = time.time()
-                for venue in ("hyperliquid", "binance"):
-                    if (self.orderflow.venue_is_stale(venue)
-                            and self.orderflow.venue_data_age(venue) != float("inf")
-                            and now_w - self._venue_stale_warned_at.get(venue, 0.0) > 300):
-                        self._venue_stale_warned_at[venue] = now_w
-                        logger.warning(
-                            "[hub] order flow venue %s silent %.0fs while the "
-                            "combined feed is still fresh — venue-specific "
-                            "data (per-venue CVD) is stale",
-                            venue, self.orderflow.venue_data_age(venue),
-                        )
+        if self.status.orderflow_engine in ("connecting", "connected", "partial", "stale"):
+            fresh = self.orderflow.venue_freshness()
+            statuses = {v: info["status"] for v, info in fresh.items()}
+            # The hub's own first seconds: sockets are still being opened, so
+            # 'never connected' is expected and must not read as stale.
+            in_startup_grace = (time.time() - self.status.started_at) < ORDERFLOW_STALE_AFTER
+            if self.orderflow.last_message_at <= 0:
+                # No venue has delivered a trade yet: 'connecting' while the
+                # hub or any venue is inside its grace window, otherwise
+                # nothing is flowing and that is 'stale', not 'connected'.
+                still_connecting = in_startup_grace or "connecting" in statuses.values()
+                state = "connecting" if still_connecting else "stale"
+            elif self.orderflow.is_stale():
+                state = "stale"
+            elif all(s == "ok" for s in statuses.values()):
+                state = "connected"
+            else:
+                # Combined freshness follows the freshest venue, so one dead
+                # venue can hide behind the other. Say so.
+                state = "partial"
+            self.status.orderflow_engine = state
+
+            # Per-venue warning for ANY non-ok venue — explicitly including one
+            # that has never delivered a byte (the previous `!= inf` guard
+            # excluded exactly the connected-but-silent case).
+            now_w = time.time()
+            contributing = self.orderflow.contributing_venues()
+            for venue, info in fresh.items():
+                if info["status"] in ("ok", "connecting") or in_startup_grace:
+                    continue
+                if now_w - self._venue_stale_warned_at.get(venue, 0.0) > self.VENUE_WARN_INTERVAL:
+                    self._venue_stale_warned_at[venue] = now_w
+                    logger.warning(
+                        "[hub] order flow venue %s is %s (%s) — CVD/OFI currently "
+                        "reflect %s", venue, info["status"], info["reason"],
+                        ", ".join(contributing) if contributing else "NO venue",
+                    )
             # Both venues silent for well past the threshold → kick the HL
             # socket so its backoff loop rebuilds it. The Binance loop self-heals
             # via its own heartbeat, and if Binance were still feeding, the
@@ -720,10 +753,21 @@ class HyperDataHub:
 
         # Orderbook (HL l2Book) — the engine's own watchdog forces reconnects,
         # so here we only reflect freshness into the status.
-        if self.status.orderbook_feed in ("connected", "stale"):
-            self.status.orderbook_feed = (
-                "stale" if self.orderbook.is_stale() else "connected"
-            )
+        if self.status.orderbook_feed in ("connecting", "connected", "stale"):
+            if self.orderbook.last_message_at <= 0:
+                pass  # still 'connecting': nothing received yet
+            else:
+                self.status.orderbook_feed = (
+                    "stale" if self.orderbook.is_stale() else "connected"
+                )
+
+        # Liquidations: promote on the first real event, never age out.
+        if self.status.liquidation_feed == "connecting" and self.status.last_liq_event > 0:
+            self.status.liquidation_feed = "connected"
+
+        # HLP: promote once the first vault snapshot has landed.
+        if self.status.hlp_status == "connecting" and self.hlp.snapshots:
+            self.status.hlp_status = "connected"
 
     # ── Demo data generators ──────────────────────────────────────
 

@@ -90,7 +90,7 @@ That's it. An interactive menu lets you pick which dashboard to view:
 |---|---|
 | **Liquidation Watch** | BTC positions closest to liquidation on Hyperliquid. Tracks distance-to-liquidation in real time so you can see which whales are about to get wiped. |
 | **Liquidation Stream** | Multi-exchange liquidation feed from Hyperliquid, Binance, Bybit, and OKX, with size, price, and exchange. Coverage is honest, not a complete census: OKX/Bybit are real feeds (Bybit top-15 symbols), Binance's stream is throttled to ~1 liq/symbol/sec at the source, and Hyperliquid is *inferred* from large trades (flagged as estimated). See [docs/DATA_INTEGRITY.md](docs/DATA_INTEGRITY.md). |
-| **CVD Order Flow** | Cumulative Volume Delta for BTC — see whether buyers or sellers are in control. Tracks buy volume vs sell volume from Binance WebSocket trades. |
+| **CVD Order Flow** | Cumulative Volume Delta for BTC — see whether buyers or sellers are in control. Tracks buy volume vs sell volume from Hyperliquid **and** Binance Futures WebSocket trades, always shown with per-venue attribution (`CVD: +1.2M [HL +0.1M \| BN +1.1M]`). **Regional caveat:** Binance Futures streams are geo-blocked in some regions (e.g. the US, Singapore); there the socket connects but never delivers data. The terminal detects this and says so — the CVD reads `[HL … \| BN silent]`, the header badge shows ⚠ PARTIAL, and `/v1/health` reports `order_flow_binance: warn`. It never presents single-venue flow as two-venue flow. |
 | **Market Overview** | Funding rates, open interest, and prices for 50 assets across exchanges. Spot divergences and funding extremes at a glance. |
 | **Liquidation Heatmap** | Price-level visualization of where liquidations are concentrated. Red bars = long liquidation risk (price drops), green bars = short liquidation risk (price rises). Like Coinglass, but free and in your terminal. |
 | **Whale Tracker** | Largest open positions on Hyperliquid. See what the biggest players are doing — their size, entry price, PnL, and liquidation price. |
@@ -241,7 +241,7 @@ All data is fetched live from public exchange APIs. No keys required.
 | Source | Data | Connection |
 |---|---|---|
 | **Hyperliquid** | Positions, liquidations, funding, whale tracking | WebSocket + REST |
-| **Binance** | Trades, liquidations, orderbook | WebSocket |
+| **Binance** | Trades, liquidations (Futures streams — geo-blocked in some regions; reported as `silent`, never hidden) | WebSocket |
 | **Bybit** | Liquidations | WebSocket |
 | **OKX** | Liquidations | WebSocket |
 | **Deribit** | DVOL implied volatility | REST |

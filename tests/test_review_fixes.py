@@ -414,3 +414,367 @@ class TestC2LoopbackCORS:
             assert (await api.handle_ws(req)).status == 429
         finally:
             await client.close()
+
+
+# ── C3 / H2 / M11: a connected-but-silent venue must be visible everywhere ──
+
+def _isolated_hub(tmp_path, monkeypatch):
+    """A HyperDataHub whose SQLite files live in tmp_path (no network)."""
+    from src.data_layer import persistence
+    monkeypatch.setattr(persistence, "DB_PATH", tmp_path / "hub.db")
+    monkeypatch.setattr(address_store, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(address_store, "DB_PATH", tmp_path / "hub.db")
+    monkeypatch.setattr(address_store, "LEGACY_JSON", tmp_path / "legacy.json")
+    monkeypatch.setattr(address_store, "_initialized", False)
+    from src.data_layer.hub import HyperDataHub
+    return HyperDataHub()
+
+
+def _hl_trade_frame(tid: int = 1) -> dict:
+    return {"channel": "trades", "data": [
+        {"coin": "BTC", "px": "80000", "sz": "0.1", "side": "B", "time": 1700000000000, "tid": tid},
+    ]}
+
+
+def _silent_binance_engine(now: float):
+    """HL flowing; Binance connected 120s ago with ZERO frames — the live case."""
+    from src.data_layer.orderflow_engine import OrderFlowEngine
+    e = OrderFlowEngine(symbols=["BTC", "ETH", "SOL"])
+    e._venue_connected("hyperliquid")
+    e._handle_message(_hl_trade_frame())
+    e._venue_connected("binance")
+    e.venues["binance"].connected_at = now - 120
+    return e
+
+
+class TestC3VenueTruth:
+    def test_status_machine(self):
+        import time as _t
+
+        from src.data_layer.orderflow_engine import OrderFlowEngine
+        now = _t.time()
+        e = OrderFlowEngine(symbols=["BTC"])
+        assert e.venue_status("binance", now) == ("disconnected", "never connected")
+
+        e._venue_connected("binance")
+        assert e.venue_status("binance", now)[0] == "connecting"           # inside grace
+        e.venues["binance"].connected_at = now - 60
+        assert e.venue_status("binance", now)[0] == "silent"               # 0 frames, past grace
+        assert "0 frames" in e.venue_status("binance", now)[1]
+
+        e._handle_binance_trade({"data": {"s": "BTCUSDT", "p": "1", "q": "1", "m": False,
+                                          "T": 1700000000000, "a": 1}})
+        assert e.venue_status("binance", now)[0] == "ok"
+
+        e.venues["binance"].connected_at = now - 200                       # long-lived connection...
+        e.last_binance_message_at = now - 100                              # ...quiet, no frames either
+        e.venues["binance"].last_frame_at = now - 100
+        assert e.venue_status("binance", now)[0] == "stale"
+
+        e.venues["binance"].last_frame_at = now - 1                        # frames flow, no trades parse
+        assert e.venue_status("binance", now)[0] == "frozen"
+
+        e._venue_disconnected("binance")
+        assert e.venue_status("binance", now)[0] == "disconnected"
+
+    @pytest.mark.asyncio
+    async def test_hub_watchdog_warns_on_never_connected_silent_venue(self, tmp_path, monkeypatch, caplog):
+        """Pre-fix: the `venue_data_age(venue) != float('inf')` guard excluded
+        exactly the venue that never delivered a byte, so this warned never.
+        The status also read 'connected' (not 'partial')."""
+        import time as _t
+
+        hub = _isolated_hub(tmp_path, monkeypatch)
+        try:
+            hub.orderflow = _silent_binance_engine(_t.time())
+            hub.status.orderflow_engine = "connected"
+            with caplog.at_level("WARNING"):
+                await hub._update_feed_staleness()
+            assert hub.status.orderflow_engine == "partial"
+            assert "binance is silent" in caplog.text
+            assert "0 frames received" in caplog.text
+            assert "reflect hyperliquid" in caplog.text
+        finally:
+            hub.store.close()
+
+    def test_health_monitor_emits_per_venue_checks(self):
+        import time as _t
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        from src.data_layer.health_monitor import DataHealthMonitor
+        now = _t.time()
+        e = _silent_binance_engine(now)
+        hub = SimpleNamespace(
+            orderflow=e,
+            orderbook=MagicMock(is_stale=lambda: False, data_age=lambda: 1.0),
+            status=SimpleNamespace(last_market_refresh=now),
+            deribit=MagicMock(get_latest=lambda s: None),
+        )
+        checks = {c.name: c for c in DataHealthMonitor(hub)._check_freshness()}
+        assert checks["order_flow"].status == "pass"          # blended: HL is flowing
+        assert "hyperliquid" in checks["order_flow"].detail
+        assert checks["order_flow_hyperliquid"].status == "pass"
+        assert checks["order_flow_binance"].status == "warn"
+        assert checks["order_flow_binance"].detail.startswith("silent:")
+
+        # Everything dead -> the venue checks fail too, not just warn.
+        e.last_hl_message_at = now - 1000
+        e.venues["hyperliquid"].last_frame_at = now - 1000
+        checks = {c.name: c for c in DataHealthMonitor(hub)._check_freshness()}
+        assert checks["order_flow"].status == "fail"
+        assert checks["order_flow_hyperliquid"].status == "fail"
+        assert checks["order_flow_binance"].status == "fail"
+
+    @pytest.mark.asyncio
+    async def test_orderflow_endpoint_has_per_venue_cvd_and_coverage(self):
+        import time as _t
+        from unittest.mock import MagicMock
+
+        from aiohttp import web
+        from aiohttp.test_utils import TestClient, TestServer
+
+        from src.api_server import HyperDataAPI
+        e = _silent_binance_engine(_t.time())
+        hub = MagicMock()
+        hub.orderflow = e
+        api = HyperDataAPI(hub=hub)
+        app = web.Application()
+        app.router.add_get("/v1/orderflow/{symbol}", api.handle_orderflow)
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            body = await (await client.get("/v1/orderflow/BTC")).json()
+        finally:
+            await client.close()
+        assert body["cumulative_cvd"] == pytest.approx(8000.0)
+        assert body["cumulative_cvd_by_venue"] == {"hyperliquid": pytest.approx(8000.0), "binance": 0.0}
+        assert body["venue_coverage"] == {"hyperliquid": "ok", "binance": "silent"}
+        assert body["venues_contributing"] == ["hyperliquid"]
+
+    @pytest.mark.asyncio
+    async def test_health_endpoint_reports_silent_venue_without_bare_except(self):
+        """L7/C3: /v1/health must carry the per-venue truth, and a broken
+        venue_freshness() must raise rather than become `null`."""
+        import time as _t
+        from unittest.mock import MagicMock
+
+        from aiohttp import web
+        from aiohttp.test_utils import TestClient, TestServer
+
+        from src.api_server import HyperDataAPI
+        from src.data_layer.hub import HubStatus
+        hub = MagicMock()
+        hub.status = HubStatus(mode="live")
+        hub.orderflow = _silent_binance_engine(_t.time())
+        hub.health.latest.return_value = None
+        api = HyperDataAPI(hub=hub)
+        app = web.Application()
+        app.router.add_get("/v1/health", api.handle_health)
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            body = await (await client.get("/v1/health")).json()
+            venues = body["orderflow_venues"]
+            assert venues["binance"]["status"] == "silent"
+            assert venues["binance"]["frames"] == 0
+            assert venues["binance"]["connected"] is True
+            assert venues["hyperliquid"]["status"] == "ok"
+
+            hub.orderflow = MagicMock()
+            hub.orderflow.venue_freshness.side_effect = RuntimeError("boom")
+            assert (await client.get("/v1/health")).status == 500
+        finally:
+            await client.close()
+
+    def test_cvd_dashboard_price_bar_shows_venue_attribution(self):
+        import time as _t
+
+        from rich.console import Console
+
+        from src.dashboards.cvd_dashboard import CVDDashboard
+        e = _silent_binance_engine(_t.time())
+        dash = CVDDashboard(engine=e, symbol="BTC")
+        console = Console(record=True, width=200, force_terminal=False)
+        console.print(dash.build_price_bar())
+        text = console.export_text()
+        assert "CVD: +8,000" in text
+        assert "HL +8,000" in text
+        assert "BN silent" in text
+
+    def test_hub_cvd_panel_shows_venue_attribution(self):
+        import time as _t
+        from unittest.mock import MagicMock
+
+        from rich.console import Console
+
+        from src.dashboards.hub_panels import HubCVD
+        e = _silent_binance_engine(_t.time())
+        hub = MagicMock()
+        hub.orderflow = e
+        hub.market.assets = {}
+        hub.status.total_trades_processed = 1
+        console = Console(record=True, width=200, force_terminal=False)
+        console.print(HubCVD(hub).build_compact())
+        text = console.export_text()
+        assert "CVD:+8,000" in text
+        assert "BN silent" in text
+
+    def test_demo_engine_is_labelled_synthetic_not_attributed(self):
+        from rich.console import Console
+
+        from src.dashboards.cvd_dashboard import CVDDashboard
+        dash = CVDDashboard(demo=True, symbol="BTC")
+        assert dash.engine.synthetic is True
+        console = Console(record=True, width=200, force_terminal=False)
+        console.print(dash.build_price_bar())
+        assert "[DEMO]" in console.export_text()
+
+    def test_health_badge_warn_is_partial_not_live(self):
+        from unittest.mock import MagicMock
+
+        from src.dashboards.combined_dashboard import CombinedDashboard
+        dash = CombinedDashboard.__new__(CombinedDashboard)
+        dash.hub = MagicMock()
+        for overall, expected in (("ok", "LIVE"), ("warn", "PARTIAL"), ("stale", "STALE")):
+            dash.hub.health.latest.return_value = {"overall": overall}
+            label, _ = dash._health_badge()
+            assert expected in label, overall
+        assert "LIVE" not in dash._health_badge()[0] if dash.hub.health.latest.return_value else True
+
+    @pytest.mark.asyncio
+    async def test_binance_loop_logs_exception_detail(self, monkeypatch, caplog):
+        """Pre-fix: `except Exception: logger.warning("Error, reconnecting")`
+        carried no exception type or message."""
+        import asyncio
+
+        from src.data_layer import orderflow_engine as oe
+
+        class FakeSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            def ws_connect(self, *a, **kw):
+                raise RuntimeError("boom-451")
+
+        monkeypatch.setattr(oe.aiohttp, "ClientSession", FakeSession)
+        e = oe.OrderFlowEngine(symbols=["BTC"])
+        e._running = True
+        with caplog.at_level("WARNING"):
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(e._binance_trade_loop(), timeout=0.2)
+        assert "RuntimeError: boom-451" in caplog.text
+        assert e.venues["binance"].connected is False
+
+
+class TestH2FrameAccounting:
+    def _engine(self):
+        from src.data_layer.orderflow_engine import OrderFlowEngine
+        e = OrderFlowEngine(symbols=["BTC"])
+        e._venue_connected("binance")
+        return e
+
+    def test_ack_frames_count_as_frames_not_liveness(self):
+        """Pre-fix: frames without `data` returned before any bookkeeping, so
+        a stream of acks/error envelopes was indistinguishable from silence."""
+        e = self._engine()
+        e._handle_binance_trade({"result": None, "id": 1})
+        e._handle_binance_trade({"error": {"code": 2, "msg": "Invalid request"}})
+        st = e.venues["binance"]
+        assert st.frames == 2
+        assert st.trades == 0
+        assert st.last_frame_at > 0
+        assert e.last_binance_message_at == 0.0          # NOT stamped by an ack
+
+    def test_schema_change_is_counted_logged_and_never_stamps_liveness(self, caplog):
+        """Pre-fix: liveness was stamped BEFORE parsing and the parse error was
+        a bare `pass` — 'fresh but frozen' with zero log output."""
+        e = self._engine()
+        renamed = {"data": {"s": "BTCUSDT", "price": "80000", "q": "0.1", "m": False, "T": 1700000000000}}
+        with caplog.at_level("WARNING"):
+            for _ in range(5):
+                e._handle_binance_trade(renamed)
+        st = e.venues["binance"]
+        assert st.parse_errors == 5
+        assert st.trades == 0
+        assert e.last_binance_message_at == 0.0
+        assert "KeyError" in caplog.text and "parse errors so far" in caplog.text
+        assert caplog.text.count("failed to parse trade frame") == 1   # rate-limited
+
+        # Past the grace period, with frames still arriving but nothing parsing,
+        # this reads as 'frozen' with the count in the reason.
+        import time as _t
+        now = _t.time() + 60
+        e.venues["binance"].last_frame_at = now - 1
+        status, reason = e.venue_status("binance", now)
+        assert status == "frozen"
+        assert "5 parse errors" in reason
+        fresh = e.venue_freshness(now)["binance"]
+        assert fresh["parse_errors"] == 5 and fresh["frames"] == 5 and fresh["trades"] == 0
+
+    def test_hl_parse_errors_counted_too(self):
+        e = self._engine()
+        e._venue_connected("hyperliquid")
+        e._handle_message({"channel": "trades", "data": [{"coin": "BTC", "px": "bad", "sz": "1",
+                                                          "side": "B", "time": 1, "tid": 9}]})
+        assert e.venues["hyperliquid"].parse_errors == 1
+        assert e.last_hl_message_at == 0.0
+        e._handle_message(_hl_trade_frame(tid=10))
+        assert e.venues["hyperliquid"].trades == 1
+        assert e.last_hl_message_at > 0
+
+
+class TestM11ConnectingStatus:
+    @pytest.mark.asyncio
+    async def test_feeds_promote_from_connecting_on_first_data(self, tmp_path, monkeypatch):
+        """Pre-fix: on_ok set 'connected' the moment start() returned — before
+        any socket opened — and the watchdog only handled 'connected'/'stale'."""
+        import time as _t
+
+        hub = _isolated_hub(tmp_path, monkeypatch)
+        try:
+            s = hub.status
+            s.started_at = _t.time()   # hub just started: sockets still opening
+            s.orderflow_engine = s.orderbook_feed = s.liquidation_feed = s.hlp_status = "connecting"
+            await hub._update_feed_staleness()
+            # Nothing has arrived: everything stays 'connecting' (never 'connected').
+            assert s.orderflow_engine == "connecting"
+            assert s.orderbook_feed == "connecting"
+            assert s.liquidation_feed == "connecting"
+            assert s.hlp_status == "connecting"
+
+            e = hub.orderflow
+            e._venue_connected("hyperliquid")
+            e._venue_connected("binance")
+            e._handle_message(_hl_trade_frame())
+            e._handle_binance_trade({"data": {"s": "BTCUSDT", "p": "1", "q": "1", "m": False,
+                                              "T": 1700000000000, "a": 1}})
+            hub.orderbook.last_message_at = __import__("time").time()
+            s.last_liq_event = 1.0
+            hub.hlp.snapshots.append(object())
+            await hub._update_feed_staleness()
+            assert s.orderflow_engine == "connected"
+            assert s.orderbook_feed == "connected"
+            assert s.liquidation_feed == "connected"
+            assert s.hlp_status == "connected"
+        finally:
+            hub.store.close()
+
+    @pytest.mark.asyncio
+    async def test_never_any_trade_past_grace_is_stale_not_connected(self, tmp_path, monkeypatch):
+        import time as _t
+
+        hub = _isolated_hub(tmp_path, monkeypatch)
+        try:
+            e = hub.orderflow
+            for v in ("hyperliquid", "binance"):
+                e._venue_connected(v)
+                e.venues[v].connected_at = _t.time() - 120
+            hub.status.orderflow_engine = "connecting"
+            await hub._update_feed_staleness()
+            assert hub.status.orderflow_engine == "stale"
+        finally:
+            hub.store.close()

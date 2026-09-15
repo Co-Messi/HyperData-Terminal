@@ -57,6 +57,41 @@ SIGNAL_EMOJI: dict[str, str] = {
 # Timeframes to display (ordered short -> long).
 DISPLAY_TFS: list[str] = ["1m", "5m", "15m", "1h", "4h"]
 
+_VENUE_TAGS = (("hyperliquid", "HL"), ("binance", "BN"))
+
+
+def venue_cvd_text(engine: OrderFlowEngine, symbol: str, compact: bool = False) -> Text:
+    """Render cumulative CVD WITH per-venue attribution.
+
+    "CVD: +1,234,567 [HL +1,234,567 | BN silent]" — the combined figure is
+    never shown alone, so single-venue data can't masquerade as multi-venue.
+    A venue that is not contributing shows its status instead of a number.
+    Synthetic (demo) engines are labelled as such.
+    """
+    cvd = engine.get_cumulative_cvd(symbol)
+    combined = cvd["combined"]
+    text = Text()
+    sep = "" if compact else " "
+    text.append(f"CVD:{sep}{combined:+,.0f}", style="green" if combined >= 0 else "red")
+    if getattr(engine, "synthetic", False):
+        text.append(f"{sep}[DEMO]", style="dim")
+        return text
+    coverage = engine.venue_coverage()
+    text.append(f"{sep}[", style="dim")
+    for i, (venue, tag) in enumerate(_VENUE_TAGS):
+        if i:
+            text.append("|" if compact else " | ", style="dim")
+        status = coverage.get(venue, "disconnected")
+        if status == "ok":
+            val = cvd[venue]
+            text.append(f"{tag} {val:+,.0f}", style="green" if val >= 0 else "red")
+        elif status == "connecting":
+            text.append(f"{tag} {status}", style="yellow")
+        else:
+            text.append(f"{tag} {status}", style="bold bright_red")
+    text.append("]", style="dim")
+    return text
+
 
 # ---------------------------------------------------------------------------
 # CVDDashboard
@@ -84,6 +119,8 @@ class CVDDashboard:
         # Auto-create engine when demo mode and none provided.
         if self.demo and self.engine is None:
             self.engine = OrderFlowEngine(symbols=[self.symbol])
+        if self.demo and self.engine is not None:
+            self.engine.synthetic = True
 
         # If the engine exists, register a callback so we capture trades live.
         if self.engine is not None:
@@ -198,10 +235,8 @@ class CVDDashboard:
             if trades:
                 price = trades[-1].price
 
-        cvd_val = 0.0
         tps = 0.0
         if self.engine is not None:
-            cvd_val = self.engine.cumulative_cvd.get(sym, 0.0)
             tps = self.engine.get_trades_per_second(sym)
 
         bar = Text()
@@ -215,8 +250,11 @@ class CVDDashboard:
         bar.append(f"{pct_sign}{pct:.3f}%", style=pct_style)
         bar.append("  ")
 
-        cvd_style = "green" if cvd_val >= 0 else "red"
-        bar.append(f"CVD: {cvd_val:+,.0f}", style=cvd_style)
+        # Combined CVD with per-venue attribution \u2014 never the bare sum.
+        if self.engine is not None:
+            bar.append_text(venue_cvd_text(self.engine, sym))
+        else:
+            bar.append("CVD: ---", style="dim")
         bar.append("\n")
         bar.append(f"             {tps:.1f} trades/sec\n", style="dim")
         return bar
@@ -509,6 +547,7 @@ async def _main(live: bool = False) -> None:
             await engine.stop()
     else:
         # Demo mode — mock trades.
+        engine.synthetic = True
         mock_task = asyncio.create_task(generate_mock_trades(engine))
         try:
             await dashboard.run()
