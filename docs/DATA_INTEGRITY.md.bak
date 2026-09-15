@@ -24,29 +24,10 @@ false positives but misses smaller liquidations.
 
 ## Order flow / CVD
 
-- CVD is computed from **both** Hyperliquid and Binance Futures trades, and
-  every consumer shows the split: the CVD dashboard and the combined view
-  render `CVD: +X [HL +a | BN +b]`, and `GET /v1/orderflow/{symbol}` returns
-  `cumulative_cvd_by_venue` plus `venue_coverage` next to the combined
-  `cumulative_cvd`. "BTC CVD" is never an unexplained sum.
-- Each venue carries its own liveness state (`OrderFlowEngine.venue_freshness()`),
-  one of:
-
-  | status | meaning |
-  |---|---|
-  | `ok` | trades arriving within 30s |
-  | `connecting` | (re)connected under 30s ago, no trade yet |
-  | `silent` | socket open past the grace period, **zero frames received** — the handshake succeeded but the stream delivers nothing (Binance Futures is geo-blocked in some regions and behaves exactly like this) |
-  | `frozen` | frames still arriving but none parse into a trade for 30s (schema change); the per-venue `parse_errors` counter says why |
-  | `stale` | had trades, socket open, nothing for 30s |
-  | `disconnected` | socket not open (never connected, or between reconnects) |
-
-  A venue that is not `ok` shows its status in place of a number
-  (`[HL +a | BN silent]`), flips the hub's `orderflow_engine` feed status to
-  `partial`, produces an `order_flow_<venue>: warn` health check (fail only
-  when every venue is dead), and turns the header badge to **⚠ PARTIAL**.
-  Liveness is stamped only by a successfully **parsed trade** — subscription
-  acks and unparseable frames count as frames, not as data.
+- CVD is computed from **both** Hyperliquid and Binance trades. The combined
+  figure is the default, but per-venue series are available via
+  `OrderFlowEngine.get_cumulative_cvd(symbol)` → `{combined, hyperliquid, binance}`
+  so "BTC CVD" is never an unexplained sum.
 - Trades are de-duplicated per venue (HL `tid`, Binance aggTrade `id`) so a
   reconnect/resubscribe replay cannot double-count into the never-resetting
   cumulative CVD.
@@ -61,11 +42,7 @@ raises and reconnects instead of silently freezing. On top of that:
 - The orderbook engine force-reconnects a socket that is open but silent past
   2× the threshold; the hub does the same for the Hyperliquid trade socket.
 - `OrderBookSnapshot.stale` is recomputed at read time.
-- WebSocket-driven feeds report `connecting` until their first real message
-  arrives — a successful `start()` only creates tasks and is never shown as
-  `connected`.
-- The dashboard header badge reflects this: **✓ LIVE** / **⚠ PARTIAL** /
-  **⚠ STALE** / **⚠ DRIFT**.
+- The dashboard header badge reflects this: **✓ LIVE** / **⚠ STALE** / **⚠ DRIFT**.
 
 Liquidations are intentionally *not* aged out — they are sporadic, so a quiet
 market is not a broken feed.
@@ -81,9 +58,7 @@ only) and caches the result; the dashboard badge and `/v1/health` read it.
 | BTC price | Binance spot ticker | within 0.5% of hub |
 | BTC long/short ratio | Binance `globalLongShortAccountRatio` | within 20% (warn beyond) |
 | Deribit DVOL | hub | present |
-| Order flow freshness (blended) | engine `is_stale()` | some venue delivering trades |
-| Order flow freshness per venue | engine `venue_freshness()` | `ok` (warn if this venue is out, fail if all are) |
-| Orderbook freshness | engine `is_stale()` | not stale |
+| Order flow / orderbook freshness | engine `is_stale()` | not stale |
 | Market data freshness | hub refresh stamp | < 30s |
 | Funding/consistency | hub | sane bands, funding sign vs L/S agree |
 

@@ -12,7 +12,7 @@ import asyncio
 import logging
 import time
 from collections import OrderedDict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable
 
 import aiohttp
@@ -28,8 +28,40 @@ WS_URL = "wss://api.hyperliquid.xyz/ws"
 # letting frozen CVD/OFI numbers read as live.
 STALE_AFTER_SECONDS = 30.0
 
+# A freshly (re)connected venue gets this long to deliver its first frame
+# before it is reported as 'silent'. Same threshold as staleness on purpose:
+# a liquid venue that has not sent a single frame in 30s is not "warming up".
+CONNECT_GRACE_SECONDS = STALE_AFTER_SECONDS
+
+# Parse failures are counted per venue and logged at most this often, so a
+# schema change is visible without a warning per frame.
+PARSE_ERROR_LOG_INTERVAL = 60.0
+
+VENUES = ("hyperliquid", "binance")
+
 # Upper bound on remembered trade IDs per venue (oldest evicted first).
 MAX_SEEN_IDS = 100_000
+
+
+@dataclass
+class VenueState:
+    """Per-venue liveness bookkeeping.
+
+    Distinguishes the four ways a venue can be "not delivering": never
+    connected, connected-but-silent (the confirmed-live Binance regional
+    block: handshake succeeds, zero frames follow, forever), frames arriving
+    that no longer parse into trades (a schema change), and a venue that
+    had data and went quiet.
+    """
+    connected: bool = False
+    connected_at: float = 0.0       # last (re)connect wall-clock, 0 = never
+    disconnected_at: float = 0.0
+    connects: int = 0
+    frames: int = 0                 # any text frame, including acks/errors
+    last_frame_at: float = 0.0
+    trades: int = 0                 # frames that parsed into a Trade
+    parse_errors: int = 0
+    _last_parse_error_log_at: float = field(default=0.0, repr=False)
 
 TIMEFRAME_WINDOWS: dict[str, int] = {
     "1m": 60,
@@ -203,10 +235,17 @@ class OrderFlowEngine:
             s: deque(maxlen=100) for s in self.symbols
         }
 
-        # Wall-clock time of the last trade processed from each venue. Used by
-        # the staleness watchdog; 0.0 means "nothing received yet".
+        # Wall-clock time of the last PARSED TRADE from each venue (not the
+        # last frame — an ack or an unparseable frame must not read as
+        # liveness). 0.0 means "no trade received yet".
         self.last_hl_message_at: float = 0.0
         self.last_binance_message_at: float = 0.0
+        # Connection / frame / parse-error bookkeeping per venue.
+        self.venues: dict[str, VenueState] = {v: VenueState() for v in VENUES}
+        # Set by demo-mode callers that feed _process_trade() directly: the
+        # renderers then label the CVD as synthetic instead of pretending to
+        # know which venue it came from.
+        self.synthetic: bool = False
 
         self._callbacks: list[Callable[[Trade], None]] = []
         self._ws: aiohttp.ClientWebSocketResponse | None = None
@@ -242,21 +281,128 @@ class OrderFlowEngine:
     def venue_is_stale(self, venue: str, now: float | None = None) -> bool:
         return self.venue_data_age(venue, now) > STALE_AFTER_SECONDS
 
+    # -- venue liveness bookkeeping -------------------------------------------
+
+    def _venue_connected(self, venue: str) -> None:
+        st = self.venues[venue]
+        st.connected = True
+        st.connected_at = time.time()
+        st.connects += 1
+
+    def _venue_disconnected(self, venue: str) -> None:
+        st = self.venues[venue]
+        if st.connected:
+            st.disconnected_at = time.time()
+        st.connected = False
+
+    def _venue_frame(self, venue: str) -> None:
+        """Any inbound text frame — including subscription acks and error
+        envelopes — counts as a frame but NOT as a trade."""
+        st = self.venues[venue]
+        st.frames += 1
+        st.last_frame_at = time.time()
+
+    def _venue_trade(self, venue: str) -> None:
+        """A frame parsed into a Trade: this is the only thing that stamps
+        the per-venue liveness the staleness watchdog reads."""
+        now = time.time()
+        self.venues[venue].trades += 1
+        if venue == "hyperliquid":
+            self.last_hl_message_at = now
+        else:
+            self.last_binance_message_at = now
+
+    def _venue_parse_error(self, venue: str, exc: BaseException, payload) -> None:
+        st = self.venues[venue]
+        st.parse_errors += 1
+        now = time.time()
+        if now - st._last_parse_error_log_at >= PARSE_ERROR_LOG_INTERVAL:
+            st._last_parse_error_log_at = now
+            logger.warning(
+                "[%s] failed to parse trade frame (%d parse errors so far — a schema "
+                "change here freezes this venue's CVD): %s: %s | payload=%.300r",
+                venue, st.parse_errors, type(exc).__name__, exc, payload,
+            )
+
+    def venue_status(self, venue: str, now: float | None = None) -> tuple[str, str]:
+        """(status, reason) for one venue.
+
+        status is one of:
+          ok            trades arriving within STALE_AFTER_SECONDS
+          connecting    (re)connected < CONNECT_GRACE_SECONDS ago, no trade yet
+          silent        connected, past the grace period, ZERO frames received
+                        since this connection (regional block / dead stream)
+          frozen        frames still arriving but nothing has parsed into a
+                        trade for STALE_AFTER_SECONDS (schema change / acks only)
+          stale         had trades, socket open, nothing for STALE_AFTER_SECONDS
+          disconnected  socket not open (never connected, or between reconnects)
+        """
+        now = time.time() if now is None else now
+        st = self.venues[venue]
+        trade_age = self.venue_data_age(venue, now)
+        frame_age = float("inf") if st.last_frame_at <= 0 else now - st.last_frame_at
+
+        if not st.connected:
+            if st.connected_at <= 0:
+                return "disconnected", "never connected"
+            down_for = now - st.disconnected_at if st.disconnected_at > 0 else 0.0
+            return "disconnected", f"disconnected {down_for:.0f}s ago, reconnecting"
+
+        connected_for = now - st.connected_at
+        no_frame_this_connection = st.last_frame_at < st.connected_at
+        if connected_for < CONNECT_GRACE_SECONDS and (no_frame_this_connection or trade_age == float("inf")):
+            return "connecting", f"connected {connected_for:.0f}s ago, awaiting first trade"
+        if no_frame_this_connection:
+            return "silent", (
+                f"connected {connected_for:.0f}s ago, 0 frames received "
+                f"(handshake succeeded but the stream delivers nothing — regional block?)"
+            )
+        if trade_age > STALE_AFTER_SECONDS:
+            if frame_age <= STALE_AFTER_SECONDS:
+                last = "never" if trade_age == float("inf") else f"{trade_age:.0f}s ago"
+                return "frozen", (
+                    f"frames arriving ({st.frames} total) but last parsed trade {last}; "
+                    f"{st.parse_errors} parse errors"
+                )
+            return "stale", f"last trade {trade_age:.0f}s ago, no frames for {frame_age:.0f}s"
+        return "ok", f"last trade {trade_age:.1f}s ago"
+
     def venue_freshness(self, now: float | None = None) -> dict[str, dict]:
         """Per-venue freshness so a dead venue can't hide behind a live one.
 
         The combined is_stale() uses the freshest venue (intentional: the
-        blended CVD is still moving), but consumers of venue-specific data
-        need to know when THEIR venue went quiet.
+        blended CVD is still moving), so this is the ONLY place a
+        connected-but-silent venue is visible. Every consumer that presents
+        order-flow data as multi-venue (health monitor, /v1/health,
+        /v1/orderflow, both CVD renderers, the hub watchdog) reads it.
         """
+        now = time.time() if now is None else now
         out: dict[str, dict] = {}
-        for venue in ("hyperliquid", "binance"):
+        for venue in VENUES:
+            st = self.venues[venue]
             age = self.venue_data_age(venue, now)
+            status, reason = self.venue_status(venue, now)
             out[venue] = {
+                "status": status,
+                "reason": reason,
                 "data_age_seconds": None if age == float("inf") else round(age, 1),
                 "stale": age > STALE_AFTER_SECONDS,
+                "connected": st.connected,
+                "connected_for_seconds": round(now - st.connected_at, 1) if st.connected else None,
+                "connects": st.connects,
+                "frames": st.frames,
+                "trades": st.trades,
+                "parse_errors": st.parse_errors,
             }
         return out
+
+    def venue_coverage(self, now: float | None = None) -> dict[str, str]:
+        """{venue: status} — the short form renderers put next to a CVD number."""
+        return {v: self.venue_status(v, now)[0] for v in VENUES}
+
+    def contributing_venues(self, now: float | None = None) -> list[str]:
+        """Venues whose trades are currently flowing into the CVD/OFI figures."""
+        return [v for v, s in self.venue_coverage(now).items() if s == "ok"]
 
     async def start(self) -> None:
         """Open WebSocket(s), subscribe, and begin processing in background."""
@@ -452,6 +598,7 @@ class OrderFlowEngine:
             # heartbeat=20 so a half-open HL socket raises instead of silently
             # freezing the CVD buckets (the other venue/socket already does this).
             self._ws = await self._session.ws_connect(WS_URL, heartbeat=20)
+            self._venue_connected("hyperliquid")
             logger.info("WebSocket connected to %s", WS_URL)
 
             # Subscribe to trades for every symbol.
@@ -475,13 +622,21 @@ class OrderFlowEngine:
                 ):
                     break
         finally:
+            self._venue_disconnected("hyperliquid")
             if self._ws and not self._ws.closed:
                 await self._ws.close()
             if self._session and not self._session.closed:
                 await self._session.close()
 
     def _handle_message(self, data: dict) -> None:
-        """Parse a WebSocket JSON message and create Trade objects."""
+        """Parse a WebSocket JSON message and create Trade objects.
+
+        Every frame counts toward the venue's frame counter; only a frame
+        that parses into a Trade stamps liveness (see VenueState).
+        """
+        self._venue_frame("hyperliquid")
+        if not isinstance(data, dict):
+            return
         channel = data.get("channel")
         if channel != "trades":
             return
@@ -490,7 +645,6 @@ class OrderFlowEngine:
         if not trades_raw:
             return
 
-        self.last_hl_message_at = time.time()
         for t in trades_raw:
             try:
                 # Skip trades already seen (a resubscribe on reconnect can replay
@@ -517,8 +671,9 @@ class OrderFlowEngine:
                     size_usd=price * size,
                 )
                 self._process_trade(trade, venue="hyperliquid")
-            except (KeyError, ValueError, TypeError):
-                logger.exception("Failed to parse trade message: %s", t)
+                self._venue_trade("hyperliquid")
+            except (KeyError, ValueError, TypeError) as exc:
+                self._venue_parse_error("hyperliquid", exc, t)
 
     # -- Binance trade stream (adds 10x volume to CVD) ---------------------
 
@@ -545,11 +700,19 @@ class OrderFlowEngine:
 
         backoff = 1.0
         while self._running:
+            close_code = None
             try:
                 async with aiohttp.ClientSession() as session:
                     async with session.ws_connect(url, heartbeat=20) as ws:
                         backoff = 1.0
-                        logger.info("[binance-trades] Connected, streaming %d symbols", len(streams))
+                        self._venue_connected("binance")
+                        # A successful handshake is NOT liveness: in some
+                        # regions this socket connects and never delivers a
+                        # frame. venue_status() reports that as 'silent'.
+                        logger.info(
+                            "[binance-trades] Connected, streaming %d symbols "
+                            "(awaiting first frame)", len(streams),
+                        )
 
                         async for msg in ws:
                             if not self._running:
@@ -559,23 +722,42 @@ class OrderFlowEngine:
                                 self._handle_binance_trade(data)
                             elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                                 break
-
+                        close_code = ws.close_code
+                # A clean server-side close is normal churn, not an error —
+                # log it as such so the two are distinguishable.
+                if self._running:
+                    logger.info(
+                        "[binance-trades] stream closed by server (code %s), reconnecting in %.1fs",
+                        close_code, backoff,
+                    )
             except asyncio.CancelledError:
                 return
-            except Exception:
-                logger.warning("[binance-trades] Error, reconnecting in %.1fs", backoff)
+            except Exception as exc:
+                logger.warning(
+                    "[binance-trades] %s: %s — reconnecting in %.1fs",
+                    type(exc).__name__, exc, backoff,
+                )
+            finally:
+                self._venue_disconnected("binance")
 
             if self._running:
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60.0)
 
     def _handle_binance_trade(self, raw: dict) -> None:
-        """Parse a Binance aggTrade message and process it."""
-        data = raw.get("data")
+        """Parse a Binance aggTrade message and process it.
+
+        Frame accounting happens BEFORE the `data` guard so subscription
+        acks / error envelopes are counted (a stream of them is not silence),
+        and liveness is stamped only AFTER a successful parse so a schema
+        change shows up as 'frozen' with a parse-error count, not as a
+        healthy venue with a flat CVD.
+        """
+        self._venue_frame("binance")
+        data = raw.get("data") if isinstance(raw, dict) else None
         if not data:
             return
 
-        self.last_binance_message_at = time.time()
         try:
             binance_sym = data.get("s", "")
             symbol = self._BINANCE_SYMBOL_MAP.get(binance_sym)
@@ -611,8 +793,9 @@ class OrderFlowEngine:
                 size_usd=price * qty,
             )
             self._process_trade(trade, venue="binance")
-        except (KeyError, ValueError, TypeError):
-            pass  # Silently skip malformed messages
+            self._venue_trade("binance")
+        except (KeyError, ValueError, TypeError) as exc:
+            self._venue_parse_error("binance", exc, data)
 
     # -- add / remove symbols at runtime ------------------------------------
 

@@ -173,13 +173,29 @@ class DataHealthMonitor:
         hub = self.hub
         now = time.time()
 
-        # Order flow / orderbook delegate to the engines' staleness (W1).
+        # Order flow: the blended check fails only when EVERY venue is dead
+        # (the combined CVD follows the freshest venue). Then one check per
+        # venue, because "order_flow: pass" while Binance has never delivered
+        # a byte is exactly the half-truth this monitor exists to prevent.
         of_stale = hub.orderflow.is_stale()
+        contributing = hub.orderflow.contributing_venues()
         out.append(HealthCheck(
             "freshness", "order_flow",
             "fail" if of_stale else "pass",
-            f"{hub.orderflow.data_age():.0f}s since last trade",
+            f"{hub.orderflow.data_age():.0f}s since last trade; "
+            f"venues contributing: {', '.join(contributing) if contributing else 'none'}",
         ))
+        for venue, info in hub.orderflow.venue_freshness().items():
+            if info["status"] == "ok":
+                status = "pass"
+            elif of_stale:
+                status = "fail"      # nothing is flowing anywhere
+            else:
+                status = "warn"      # this venue is out; the other still feeds the CVD
+            out.append(HealthCheck(
+                "freshness", f"order_flow_{venue}", status,
+                f"{info['status']}: {info['reason']}",
+            ))
         ob_stale = hub.orderbook.is_stale()
         out.append(HealthCheck(
             "freshness", "orderbook",

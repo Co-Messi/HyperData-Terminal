@@ -50,8 +50,9 @@ class CombinedDashboard:
         """Map the data-health monitor's overall verdict to a header badge.
 
         Replaces the old hardcoded green 'LIVE' so the terminal never claims
-        live when a feed is frozen (STALE) or disagrees with reference data
-        (DRIFT).
+        live when a feed is frozen (STALE), disagrees with reference data
+        (DRIFT), or is only partially fed — e.g. one order-flow venue silent
+        (PARTIAL). 'warn' is not 'LIVE': something is missing.
         """
         monitor = getattr(self.hub, "health", None)
         result = monitor.latest() if monitor is not None else None
@@ -60,7 +61,7 @@ class CombinedDashboard:
         overall = result.get("overall")
         return {
             "ok":    ("✓ LIVE", "bold bright_green"),
-            "warn":  ("✓ LIVE", "bold bright_green"),
+            "warn":  ("⚠ PARTIAL", "bold yellow"),
             "stale": ("⚠ STALE", "bold bright_red"),
             "drift": ("⚠ DRIFT", "bold yellow"),
             "fail":  ("⚠ DEGRADED", "bold bright_red"),

@@ -169,7 +169,7 @@ class HubCVD:
         self.cycle = 0
 
     def build_compact(self) -> Panel:
-        from src.dashboards.cvd_dashboard import SIGNAL_STYLES
+        from src.dashboards.cvd_dashboard import SIGNAL_STYLES, venue_cvd_text
 
         engine = self.hub.orderflow
         tfs = ["1m", "5m", "15m", "1h", "4h"]
@@ -177,7 +177,6 @@ class HubCVD:
 
         info = Text()
         for sym in symbols:
-            cvd = engine.cumulative_cvd.get(sym, 0.0)
             tps = engine.get_trades_per_second(sym)
             agg = engine.get_multi_timeframe_signal(sym)
             agg_style = SIGNAL_STYLES.get(agg, "white")
@@ -188,7 +187,10 @@ class HubCVD:
             info.append(f" {sym}", style="bold bright_white")
             if price_val > 0:
                 info.append(f" ${price_val:,.2f}" if price_val >= 1 else f" ${price_val:.6f}", style="bright_white")
-            info.append(f" CVD:{cvd:+,.0f}", style="green" if cvd >= 0 else "red")
+            info.append(" ")
+            # Combined CVD with per-venue attribution (C3) — a silent venue
+            # is named here instead of hiding inside the sum.
+            info.append_text(venue_cvd_text(engine, sym, compact=True))
             info.append(f" {tps:.1f}t/s", style="dim")
             info.append(f" {agg}\n", style=agg_style)
 
@@ -420,12 +422,18 @@ class HubStatusPanel:
         for name, status, count in components:
             if status in ("connected", "demo", "ready"):
                 icon, style = "\U0001f7e2", "bright_green"
-            elif status == "reconnecting":
+            elif status in ("reconnecting", "connecting", "starting", "partial"):
+                # Yellow = not (yet) fully delivering: still connecting, or
+                # (order flow) one venue is missing.
                 icon, style = "\U0001f7e1", "yellow"
             else:
                 icon, style = "\U0001f534", "red"
             lines.append(f"  {icon} {name:<16}", style=style)
-            lines.append(f" {count:>8,}\n", style="bright_white")
+            lines.append(f" {count:>6,} ", style="bright_white")
+            if status not in ("connected", "demo", "ready"):
+                lines.append(f"{status}\n", style=style)
+            else:
+                lines.append("\n")
 
         lines.append("\n  ALERTS:\n", style="bold bright_cyan")
         lines.append(f"  Sent: {self.hub.alerts.alerts_sent}\n", style="bright_white")

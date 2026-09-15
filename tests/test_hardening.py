@@ -426,7 +426,10 @@ class TestHubDegradedStartup:
 
         assert hub.status.failed_components == ["liquidation_feed"]
         assert hub.status.liquidation_feed == "error"
-        assert hub.status.orderflow_engine == "connected"
+        # start() only creates tasks — no socket is open yet (M11).
+        assert hub.status.orderflow_engine == "connecting"
+        assert hub.status.orderbook_feed == "connecting"
+        assert hub.status.hlp_status == "connecting"
         # Loop-driven components are 'starting', never a blind 'ready'.
         assert hub.status.position_scanner == "starting"
         assert hub.status.market_data == "starting"
