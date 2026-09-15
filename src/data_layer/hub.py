@@ -122,9 +122,14 @@ class HubStatus:
     hlp_liquidation_absorptions: int = 0
     hlp_session_pnl: float = 0.0
 
-    # Persistence
+    # Persistence (refreshed every 30s from DataStore.get_db_stats)
     db_size_mb: float = 0.0
     events_persisted: int = 0
+    # Writes waiting for the writer thread, and writes dropped because the
+    # bounded queue was full (cumulative). Surfaced in /v1/health so a
+    # writer that is not keeping up is visible, not just logged.
+    write_queue_pending: int = 0
+    dropped_writes: int = 0
 
     # Funding rates
     funding_rate_symbols_binance: int = 0
@@ -630,6 +635,8 @@ class HyperDataHub:
                 self.status.events_persisted = (
                     db_stats["liquidations_stored"] + db_stats["trades_stored"]
                 )
+                self.status.write_queue_pending = db_stats["write_queue_pending"]
+                self.status.dropped_writes = db_stats["dropped_writes"]
             except Exception:
                 logger.exception("Error fetching DB stats")
             try:

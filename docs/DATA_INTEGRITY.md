@@ -136,8 +136,12 @@ installs SIGINT/SIGTERM handlers so `kill <pid>` shuts down cleanly.
 
 Writes never run on the event loop: feed callbacks enqueue rows for a
 dedicated writer thread (bounded queue; overflow is dropped and counted as
-`dropped_writes` in the DB stats), and reads drain the queue first so a
-query immediately after an event still sees it. The startup integrity check
+`dropped_writes`), and reads drain the queue first so a query immediately
+after an event still sees it. `/v1/health` → `persistence` carries
+`write_queue_pending` and `dropped_writes` (informational — they do not
+gate the top-level status). A drain that times out — a read about to miss
+rows, or a shutdown about to abandon queued writes — is logged at ERROR
+with the count, and `DataStore.flush()`/`close()` return `False`. The startup integrity check
 (`PRAGMA quick_check`) is fetched and acted on — anything but `ok` quarantines
 the file and starts fresh.
 
