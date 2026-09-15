@@ -577,20 +577,22 @@ class HyperDataHub:
 
         _db_tick += 1
         # Prune old rows + checkpoint the WAL roughly hourly so the DB and
-        # the COUNT(*) below stay bounded on long-running instances.
+        # the COUNT(*) below stay bounded on long-running instances. These
+        # are blocking full-table operations, so they run off the event loop
+        # (H6) — this loop is also the staleness watchdog and must not stall.
         if _db_tick % 3600 == 0:
             try:
-                self.store.prune()
+                await asyncio.to_thread(self.store.prune)
             except Exception:
                 logger.exception("Error pruning DB")
             try:
-                address_store.prune()
+                await asyncio.to_thread(address_store.prune)
             except Exception:
                 logger.exception("Error pruning address store")
         # Update persistence stats every 30 seconds
         if _db_tick % 30 == 0:
             try:
-                db_stats = self.store.get_db_stats()
+                db_stats = await asyncio.to_thread(self.store.get_db_stats)
                 self.status.db_size_mb = db_stats["db_size_mb"]
                 self.status.events_persisted = (
                     db_stats["liquidations_stored"] + db_stats["trades_stored"]
