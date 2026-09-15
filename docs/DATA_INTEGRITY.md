@@ -64,6 +64,13 @@ raises and reconnects instead of silently freezing. On top of that:
 - WebSocket-driven feeds report `connecting` until their first real message
   arrives — a successful `start()` only creates tasks and is never shown as
   `connected`.
+- The position scanner is bounded: each cycle re-fetches at most 150
+  addresses (round-robin) and serves the rest from a per-address cache whose
+  distance-to-liquidation is recomputed from fresh mids. Every position
+  carries `scanned_at`; `/v1/whales` and `/v1/positions/danger-zone` carry
+  `as_of`; `/v1/health` carries `position_scan.scan_age_seconds`. A scanner
+  that has not re-fetched a displayed position within 10 minutes reads
+  `stale` (feed status, health check, whales panel) — never `connected`.
 - The dashboard header badge reflects this: **✓ LIVE** / **⚠ PARTIAL** /
   **⚠ STALE** / **⚠ DRIFT**.
 
@@ -84,6 +91,7 @@ only) and caches the result; the dashboard badge and `/v1/health` read it.
 | Order flow freshness (blended) | engine `is_stale()` | some venue delivering trades |
 | Order flow freshness per venue | engine `venue_freshness()` | `ok` (warn if this venue is out, fail if all are) |
 | Orderbook freshness | engine `is_stale()` | not stale |
+| Position scanner freshness | scanner `is_stale()` | last cycle and every displayed position under 10 min old (warn before the first cycle) |
 | Market data freshness | hub refresh stamp | < 30s |
 | Funding/consistency | hub | sane bands, funding sign vs L/S agree |
 
@@ -104,6 +112,13 @@ SQLite runs in WAL mode and commits on a time interval
 uncatchable crash (SIGKILL/OOM) loses at most a few seconds of events. A graceful
 exit flushes via an `atexit` handler, and the headless server (`run_api.py`)
 installs SIGINT/SIGTERM handlers so `kill <pid>` shuts down cleanly.
+
+Writes never run on the event loop: feed callbacks enqueue rows for a
+dedicated writer thread (bounded queue; overflow is dropped and counted as
+`dropped_writes` in the DB stats), and reads drain the queue first so a
+query immediately after an event still sees it. The startup integrity check
+(`PRAGMA quick_check`) is fetched and acted on — anything but `ok` quarantines
+the file and starts fresh.
 
 Old rows are pruned hourly (`DataStore.prune`, default `RETENTION_DAYS=7`) and
 the WAL is checkpointed, so the DB stays bounded on long-running instances.
