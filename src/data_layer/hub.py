@@ -482,10 +482,12 @@ class HyperDataHub:
             except Exception:
                 logger.exception("Error stopping api_server (continuing shutdown)")
 
-        # Flush and close persistence
+        # Flush and close persistence. close() flushes; a False return
+        # means writes were lost (already logged at ERROR by the store) —
+        # repeat it here so the shutdown log line itself says so.
         try:
-            self.store.flush()
-            self.store.close()
+            if not self.store.close():
+                logger.error("HyperDataHub stopped with unflushed persistence writes (see DataStore errors above)")
         except Exception:
             logger.exception("Error closing persistence store")
 

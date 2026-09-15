@@ -218,12 +218,17 @@ class DataStore:
             self._conn.commit()
             self._last_commit_at = time.time()
 
-    def _drain(self, timeout: float = DRAIN_TIMEOUT_SECONDS) -> bool:
+    def _drain(self, timeout: float | None = None) -> bool:
         """Block until every write enqueued so far has been applied.
 
         Returns False if the writer did not catch up within `timeout` (or is
-        not running), logging the backlog so a wedged writer is visible.
+        not running). That is an ERROR, not a warning: every caller is a
+        read that will now miss rows, or flush()/close() about to let
+        those writes go — the only evidence is this line.
         """
+        # Read the module constant at call time (not as a default argument
+        # bound at definition) so tests and operators can tune it.
+        timeout = DRAIN_TIMEOUT_SECONDS if timeout is None else timeout
         writer = self._writer
         if writer is None:
             return True
@@ -236,13 +241,18 @@ class DataStore:
             while self._applied_seq < target:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0 or not writer.is_alive():
-                    logger.warning(
-                        "DataStore drain incomplete: %d writes still pending (writer alive=%s)",
-                        target - self._applied_seq, writer.is_alive(),
+                    logger.error(
+                        "DataStore drain incomplete after %.0fs: %d writes still pending "
+                        "(writer alive=%s)", timeout, target - self._applied_seq, writer.is_alive(),
                     )
                     return False
                 self._q_cond.wait(timeout=remaining)
         return True
+
+    def pending_writes(self) -> int:
+        """Writes enqueued but not yet applied by the writer thread."""
+        with self._q_cond:
+            return self._enqueued_seq - self._applied_seq
 
     @staticmethod
     def _check_integrity(conn: sqlite3.Connection) -> None:
@@ -577,25 +587,47 @@ class DataStore:
             except sqlite3.Error:
                 logger.exception("wal_checkpoint failed")
 
-    def flush(self) -> None:
-        """Apply every queued write and commit."""
-        self._drain()
+    def flush(self) -> bool:
+        """Apply every queued write and commit.
+
+        Returns False — after an ERROR log — if the writer did not drain
+        within DRAIN_TIMEOUT_SECONDS; the commit still happens for whatever
+        WAS applied. Pre-fix the drain result was discarded (S4).
+        """
+        drained = self._drain()
         with self._lock:
             self._conn.commit()
             self._last_commit_at = time.time()
+        return drained
 
-    def close(self) -> None:
-        """Flush, stop the writer thread, close the connection."""
-        self.flush()
+    def close(self) -> bool:
+        """Flush, stop the writer thread, close the connection.
+
+        Returns False if any write was lost: the drain timed out, or the
+        writer did not finish its backlog before the join timeout. The loss
+        is logged at ERROR with the count, because closing the connection
+        underneath a wedged writer discards everything still queued and
+        nothing else will ever say so.
+        """
+        drained = self.flush()
         writer = self._writer
         if writer is not None and writer.is_alive():
             with self._q_cond:
                 self._writer_stop = True
                 self._q_cond.notify_all()
             writer.join(timeout=DRAIN_TIMEOUT_SECONDS)
+        lost = self.pending_writes()
+        if writer is not None and writer.is_alive():
+            logger.error(
+                "DataStore writer thread did not stop within %.0fs; closing the connection "
+                "underneath it — %d queued writes lost", DRAIN_TIMEOUT_SECONDS, lost,
+            )
+        elif lost:
+            logger.error("DataStore closed with %d queued writes NOT persisted", lost)
         self._writer = None
         with self._lock:
             self._conn.close()
+        return drained and lost == 0
 
     # ── Query methods ────────────────────────────────────
 
