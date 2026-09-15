@@ -92,7 +92,7 @@ class TestBindGuard:
         monkeypatch.delenv("HYPERDATA_CORS_ORIGINS", raising=False)
         key, origins = _api(host="127.0.0.1")._resolve_security()
         assert key == ""
-        assert origins == set()  # no browser origin is granted by default (C2)
+        assert origins is None  # wildcard CORS allowed on loopback
 
     def test_public_bind_refused_without_key_or_ack(self, monkeypatch):
         monkeypatch.delenv("HYPERDATA_API_KEY", raising=False)

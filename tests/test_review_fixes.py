@@ -299,3 +299,118 @@ class TestC1Tiers:
         text = console.export_text()
         assert "CONF" in text
         assert text.count("42%") >= 9   # 5 smart + 3 dumb rows + the signal line
+
+
+# ── C2 / M7: no wildcard CORS on loopback, Host guard, one origin policy ──
+
+async def _loopback_client(monkeypatch, cors_env: str = ""):
+    """A test server wired exactly like HyperDataAPI.start() on 127.0.0.1."""
+    from unittest.mock import MagicMock
+
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from src.api_server import (
+        HyperDataAPI,
+        _make_cors_middleware,
+        _make_host_guard_middleware,
+        _make_rate_limit_middleware,
+    )
+    monkeypatch.delenv("HYPERDATA_API_KEY", raising=False)
+    monkeypatch.delenv("HYPERDATA_UNSAFE_PUBLIC_API", raising=False)
+    if cors_env:
+        monkeypatch.setenv("HYPERDATA_CORS_ORIGINS", cors_env)
+    else:
+        monkeypatch.delenv("HYPERDATA_CORS_ORIGINS", raising=False)
+    api = HyperDataAPI(hub=MagicMock(), host="127.0.0.1")
+    _, origins = api._resolve_security()
+    api._cors_origins = origins
+    app = web.Application(middlewares=[
+        _make_host_guard_middleware("127.0.0.1"),
+        _make_rate_limit_middleware(api._rate_limiter),
+        _make_cors_middleware(origins),
+    ])
+
+    async def whales(request):
+        return web.json_response({"positions": [{"address": "0xsecret"}]})
+
+    app.router.add_get("/v1/whales", whales)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    return api, client
+
+
+class TestC2LoopbackCORS:
+    @pytest.mark.asyncio
+    async def test_no_wildcard_and_no_grant_to_unlisted_origin(self, monkeypatch):
+        """Pre-fix: every loopback response carried Access-Control-Allow-Origin: *
+        so any web page could fetch() /v1/whales and read the addresses."""
+        _, client = await _loopback_client(monkeypatch)
+        try:
+            for headers in ({}, {"Origin": "https://evil.example"}):
+                resp = await client.get("/v1/whales", headers=headers)
+                assert resp.status == 200
+                assert "Access-Control-Allow-Origin" not in resp.headers, headers
+            pre = await client.options("/v1/whales", headers={"Origin": "https://evil.example"})
+            assert pre.headers.get("Access-Control-Allow-Origin") != "*"
+            assert "Access-Control-Allow-Origin" not in pre.headers
+        finally:
+            await client.close()
+
+    @pytest.mark.asyncio
+    async def test_allowlisted_origin_is_echoed_not_wildcarded(self, monkeypatch):
+        _, client = await _loopback_client(monkeypatch, cors_env="http://localhost:3000")
+        try:
+            ok = await client.get("/v1/whales", headers={"Origin": "http://localhost:3000"})
+            assert ok.headers.get("Access-Control-Allow-Origin") == "http://localhost:3000"
+            assert ok.headers.get("Vary") == "Origin"
+            bad = await client.get("/v1/whales", headers={"Origin": "https://evil.example"})
+            assert "Access-Control-Allow-Origin" not in bad.headers
+        finally:
+            await client.close()
+
+    @pytest.mark.asyncio
+    async def test_host_header_must_be_loopback(self, monkeypatch):
+        """DNS rebinding: evil.example resolving to 127.0.0.1 sends
+        `Host: evil.example`. Pre-fix there was no Host validation at all."""
+        _, client = await _loopback_client(monkeypatch)
+        try:
+            for good in ("127.0.0.1:8420", "localhost", "localhost:1", "[::1]:8420", "127.0.0.1"):
+                resp = await client.get("/v1/whales", headers={"Host": good})
+                assert resp.status == 200, good
+            for bad in ("evil.example", "evil.example:8420", "192.168.1.5:8420", "", "127.0.0.1.evil.example"):
+                resp = await client.get("/v1/whales", headers={"Host": bad})
+                assert resp.status == 403, bad
+        finally:
+            await client.close()
+
+    def test_host_guard_only_on_loopback_bind(self):
+        from src.api_server import _host_header_is_loopback, _make_host_guard_middleware
+        assert _make_host_guard_middleware("0.0.0.0") is None
+        assert _make_host_guard_middleware("127.0.0.1") is not None
+        assert _host_header_is_loopback("::1")
+        assert not _host_header_is_loopback("[::1")          # malformed
+        assert not _host_header_is_loopback("localhost.evil.example")
+
+    @pytest.mark.asyncio
+    async def test_m7_rest_and_ws_read_one_allowlist(self, monkeypatch):
+        """M7: REST CORS and the WebSocket Origin gate must agree. Pre-fix,
+        loopback REST was wildcard-open while WS rejected every origin."""
+        from unittest.mock import MagicMock
+
+        api, client = await _loopback_client(monkeypatch, cors_env="http://localhost:3000")
+        try:
+            allowed = {"Origin": "http://localhost:3000"}
+            denied = {"Origin": "https://evil.example"}
+            assert (await client.get("/v1/whales", headers=allowed)).headers.get(
+                "Access-Control-Allow-Origin") == "http://localhost:3000"
+            assert "Access-Control-Allow-Origin" not in (await client.get("/v1/whales", headers=denied)).headers
+
+            req = MagicMock()
+            req.headers = denied
+            assert (await api.handle_ws(req)).status == 403
+            api._ws_clients = [MagicMock()] * 100   # past the origin gate -> connection cap
+            req.headers = allowed
+            assert (await api.handle_ws(req)).status == 429
+        finally:
+            await client.close()

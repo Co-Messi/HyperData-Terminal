@@ -112,10 +112,14 @@ python run_api.py --port 8420
 > (`HYPERDATA_API_HOST=0.0.0.0`) is **refused** unless you either set
 > `HYPERDATA_API_KEY=<secret>` (all non-health routes then require
 > `Authorization: Bearer <secret>` or `X-API-Key`) or explicitly accept the
-> risk with `HYPERDATA_UNSAFE_PUBLIC_API=1`. Restrict browser access with
-> `HYPERDATA_CORS_ORIGINS=https://your-app.example` (wildcard CORS applies to
-> loopback binds only). Do not front this API with a public tunnel or reverse
-> proxy without auth and rate limiting of your own.
+> risk with `HYPERDATA_UNSAFE_PUBLIC_API=1`. Browsers get **no** cross-origin
+> access by default on any bind — loopback is not a boundary against a web
+> page you happen to have open, which could otherwise `fetch()` your tracked
+> wallets. To let a local web UI read the API (REST and WebSocket alike), set
+> `HYPERDATA_CORS_ORIGINS=http://localhost:3000`. On a loopback bind the
+> `Host` header must also be loopback (DNS-rebinding guard). Do not front
+> this API with a public tunnel or reverse proxy without auth and rate
+> limiting of your own.
 
 ### Endpoints
 

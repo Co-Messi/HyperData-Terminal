@@ -90,8 +90,10 @@ non-loopback bind (`HYPERDATA_API_HOST=0.0.0.0`) is refused at startup unless
 either `HYPERDATA_API_KEY` is set — all non-health routes then require
 `Authorization: Bearer <key>` or `X-API-Key: <key>` — or
 `HYPERDATA_UNSAFE_PUBLIC_API=1` explicitly acknowledges the exposure. CORS is
-wildcard only on loopback; non-loopback binds send CORS headers only for
-origins allowlisted in `HYPERDATA_CORS_ORIGINS` (comma-separated). REST
+never wildcard on any bind: browsers receive CORS headers (and may open the
+WebSocket) only for origins allowlisted in `HYPERDATA_CORS_ORIGINS`
+(comma-separated) — one allowlist drives both surfaces. On a loopback bind
+the `Host` header must itself be loopback (DNS-rebinding guard). REST
 requests are rate-limited per client IP, and WebSocket clients get bounded
 per-client send queues plus inbound message size/rate limits. Numeric query
 params are validated (bad values return `400`, not `500`).
