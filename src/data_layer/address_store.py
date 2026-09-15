@@ -33,13 +33,14 @@ LEGACY_JSON = DATA_DIR / "discovered_addresses.json"
 # payload is junk and must not be persisted (it would be re-scanned forever).
 _ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 
-# Retention cap: keep the most recently seen addresses. Derived from what the
-# position scanner can actually service — it scans SCAN_ADDRESS_BUDGET (150)
-# addresses per cycle at ~30s per cycle (15s of rate-limited requests + the
-# 15s scan_interval), i.e. ~300 addresses/minute. 3,000 addresses therefore
-# means every tracked position is re-scanned within ~10 minutes
-# (POSITION_STALE_AFTER_SECONDS). The old 50,000 cap implied an 83-minute
-# scan cycle that nothing reported. Enforced by prune(), not on every write.
+# Retention cap: keep the most recently seen addresses. The position scanner
+# re-fetches SCAN_ADDRESS_BUDGET (150) addresses per ~45s cycle (15 batches
+# of rate-limited requests plus the 15s scan_interval), so 3,000 addresses
+# is a ~17-minute worst-case full pass; position_scanner derives its
+# staleness threshold (POSITION_STALE_AFTER_SECONDS) from this cap, so the
+# two can never drift apart again. The old 50,000 cap implied an 83-minute
+# pass that nothing reported. Enforced by prune(), not on every write; the
+# hub re-syncs the scanner's in-memory set right after each prune.
 MAX_TRACKED_ADDRESSES = 3_000
 
 

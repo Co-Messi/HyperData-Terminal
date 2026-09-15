@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 import time as _time  # wall-clock stamps (time.monotonic is used for rate limiting)
 from dataclasses import dataclass, field
@@ -22,18 +23,90 @@ META_CACHE_TTL = 300  # 5 minutes
 # Per-cycle address budget (H4). scan() used to walk EVERY tracked address
 # at 10 req/s, so cycle time grew linearly with the store — 50k addresses
 # was an 83-minute cycle behind a 15s scan_interval, and nothing reported
-# it. Now each cycle scans at most this many addresses (15 batches ≈ 15s),
-# round-robin across cycles, and serves the rest from a per-address cache
-# whose distance-to-liquidation is recomputed from fresh prices every
-# cycle. Every position carries the time it was actually scanned.
+# it. Now each cycle scans at most this many addresses (15 batches of
+# RATE_LIMIT_PER_SEC), round-robin across cycles, and serves the rest from a
+# per-address cache whose distance-to-liquidation is recomputed from fresh
+# prices every cycle. Every position carries the time it was actually
+# scanned.
 SCAN_ADDRESS_BUDGET = 150
+
+# Seconds the hub sleeps between scan() cycles (HyperDataHub's default
+# scan_interval). Lives here because the staleness threshold below is
+# derived from it; a hub configured with a LONGER interval is told at
+# construction that the threshold no longer holds.
+SCAN_INTERVAL_SECONDS = 15.0
+
+# Sleep between batches of RATE_LIMIT_PER_SEC concurrent requests.
+BATCH_SLEEP_SECONDS = 1.0
+
+# Wall-clock allowance per batch for the exchange round-trip itself.
+# clearinghouseState answers ~0.3s per batch of 10 concurrent requests when
+# healthy; 1s absorbs a slow region without a healthy scanner ever reading
+# as stale. (A request that actually hangs is bounded by HTTP_TIMEOUT and
+# leaves the address's cached entry — and its older scanned_at — in place,
+# so a broken endpoint still surfaces as staleness, not as a slow cycle.)
+BATCH_LATENCY_ALLOWANCE_SECONDS = 1.0
+
+# Allowance per cycle for the allMids/meta refresh that precedes the batches.
+CYCLE_OVERHEAD_ALLOWANCE_SECONDS = 1.0
+
+# Address discovery: every DISCOVERY_INTERVAL_SECONDS scan() pulls recent
+# trades on DISCOVERY_SYMBOLS and adds up to DISCOVERY_LIMIT new addresses.
+DISCOVERY_INTERVAL_SECONDS = 1800.0
+DISCOVERY_LIMIT = 100
+DISCOVERY_SYMBOLS = ("BTC", "ETH", "SOL", "DOGE", "ARB", "SUI", "WIF", "PEPE")
+
+# The in-memory tracked set is re-synced from the store right after the hub
+# prunes the table (address_store.MAX_TRACKED_ADDRESSES, hourly). Between
+# prunes only discovery can grow it, so this is the most addresses a full
+# round-robin pass can ever have to cover. Before the re-sync existed the
+# set was loaded once and only ever grew — prune() trimmed the TABLE, the
+# scanner never noticed, and full-pass time was unbounded.
+ADDRESS_PRUNE_INTERVAL_SECONDS = 3600.0
+MAX_TRACKED_ADDRESSES_IN_MEMORY = address_store.MAX_TRACKED_ADDRESSES + (
+    int(ADDRESS_PRUNE_INTERVAL_SECONDS // DISCOVERY_INTERVAL_SECONDS) + 1
+) * DISCOVERY_LIMIT
+
+# Safety factor between the worst-case healthy full pass and "stale".
+STALE_MARGIN_FACTOR = 1.5
+
+
+def scan_cycle_seconds_worst_case(
+    budget: int = SCAN_ADDRESS_BUDGET, scan_interval: float = SCAN_INTERVAL_SECONDS,
+) -> float:
+    """Wall-clock seconds one hub scan cycle takes when every request is
+    answered within its latency allowance: the batches, the sleeps between
+    them, the price/meta refresh and the hub's idle interval."""
+    batches = -(-budget // RATE_LIMIT_PER_SEC)
+    return (
+        batches * BATCH_LATENCY_ALLOWANCE_SECONDS
+        + max(0, batches - 1) * BATCH_SLEEP_SECONDS
+        + CYCLE_OVERHEAD_ALLOWANCE_SECONDS
+        + scan_interval
+    )
+
+
+def full_pass_seconds_worst_case(
+    tracked: int = MAX_TRACKED_ADDRESSES_IN_MEMORY,
+    budget: int = SCAN_ADDRESS_BUDGET,
+    scan_interval: float = SCAN_INTERVAL_SECONDS,
+) -> float:
+    """Longest a healthy scanner can take to re-fetch EVERY tracked address
+    once: the cycles a round-robin pass over `tracked` needs, plus one
+    discovery run (a pass of this length always contains at most one)."""
+    cycles = -(-tracked // budget)
+    discovery = len(DISCOVERY_SYMBOLS) * BATCH_LATENCY_ALLOWANCE_SECONDS
+    return cycles * scan_cycle_seconds_worst_case(budget, scan_interval) + discovery
+
 
 # A position whose last real scan is older than this — or a scanner whose
 # last cycle finished longer ago than this — is stale: its size/entry/liq
 # may have changed and its distance is being extrapolated from cached
-# state. With SCAN_ADDRESS_BUDGET per ~30s cycle this bounds the tracked
-# set to ~3,000 addresses (address_store.MAX_TRACKED_ADDRESSES).
-POSITION_STALE_AFTER_SECONDS = 600.0
+# state. DERIVED from the worst-case healthy full pass with a safety margin,
+# never hand-tuned: the previous hardcoded 600s was 20s above the
+# zero-latency pass time, so any real install read "stale" forever.
+# tests/test_review_fixes.py::TestB1StalenessBudget pins the relationship.
+POSITION_STALE_AFTER_SECONDS = float(math.ceil(full_pass_seconds_worst_case() * STALE_MARGIN_FACTOR))
 
 # Explicit deadline on every request so a hung endpoint fails the scan cycle
 # instead of blocking the hub's position-scan loop indefinitely. Split
@@ -69,8 +142,11 @@ class PositionScanner:
     scan_budget: int = SCAN_ADDRESS_BUDGET
     # End of the last completed scan() cycle (0 = never).
     last_scan_at: float = 0.0
-    # When the round-robin cursor last wrapped, i.e. every tracked address
-    # had been visited at least once since the previous wrap (0 = never).
+    # When the round-robin cursor last wrapped (0 = never). Every address
+    # that was tracked for the WHOLE rotation has been visited since the
+    # previous wrap; one added or removed mid-rotation shifts the sorted
+    # order under the cursor, so it may have been skipped or visited twice.
+    # Per-position freshness is scanned_at, not this stamp.
     last_full_pass_at: float = 0.0
 
     _meta_updated_at: float = field(default=0.0, repr=False)
@@ -108,10 +184,11 @@ class PositionScanner:
                     if isinstance(res, BaseException):
                         logger.warning("[scanner] %s failed: %r", name, res)
 
-                # Discover new addresses: always on first run, then every 30 minutes
+                # Discover new addresses: always on first run, then every
+                # DISCOVERY_INTERVAL_SECONDS.
                 should_rediscover = (
                     not self.discovered_addresses
-                    or (_time.time() - getattr(self, '_last_discovery', 0)) > 1800
+                    or (_time.time() - getattr(self, '_last_discovery', 0)) > DISCOVERY_INTERVAL_SECONDS
                 )
                 if should_rediscover:
                     await self.discover_addresses()
@@ -149,7 +226,7 @@ class PositionScanner:
                             # silently reading as "no positions".
 
                         if batch_start + RATE_LIMIT_PER_SEC < len(slice_):
-                            await asyncio.sleep(1.0)
+                            await asyncio.sleep(BATCH_SLEEP_SECONDS)
 
                 self.positions = self._assemble_positions()
                 self.last_scan_at = _time.time()
@@ -213,17 +290,17 @@ class PositionScanner:
             "tracked_addresses": len(self.discovered_addresses),
             "scan_budget_per_cycle": self.scan_budget,
             "stale_after_seconds": POSITION_STALE_AFTER_SECONDS,
+            "full_pass_worst_case_seconds": full_pass_seconds_worst_case(),
             "stale": self.is_stale(now),
         }
 
     # ── Address discovery ────────────────────────────────────────
 
-    async def discover_addresses(self, limit: int = 100) -> set[str]:
+    async def discover_addresses(self, limit: int = DISCOVERY_LIMIT) -> set[str]:
         """Discover active trader addresses from recent trades on popular markets."""
-        symbols = ["BTC", "ETH", "SOL", "DOGE", "ARB", "SUI", "WIF", "PEPE"]
         new_addresses: set[str] = set()
 
-        for symbol in symbols:
+        for symbol in DISCOVERY_SYMBOLS:
             if len(new_addresses) >= limit:
                 break
             try:
@@ -434,6 +511,27 @@ class PositionScanner:
         construction, not be mistaken for "no addresses yet".
         """
         self.discovered_addresses = address_store.get_all_addresses()
+
+    async def resync_addresses(self) -> int:
+        """Make the in-memory tracked set match the store again.
+
+        The set is loaded once at construction and grows with discovery;
+        address_store.prune() trims the TABLE, so without this the scanner
+        kept scanning pruned addresses forever and full-pass time was
+        unbounded (B1). The hub calls this right after each prune. The read
+        runs off the event loop; anything discovered while it ran is kept
+        (it is in the store too). Returns how many addresses were dropped.
+        """
+        before = set(self.discovered_addresses)
+        in_store = await asyncio.to_thread(address_store.get_all_addresses)
+        discovered_meanwhile = self.discovered_addresses - before
+        self.discovered_addresses = in_store | discovered_meanwhile
+        dropped = len(before - self.discovered_addresses)
+        # scan() also does this each cycle; do it now so the very next
+        # freshness() reflects the pruned set.
+        for addr in [a for a in self._position_cache if a not in self.discovered_addresses]:
+            del self._position_cache[addr]
+        return dropped
 
     def add_addresses(self, addresses: list[str]):
         """Manually add addresses to track (validated + normalized)."""

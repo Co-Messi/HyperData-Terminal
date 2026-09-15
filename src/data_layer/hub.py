@@ -48,7 +48,12 @@ from src.data_layer.orderflow_engine import (
     Trade,
 )
 from src.data_layer.persistence import DataStore
-from src.data_layer.position_scanner import PositionScanner, TrackedPosition
+from src.data_layer.position_scanner import (
+    ADDRESS_PRUNE_INTERVAL_SECONDS,
+    SCAN_INTERVAL_SECONDS,
+    PositionScanner,
+    TrackedPosition,
+)
 from src.data_layer.smart_money import SmartMoneyEngine, SmartMoneySignal, WalletProfile
 from src.data_layer.spot_prices import SpotPriceCollector, SpotPriceSnapshot
 
@@ -57,6 +62,12 @@ logger = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 STATE_DIR = PROJECT_ROOT / "data"
 STATE_FILE = STATE_DIR / "hub_state.json"
+
+# The status loop ticks once a second; DB/address-store pruning runs on this
+# many ticks. The position scanner's staleness threshold is derived from
+# the address-store cap plus what discovery can add between prunes, so this
+# must stay equal to position_scanner.ADDRESS_PRUNE_INTERVAL_SECONDS.
+DB_PRUNE_INTERVAL_TICKS = int(ADDRESS_PRUNE_INTERVAL_SECONDS)
 
 
 @dataclass
@@ -142,7 +153,7 @@ class HyperDataHub:
         self,
         symbols: list[str] | None = None,
         demo: bool = False,
-        scan_interval: float = 15.0,
+        scan_interval: float = SCAN_INTERVAL_SECONDS,
         market_refresh_interval: float = 5.0,
         api_port: int | None = None,
     ) -> None:
@@ -151,6 +162,14 @@ class HyperDataHub:
         self._api_server: HyperDataAPI | None = None
         self.symbols = symbols or list(DEFAULT_SYMBOLS)
         self.scan_interval = scan_interval
+        if scan_interval > SCAN_INTERVAL_SECONDS:
+            # POSITION_STALE_AFTER_SECONDS is derived from the default
+            # interval; a slower cadence WILL trip it on a healthy scanner.
+            logger.warning(
+                "scan_interval=%.0fs exceeds the %.0fs the position-scan staleness "
+                "threshold is derived from — a healthy scanner may read 'stale'",
+                scan_interval, SCAN_INTERVAL_SECONDS,
+            )
         self.market_refresh_interval = market_refresh_interval
 
         # ── Core components ──────────────────────────────────────
@@ -580,13 +599,23 @@ class HyperDataHub:
         # the COUNT(*) below stay bounded on long-running instances. These
         # are blocking full-table operations, so they run off the event loop
         # (H6) — this loop is also the staleness watchdog and must not stall.
-        if _db_tick % 3600 == 0:
+        if _db_tick % DB_PRUNE_INTERVAL_TICKS == 0:
             try:
                 await asyncio.to_thread(self.store.prune)
             except Exception:
                 logger.exception("Error pruning DB")
             try:
                 await asyncio.to_thread(address_store.prune)
+                # prune() trims the TABLE; the scanner loaded its set once at
+                # construction and would otherwise keep every pruned address
+                # forever, making full-pass time — and therefore the staleness
+                # guarantee — unbounded (B1).
+                dropped = await self.positions.resync_addresses()
+                if dropped:
+                    logger.info(
+                        "[hub] position scanner dropped %d pruned addresses; %d tracked",
+                        dropped, len(self.positions.discovered_addresses),
+                    )
             except Exception:
                 logger.exception("Error pruning address store")
         # Update persistence stats every 30 seconds

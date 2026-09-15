@@ -1466,21 +1466,22 @@ class TestH4ScanBudget:
         assert s.positions == [pos]                      # not silently "no positions"
 
     def test_staleness_semantics(self, monkeypatch):
+        from src.data_layer.position_scanner import POSITION_STALE_AFTER_SECONDS as STALE
         s = _scanner(monkeypatch)
         assert s.is_stale() is False                     # never scanned = starting, not stale
-        now = 1000.0
+        now = 10_000.0
         p = _position("BTC")
         s.positions = [p]
         s.last_scan_at = now - 1
         p.scanned_at = now - 1
         assert s.is_stale(now) is False
-        p.scanned_at = now - 700                         # a displayed position fell behind
+        p.scanned_at = now - STALE - 100                 # a displayed position fell behind
         assert s.is_stale(now) is True
         p.scanned_at = now - 1
-        s.last_scan_at = now - 700                       # cycles stopped completing
+        s.last_scan_at = now - STALE - 100               # cycles stopped completing
         assert s.is_stale(now) is True
         f = s.freshness(now)
-        assert f["stale"] is True and f["scan_age_seconds"] == 700.0
+        assert f["stale"] is True and f["scan_age_seconds"] == STALE + 100
 
     @pytest.mark.asyncio
     async def test_api_exposes_scan_age_and_as_of(self, monkeypatch):
@@ -1528,10 +1529,12 @@ class TestH4ScanBudget:
         'connected' stayed on a scanner whose last result was an hour old."""
         import time as _t
 
+        from src.data_layer.position_scanner import POSITION_STALE_AFTER_SECONDS as STALE
+
         hub = _isolated_hub(tmp_path, monkeypatch)
         try:
             hub.status.position_scanner = "connected"
-            hub.positions.last_scan_at = _t.time() - 700
+            hub.positions.last_scan_at = _t.time() - STALE - 100
             await hub._update_feed_staleness()
             assert hub.status.position_scanner == "stale"
             hub.positions.last_scan_at = _t.time()
@@ -1547,6 +1550,7 @@ class TestH4ScanBudget:
 
         from src.data_layer.health_monitor import DataHealthMonitor
         from src.data_layer.orderflow_engine import OrderFlowEngine
+        from src.data_layer.position_scanner import POSITION_STALE_AFTER_SECONDS as STALE
         now = _t.time()
         s = _scanner(monkeypatch)
         hub = SimpleNamespace(
@@ -1557,7 +1561,7 @@ class TestH4ScanBudget:
         )
         checks = {c.name: c for c in DataHealthMonitor(hub)._check_freshness()}
         assert checks["position_scanner"].status == "warn"      # no scan yet
-        s.last_scan_at = now - 700
+        s.last_scan_at = now - STALE - 100
         checks = {c.name: c for c in DataHealthMonitor(hub)._check_freshness()}
         assert checks["position_scanner"].status == "fail"
         s.last_scan_at = now - 5
@@ -1565,11 +1569,101 @@ class TestH4ScanBudget:
         assert checks["position_scanner"].status == "pass"
 
     def test_retention_cap_is_scan_rate_derived(self):
-        """3,000 addresses at 150/cycle is 20 cycles ≈ 10 min — the stale
-        threshold. The old 50,000 cap implied an 83-minute cycle."""
-        from src.data_layer.position_scanner import POSITION_STALE_AFTER_SECONDS, SCAN_ADDRESS_BUDGET
-        cycles_to_cover = address_store.MAX_TRACKED_ADDRESSES / SCAN_ADDRESS_BUDGET
-        assert cycles_to_cover * 30 <= POSITION_STALE_AFTER_SECONDS   # ~30s per cycle
+        """The store cap must be coverable well inside the stale threshold
+        (the old 50,000 cap implied an 83-minute cycle). The exact
+        relationship is pinned by TestB1StalenessBudget."""
+        from src.data_layer.position_scanner import (
+            POSITION_STALE_AFTER_SECONDS,
+            full_pass_seconds_worst_case,
+        )
+        assert full_pass_seconds_worst_case(address_store.MAX_TRACKED_ADDRESSES) < POSITION_STALE_AFTER_SECONDS
+
+
+# ── B1: the staleness threshold must hold for the tracked set it bounds ──
+
+class TestB1StalenessBudget:
+    """Pre-fix: POSITION_STALE_AFTER_SECONDS was a hardcoded 600s while a
+    full pass over the 3,000-address cap took >=580s at ZERO latency (150
+    addresses/cycle, 14s of batch sleeps + the 15s scan_interval), so any
+    real install tripped 'stale' — and /v1/health 'degraded' — forever.
+    Worse, the scanner's in-memory set was loaded once and only ever grew;
+    address_store.prune() trimmed the table but never the set, so the pass
+    time was not even bounded by the cap."""
+
+    def test_worst_case_full_pass_is_comfortably_under_the_stale_threshold(self):
+        from src.data_layer import position_scanner as ps
+        # The relationship the threshold is derived from...
+        assert ps.full_pass_seconds_worst_case() * ps.STALE_MARGIN_FACTOR <= ps.POSITION_STALE_AFTER_SECONDS
+        assert ps.STALE_MARGIN_FACTOR >= 1.5
+        # ...and the reviewer's independent zero-latency arithmetic for the
+        # store cap alone (20 cycles x (14s sleeps + 15s interval) = 580s),
+        # which the old 600s threshold cleared by 20 seconds.
+        cycles = -(-address_store.MAX_TRACKED_ADDRESSES // ps.SCAN_ADDRESS_BUDGET)
+        batches = -(-ps.SCAN_ADDRESS_BUDGET // ps.RATE_LIMIT_PER_SEC)
+        zero_latency_pass = cycles * ((batches - 1) * ps.BATCH_SLEEP_SECONDS + ps.SCAN_INTERVAL_SECONDS)
+        assert zero_latency_pass * 1.5 <= ps.POSITION_STALE_AFTER_SECONDS
+        # The in-memory bound covers the store cap plus what discovery can
+        # add between prunes; the derivation uses THAT, not the store cap.
+        assert ps.MAX_TRACKED_ADDRESSES_IN_MEMORY >= address_store.MAX_TRACKED_ADDRESSES + ps.DISCOVERY_LIMIT
+        assert ps.full_pass_seconds_worst_case() > ps.full_pass_seconds_worst_case(address_store.MAX_TRACKED_ADDRESSES)
+
+    def test_hub_default_interval_and_prune_cadence_match_the_derivation(self):
+        import inspect
+
+        from src.data_layer import hub as hub_mod
+        from src.data_layer import position_scanner as ps
+        sig = inspect.signature(hub_mod.HyperDataHub.__init__)
+        assert sig.parameters["scan_interval"].default == ps.SCAN_INTERVAL_SECONDS
+        assert hub_mod.DB_PRUNE_INTERVAL_TICKS == ps.ADDRESS_PRUNE_INTERVAL_SECONDS
+        assert "% DB_PRUNE_INTERVAL_TICKS == 0" in inspect.getsource(hub_mod.HyperDataHub._status_update_tick)
+
+    @pytest.mark.asyncio
+    async def test_resync_drops_pruned_addresses_and_keeps_new_discoveries(self, isolated_address_store, monkeypatch):
+        from src.data_layer.position_scanner import PositionScanner
+        addrs = [_addr(f"{i}{i}{i}") for i in range(5)]
+        for a in addrs:
+            address_store.add_addresses([a], source="test")
+        s = PositionScanner()
+        assert s.discovered_addresses == set(addrs)
+        s._position_cache = {a: [] for a in addrs}
+
+        monkeypatch.setattr(address_store, "MAX_TRACKED_ADDRESSES", 3)
+        assert address_store.prune() == 2
+        # Pre-fix there was no way to notice: the set stayed at 5 forever.
+        assert len(s.discovered_addresses) == 5
+
+        # Something discovered while the (off-loop) read is in flight must
+        # survive the re-sync — it is in the store too.
+        late = _addr("fff")
+        real_read = address_store.get_all_addresses
+
+        def read_then_discover():
+            got = real_read()
+            s.discovered_addresses.add(late)
+            return got
+
+        monkeypatch.setattr(address_store, "get_all_addresses", read_then_discover)
+        dropped = await s.resync_addresses()
+        assert dropped == 2
+        assert s.discovered_addresses == set(addrs[2:]) | {late}
+        assert set(s._position_cache) == set(addrs[2:])
+        assert len(s.discovered_addresses) <= address_store.MAX_TRACKED_ADDRESSES + 1
+
+    @pytest.mark.asyncio
+    async def test_hub_resyncs_the_scanner_after_the_hourly_prune(self, tmp_path, monkeypatch):
+        from src.data_layer import hub as hub_mod
+        addrs = [_addr(f"{i}{i}{i}") for i in range(5)]
+        hub = _isolated_hub(tmp_path, monkeypatch)
+        try:
+            for a in addrs:
+                address_store.add_addresses([a], source="test")
+            hub.positions.discovered_addresses = set(addrs)
+            monkeypatch.setattr(address_store, "MAX_TRACKED_ADDRESSES", 3)
+            await hub._status_update_tick(hub_mod.DB_PRUNE_INTERVAL_TICKS - 1)   # the prune tick
+            assert len(address_store.get_all_addresses()) == 3
+            assert hub.positions.discovered_addresses == set(addrs[2:])
+        finally:
+            hub.store.close()
 
 
 # ── H6: SQLite writes off the event loop ─────────────────────────
