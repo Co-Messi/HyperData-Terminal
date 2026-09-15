@@ -63,7 +63,10 @@ class WalletProfile:
     # Risk-adjusted per-trade RETURN ratio (mean/std of closedPnl/notional,
     # shrunk toward 0 on small samples). NOT an annualised Sharpe ratio —
     # no time basis, no risk-free rate. The field keeps its historical name
-    # because it is a persisted DB column.
+    # for the in-memory consumers (dashboards, demo generator); it is NOT
+    # persisted — profiles are recomputed from fills every session — so the
+    # change from a dollar-based ratio to this one left no stale rows
+    # anywhere (the dead `wallets` table was dropped in DataStore v4).
     sharpe_ratio: float = 0.0
     composite_score: float = 0.0    # final weighted score, ordinal only
     confidence: float = 0.0         # 0-1 sample-size confidence (see _compute_confidence)
