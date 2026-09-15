@@ -1570,3 +1570,111 @@ class TestH4ScanBudget:
         from src.data_layer.position_scanner import POSITION_STALE_AFTER_SECONDS, SCAN_ADDRESS_BUDGET
         cycles_to_cover = address_store.MAX_TRACKED_ADDRESSES / SCAN_ADDRESS_BUDGET
         assert cycles_to_cover * 30 <= POSITION_STALE_AFTER_SECONDS   # ~30s per cycle
+
+
+# ── H6: SQLite writes off the event loop ─────────────────────────
+
+class _Liq:
+    def __init__(self, i: int = 0):
+        import time as _t
+        self.timestamp = _t.time()
+        self.exchange = "binance"
+        self.symbol = "BTC"
+        self.side = "long"
+        self.size_usd = float(i)
+        self.price = 1.0
+        self.quantity = 1.0
+        self.confirmed = True
+
+
+class TestH6WriterThread:
+    def test_insert_callbacks_never_touch_sqlite_on_the_caller_thread(self, tmp_path):
+        """Pre-fix: _save_trade/_save_liquidation ran a blocking INSERT under
+        a threading.Lock inside the WebSocket read path on the event loop."""
+        import threading
+        from types import SimpleNamespace
+
+        store = DataStore(tmp_path / "w.db")
+        try:
+            real_conn = store._conn
+            idents: list[int] = []
+
+            class _Spy:
+                def execute(self, *a, **kw):
+                    idents.append(threading.get_ident())
+                    return real_conn.execute(*a, **kw)
+
+                def __getattr__(self, name):
+                    return getattr(real_conn, name)
+
+            store._conn = _Spy()
+            for i in range(20):
+                store._save_liquidation(_Liq(i))
+                store._save_trade(SimpleNamespace(timestamp=1.0, symbol="BTC", side="buy",
+                                                  price=1.0, size=1.0, size_usd=1.0))
+            store.save_funding_rate(SimpleNamespace(timestamp=1.0, exchange="binance", symbol="BTC",
+                                                    funding_rate_hourly=0.0, funding_rate_annualized=0.0))
+            store.flush()
+            assert idents, "nothing was written"
+            assert threading.get_ident() not in idents          # all INSERTs ran on the writer
+            assert store._writer is not None and store._writer.is_alive()
+            assert store._writer.name == "datastore-writer"
+        finally:
+            store.close()
+
+    def test_reads_drain_the_queue_first(self, tmp_path):
+        store = DataStore(tmp_path / "r.db")
+        try:
+            for i in range(7):
+                store._save_liquidation(_Liq(i))
+            # No explicit flush: the read must still see everything queued.
+            assert store.get_liquidation_stats(hours=1)["total_count"] == 7
+            assert store.get_db_stats()["liquidations_stored"] == 7
+            assert store.get_db_stats()["write_queue_pending"] == 0
+        finally:
+            store.close()
+
+    def test_queue_is_bounded_and_drops_are_counted(self, tmp_path, monkeypatch, caplog):
+        from src.data_layer import persistence
+        monkeypatch.setattr(persistence, "WRITE_QUEUE_MAX", 5)
+        store = DataStore(tmp_path / "q.db")
+        try:
+            # Park the writer: it pops the first item, then blocks on the
+            # connection lock held here; everything else piles up in the queue.
+            with store._lock:
+                store._save_liquidation(_Liq(0))
+                import time as _t
+                deadline = _t.time() + 2
+                while store._applied_seq == 0 and store._write_q and _t.time() < deadline:
+                    _t.sleep(0.005)   # let the writer take the first batch
+                with caplog.at_level("WARNING"):
+                    for i in range(1, 10):
+                        store._save_liquidation(_Liq(i))
+            store.flush()
+            assert store.dropped_writes == 4                       # 1 in flight + 5 queued + 4 dropped
+            assert store.get_db_stats()["dropped_writes"] == 4
+            assert store.get_db_stats()["liquidations_stored"] == 6
+            assert "write queue full" in caplog.text
+        finally:
+            store.close()
+
+    def test_close_stops_writer_and_persists_everything(self, tmp_path):
+        path = tmp_path / "c.db"
+        store = DataStore(path)
+        for i in range(30):
+            store._save_liquidation(_Liq(i))
+        writer = store._writer
+        store.close()
+        assert not writer.is_alive()
+        ro = sqlite3.connect(str(path))
+        assert ro.execute("SELECT COUNT(*) FROM liquidations").fetchone()[0] == 30
+        ro.close()
+
+    def test_hub_runs_blocking_db_work_off_the_loop(self):
+        import inspect
+
+        from src.data_layer.hub import HyperDataHub
+        src = inspect.getsource(HyperDataHub._status_update_tick)
+        assert "asyncio.to_thread(self.store.get_db_stats)" in src
+        assert "asyncio.to_thread(self.store.prune)" in src
+        assert "asyncio.to_thread(address_store.prune)" in src

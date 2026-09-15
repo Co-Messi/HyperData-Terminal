@@ -18,6 +18,7 @@ import shutil
 import sqlite3
 import threading
 import time
+from collections import deque
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -34,8 +35,32 @@ COMMIT_INTERVAL_SECONDS = 5.0
 # COUNT(*) on the status loop) bounded on long-running instances. 0 disables.
 RETENTION_DAYS = 7.0
 
+# Upper bound on INSERTs waiting for the writer thread (H6). At full
+# Binance+HL trade rates with 1-in-2 sampling this is well over a minute
+# of backlog; beyond it new events are dropped and COUNTED (dropped_writes
+# in get_db_stats) rather than allowed to grow memory without bound.
+WRITE_QUEUE_MAX = 50_000
+
+# How long flush()/close()/reads wait for the writer to catch up.
+DRAIN_TIMEOUT_SECONDS = 10.0
+
 
 class DataStore:
+    """SQLite event store with a dedicated writer thread.
+
+    Every INSERT path (hub callbacks for trades/liquidations/signals/HLP
+    trades, plus the periodic funding/LSR/IV/HLP snapshot saves) ENQUEUES
+    a (sql, params) pair and returns immediately; a single daemon thread
+    drains the queue in batches, executes under the connection lock and
+    commits on the usual 50-event / COMMIT_INTERVAL cadence. Before H6 the
+    trade callback ran a blocking INSERT on the asyncio event loop inside
+    the WebSocket read path — thousands of synchronous disk writes per
+    second on the thread running every feed, the API and the heartbeat.
+
+    Readers (get_*, flush, close, prune) drain the queue first so a read
+    immediately after a write still sees it.
+    """
+
     def __init__(self, db_path: str | Path = DB_PATH):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -45,7 +70,18 @@ class DataStore:
         # _event_count (which is bumped by 6 unrelated event types), or the
         # "1-in-N" sample becomes biased and get_trade_summary's xN rescale wrong.
         self._trade_count = 0
+        self._sample_lock = threading.Lock()
         self._last_commit_at = 0.0
+
+        # Writer queue state (see class docstring). Sequence numbers let
+        # _drain() wait for exactly the writes enqueued before it was called.
+        self._write_q: deque[tuple[str, tuple]] = deque()
+        self._q_cond = threading.Condition()
+        self._enqueued_seq = 0
+        self._applied_seq = 0
+        self.dropped_writes = 0
+        self._writer_stop = False
+        self._writer: threading.Thread | None = None
 
         # Use a local handle so the corruption-recovery path can close a
         # half-opened connection without assuming self._conn was ever assigned.
@@ -108,10 +144,94 @@ class DataStore:
                 self._conn = sqlite3.connect(":memory:", check_same_thread=False)
                 self._init_tables()
 
+        self._writer = threading.Thread(
+            target=self._writer_loop, name="datastore-writer", daemon=True,
+        )
+        self._writer.start()
+
         # Safety net for graceful exits (normal return, unhandled exception,
         # Ctrl-C → KeyboardInterrupt unwinds to interpreter exit). The
         # time-based commit above covers uncatchable kills.
         atexit.register(self._atexit_flush)
+
+    # ── Writer thread ────────────────────────────────────────
+
+    def _enqueue(self, sql: str, params: tuple) -> bool:
+        """Queue one INSERT for the writer thread. Never blocks the caller;
+        returns False (and counts) when the queue is full."""
+        with self._q_cond:
+            if len(self._write_q) >= WRITE_QUEUE_MAX:
+                self.dropped_writes += 1
+                if self.dropped_writes % 1000 == 1:
+                    logger.warning(
+                        "DataStore write queue full (%d) — %d events dropped so far; "
+                        "the writer thread is not keeping up with the feeds",
+                        WRITE_QUEUE_MAX, self.dropped_writes,
+                    )
+                return False
+            self._write_q.append((sql, params))
+            self._enqueued_seq += 1
+            self._q_cond.notify()
+        return True
+
+    def _writer_loop(self) -> None:
+        while True:
+            with self._q_cond:
+                while not self._write_q and not self._writer_stop:
+                    self._q_cond.wait(timeout=COMMIT_INTERVAL_SECONDS)
+                if not self._write_q and self._writer_stop:
+                    return
+                batch = list(self._write_q)
+                self._write_q.clear()
+            try:
+                self._apply(batch)
+            except Exception:
+                # Never let the writer die: a dead writer means every later
+                # event silently queues until the cap and is then dropped.
+                logger.exception("DataStore writer batch failed (%d writes)", len(batch))
+            finally:
+                with self._q_cond:
+                    self._applied_seq += len(batch)
+                    self._q_cond.notify_all()
+
+    def _apply(self, batch: list[tuple[str, tuple]]) -> None:
+        with self._lock:
+            for sql, params in batch:
+                try:
+                    self._conn.execute(sql, params)
+                    self._event_count += 1
+                except sqlite3.Error:
+                    logger.exception("DataStore write failed: %s", sql[:60])
+            # Time-based commit also fires on the periodic empty wake-up so a
+            # trickle of events is never left uncommitted past the interval.
+            if batch or self._conn.in_transaction:
+                self._maybe_commit()
+
+    def _drain(self, timeout: float = DRAIN_TIMEOUT_SECONDS) -> bool:
+        """Block until every write enqueued so far has been applied.
+
+        Returns False if the writer did not catch up within `timeout` (or is
+        not running), logging the backlog so a wedged writer is visible.
+        """
+        writer = self._writer
+        if writer is None:
+            return True
+        if threading.current_thread() is writer:
+            return True  # called from inside _apply(): nothing to wait for
+        with self._q_cond:
+            target = self._enqueued_seq
+            self._q_cond.notify_all()
+            deadline = time.monotonic() + timeout
+            while self._applied_seq < target:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not writer.is_alive():
+                    logger.warning(
+                        "DataStore drain incomplete: %d writes still pending (writer alive=%s)",
+                        target - self._applied_seq, writer.is_alive(),
+                    )
+                    return False
+                self._q_cond.wait(timeout=remaining)
+        return True
 
     @staticmethod
     def _check_integrity(conn: sqlite3.Connection) -> None:
@@ -399,42 +519,37 @@ class DataStore:
             self._hlp_hub = hub
 
     def _save_liquidation(self, event) -> None:
-        """Callback: save a liquidation event."""
-        with self._lock:
-            self._conn.execute(
-                "INSERT INTO liquidations (timestamp, exchange, symbol, side, size_usd, "
-                "price, quantity, confirmed, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (event.timestamp, event.exchange, event.symbol, event.side,
-                 event.size_usd, event.price, event.quantity,
-                 1 if getattr(event, 'confirmed', True) else 0,
-                 time.time())
-            )
-            self._event_count += 1
-            # Batch commit every 50 events for performance
-            self._maybe_commit()
+        """Callback: queue a liquidation event for the writer thread."""
+        self._enqueue(
+            "INSERT INTO liquidations (timestamp, exchange, symbol, side, size_usd, "
+            "price, quantity, confirmed, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (event.timestamp, event.exchange, event.symbol, event.side,
+             event.size_usd, event.price, event.quantity,
+             1 if getattr(event, 'confirmed', True) else 0,
+             time.time()),
+        )
 
     TRADE_SAMPLE_RATE = 2  # keep 1 in N trades
 
     def _save_trade(self, trade) -> None:
-        """Callback: persist 1 in TRADE_SAMPLE_RATE trades.
+        """Callback: queue 1 in TRADE_SAMPLE_RATE trades for the writer thread.
 
         Sampling is keyed on a dedicated trade counter (not the shared
         _event_count), so every Nth *trade* is kept regardless of other event
-        streams — making get_trade_summary's xN rescale unbiased. All counter
-        mutation happens under the lock.
+        streams — making get_trade_summary's xN rescale unbiased. This runs
+        on the WebSocket read path: no disk I/O happens here.
         """
-        with self._lock:
+        with self._sample_lock:
             self._trade_count += 1
-            if self._trade_count % self.TRADE_SAMPLE_RATE != 0:
-                return
-            self._conn.execute(
-                "INSERT INTO trades (timestamp, symbol, side, price, size, size_usd, "
-                "created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (trade.timestamp, trade.symbol, trade.side, trade.price,
-                 trade.size, trade.size_usd, time.time())
-            )
-            self._event_count += 1
-            self._maybe_commit()
+            keep = self._trade_count % self.TRADE_SAMPLE_RATE == 0
+        if not keep:
+            return
+        self._enqueue(
+            "INSERT INTO trades (timestamp, symbol, side, price, size, size_usd, "
+            "created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (trade.timestamp, trade.symbol, trade.side, trade.price,
+             trade.size, trade.size_usd, time.time()),
+        )
 
     # Time-series tables that grow unbounded and are safe to age out.
     _PRUNABLE_TABLES = (
@@ -450,7 +565,9 @@ class DataStore:
         COUNT(*) on the hub status loop becomes an ever-slower full scan under
         the write lock. retention_days <= 0 keeps everything (WAL is still
         checkpointed). Table names are hardcoded literals — no injection.
+        Blocking (full-table DELETEs): the hub calls it via asyncio.to_thread.
         """
+        self._drain()
         with self._lock:
             if retention_days and retention_days > 0:
                 cutoff = time.time() - retention_days * 86400
@@ -468,15 +585,24 @@ class DataStore:
                 logger.exception("wal_checkpoint failed")
 
     def flush(self) -> None:
-        """Force commit any pending writes."""
+        """Apply every queued write and commit."""
+        self._drain()
         with self._lock:
             self._conn.commit()
             self._last_commit_at = time.time()
 
     def close(self) -> None:
-        """Close the database connection."""
+        """Flush, stop the writer thread, close the connection."""
         self.flush()
-        self._conn.close()
+        writer = self._writer
+        if writer is not None and writer.is_alive():
+            with self._q_cond:
+                self._writer_stop = True
+                self._q_cond.notify_all()
+            writer.join(timeout=DRAIN_TIMEOUT_SECONDS)
+        self._writer = None
+        with self._lock:
+            self._conn.close()
 
     # ── Query methods ────────────────────────────────────
 
@@ -496,6 +622,7 @@ class DataStore:
         query += " ORDER BY timestamp DESC LIMIT ?"
         params.append(limit)
 
+        self._drain()
         with self._lock:
             rows = self._conn.execute(query, params).fetchall()
 
@@ -508,6 +635,7 @@ class DataStore:
     def get_liquidation_stats(self, hours: float = 24) -> dict:
         """Get aggregated liquidation stats for a time window."""
         cutoff = time.time() - (hours * 3600)
+        self._drain()
         with self._lock:
             row = self._conn.execute("""
                 SELECT COUNT(*), COALESCE(SUM(size_usd), 0),
@@ -527,6 +655,7 @@ class DataStore:
     def get_liquidations_by_exchange(self, hours: float = 24) -> dict[str, dict]:
         """Get liquidation counts/volume per exchange."""
         cutoff = time.time() - (hours * 3600)
+        self._drain()
         with self._lock:
             rows = self._conn.execute("""
                 SELECT exchange, COUNT(*), COALESCE(SUM(size_usd), 0)
@@ -538,6 +667,7 @@ class DataStore:
     def get_trade_summary(self, symbol: str = "BTC", hours: float = 1) -> dict:
         """Get trade volume summary for a symbol."""
         cutoff = time.time() - (hours * 3600)
+        self._drain()
         with self._lock:
             row = self._conn.execute("""
                 SELECT COUNT(*),
@@ -549,35 +679,38 @@ class DataStore:
         return {"count": row[0] * s, "buy_volume": row[1] * s, "sell_volume": row[2] * s}
 
     def get_db_stats(self) -> dict:
-        """Get database statistics."""
+        """Get database statistics. Blocking (two COUNT(*) scans): the hub
+        calls it via asyncio.to_thread."""
+        self._drain()
         with self._lock:
             liq_count = self._conn.execute("SELECT COUNT(*) FROM liquidations").fetchone()[0]
             trade_count = self._conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
             # DB file size
             size_bytes = self.db_path.stat().st_size if self.db_path.exists() else 0
+        with self._q_cond:
+            pending = len(self._write_q)
         return {
             "liquidations_stored": liq_count,
             "trades_stored": trade_count,
             "db_size_mb": round(size_bytes / (1024 * 1024), 2),
             "db_path": str(self.db_path),
+            "write_queue_pending": pending,
+            "dropped_writes": self.dropped_writes,
         }
 
     # ── Smart Money Persistence ───────────────────────────────
 
     def _save_smart_money_signal(self, signal) -> None:
-        """Callback: save a smart money signal."""
-        with self._lock:
-            self._conn.execute(
-                "INSERT INTO smart_money_signals (timestamp, address, tier, action, symbol, "
-                "size_usd, wallet_rank, signal_type, created_at, wallet_confidence) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (signal.timestamp, signal.address, signal.tier, signal.action,
-                 signal.symbol, signal.size_usd, signal.wallet_rank,
-                 signal.signal_type, time.time(),
-                 getattr(signal, "wallet_confidence", 0.0)),
-            )
-            self._event_count += 1
-            self._maybe_commit()
+        """Callback: queue a smart money signal for the writer thread."""
+        self._enqueue(
+            "INSERT INTO smart_money_signals (timestamp, address, tier, action, symbol, "
+            "size_usd, wallet_rank, signal_type, created_at, wallet_confidence) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (signal.timestamp, signal.address, signal.tier, signal.action,
+             signal.symbol, signal.size_usd, signal.wallet_rank,
+             signal.signal_type, time.time(),
+             getattr(signal, "wallet_confidence", 0.0)),
+        )
 
     def save_wallet(self, profile) -> None:
         """Save or update a wallet profile."""
@@ -599,15 +732,16 @@ class DataStore:
             self._conn.commit()
 
     def save_signal(self, signal) -> None:
-        """Explicitly save a smart money signal (non-callback path)."""
+        """Explicitly save a smart money signal (non-callback path): queued,
+        then flushed so it is durable when this returns."""
         self._save_smart_money_signal(signal)
-        with self._lock:
-            self._conn.commit()
+        self.flush()
 
     def load_wallets(self) -> list:
         """Load all wallet profiles from the database."""
         from src.data_layer.smart_money import WalletProfile
 
+        self._drain()
         with self._lock:
             rows = self._conn.execute(
                 """SELECT address, discovered_at, last_analyzed, total_trades,
@@ -643,6 +777,7 @@ class DataStore:
     def get_signals(self, hours: float = 24) -> list[dict]:
         """Get smart money signals from the last N hours."""
         cutoff = time.time() - (hours * 3600)
+        self._drain()
         with self._lock:
             rows = self._conn.execute(
                 """SELECT timestamp, address, tier, action, symbol, size_usd,
@@ -662,37 +797,32 @@ class DataStore:
     # ── HLP Persistence ──────────────────────────────────────
 
     def _save_hlp_trade(self, trade) -> None:
-        """Callback: save an HLP trade."""
-        with self._lock:
-            self._conn.execute(
-                """INSERT INTO hlp_trades
-                   (timestamp, symbol, side, price, size, size_usd, direction,
-                    closed_pnl, is_liquidation, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (trade.timestamp, trade.symbol, trade.side, trade.price,
-                 trade.size, trade.size_usd, trade.direction,
-                 trade.closed_pnl, 1 if trade.is_liquidation else 0,
-                 time.time()),
-            )
-            self._event_count += 1
-            self._maybe_commit()
+        """Callback: queue an HLP trade for the writer thread."""
+        self._enqueue(
+            """INSERT INTO hlp_trades
+               (timestamp, symbol, side, price, size, size_usd, direction,
+                closed_pnl, is_liquidation, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (trade.timestamp, trade.symbol, trade.side, trade.price,
+             trade.size, trade.size_usd, trade.direction,
+             trade.closed_pnl, 1 if trade.is_liquidation else 0,
+             time.time()),
+        )
 
     def save_hlp_snapshot(self, snapshot) -> None:
-        """Save an HLP snapshot (call periodically, e.g. every 5th snapshot)."""
-        with self._lock:
-            self._conn.execute(
-                """INSERT INTO hlp_snapshots
-                   (timestamp, account_value, net_delta, delta_zscore,
-                    total_exposure, num_positions, session_pnl,
-                    total_unrealized_pnl, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (snapshot.timestamp, snapshot.account_value,
-                 snapshot.net_delta_usd, snapshot.delta_zscore,
-                 snapshot.total_exposure_usd, snapshot.num_positions,
-                 snapshot.session_pnl, snapshot.total_unrealized_pnl,
-                 time.time()),
-            )
-            self._conn.commit()
+        """Queue an HLP snapshot (called periodically from the status loop)."""
+        self._enqueue(
+            """INSERT INTO hlp_snapshots
+               (timestamp, account_value, net_delta, delta_zscore,
+                total_exposure, num_positions, session_pnl,
+                total_unrealized_pnl, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (snapshot.timestamp, snapshot.account_value,
+             snapshot.net_delta_usd, snapshot.delta_zscore,
+             snapshot.total_exposure_usd, snapshot.num_positions,
+             snapshot.session_pnl, snapshot.total_unrealized_pnl,
+             time.time()),
+        )
 
     def maybe_save_hlp_snapshot(self) -> None:
         """Save every 5th HLP snapshot to avoid DB bloat. Called from status loop."""
@@ -711,6 +841,7 @@ class DataStore:
     def get_hlp_snapshots(self, hours: float = 24, limit: int = 500) -> list[dict]:
         """Get historical HLP snapshots."""
         cutoff = time.time() - (hours * 3600)
+        self._drain()
         with self._lock:
             rows = self._conn.execute(
                 """SELECT timestamp, account_value, net_delta, delta_zscore,
@@ -739,6 +870,7 @@ class DataStore:
             query += " AND is_liquidation = 1"
         query += " ORDER BY timestamp DESC LIMIT ?"
         params.append(limit)
+        self._drain()
         with self._lock:
             rows = self._conn.execute(query, params).fetchall()
         return [
@@ -752,16 +884,13 @@ class DataStore:
     # its own data/paper_trades.db — they are deliberately NOT in this store.
 
     def save_funding_rate(self, snap) -> None:
-        """Save a funding rate snapshot."""
-        with self._lock:
-            self._conn.execute(
-                "INSERT INTO funding_rates (timestamp, exchange, symbol, funding_rate_hourly, "
-                "funding_rate_annualized, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (snap.timestamp, snap.exchange, snap.symbol,
-                 snap.funding_rate_hourly, snap.funding_rate_annualized, time.time()),
-            )
-            self._event_count += 1
-            self._maybe_commit()
+        """Queue a funding rate snapshot."""
+        self._enqueue(
+            "INSERT INTO funding_rates (timestamp, exchange, symbol, funding_rate_hourly, "
+            "funding_rate_annualized, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (snap.timestamp, snap.exchange, snap.symbol,
+             snap.funding_rate_hourly, snap.funding_rate_annualized, time.time()),
+        )
 
     def get_funding_rates(self, exchange: str | None = None, symbol: str | None = None,
                           hours: float = 24, limit: int = 500) -> list[dict]:
@@ -778,6 +907,7 @@ class DataStore:
             params.append(symbol.upper())
         query += " ORDER BY timestamp DESC LIMIT ?"
         params.append(limit)
+        self._drain()
         with self._lock:
             rows = self._conn.execute(query, params).fetchall()
         return [
@@ -787,14 +917,11 @@ class DataStore:
         ]
 
     def save_long_short_ratio(self, snap) -> None:
-        with self._lock:
-            self._conn.execute(
-                "INSERT INTO long_short_ratios (timestamp, symbol, long_ratio, short_ratio, "
-                "long_short_ratio, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (snap.timestamp, snap.symbol, snap.long_ratio, snap.short_ratio, snap.long_short_ratio, time.time()),
-            )
-            self._event_count += 1
-            self._maybe_commit()
+        self._enqueue(
+            "INSERT INTO long_short_ratios (timestamp, symbol, long_ratio, short_ratio, "
+            "long_short_ratio, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (snap.timestamp, snap.symbol, snap.long_ratio, snap.short_ratio, snap.long_short_ratio, time.time()),
+        )
 
     def get_long_short_ratios(self, symbol: str | None = None, hours: float = 24, limit: int = 200) -> list[dict]:
         cutoff = time.time() - (hours * 3600)
@@ -806,6 +933,7 @@ class DataStore:
             params.append(symbol.upper())
         query += " ORDER BY timestamp DESC LIMIT ?"
         params.append(limit)
+        self._drain()
         with self._lock:
             rows = self._conn.execute(query, params).fetchall()
         return [
@@ -815,16 +943,13 @@ class DataStore:
         ]
 
     def save_options_snapshot(self, snap) -> None:
-        """Save a Deribit IV snapshot."""
-        with self._lock:
-            self._conn.execute(
-                "INSERT INTO options_data (timestamp, underlying, mark_iv, bid_iv, ask_iv, "
-                "oi_usd, index_price, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (snap.timestamp, snap.underlying, snap.mark_iv, snap.bid_iv, snap.ask_iv,
-                 snap.oi_usd, snap.index_price, time.time()),
-            )
-            self._event_count += 1
-            self._maybe_commit()
+        """Queue a Deribit IV snapshot."""
+        self._enqueue(
+            "INSERT INTO options_data (timestamp, underlying, mark_iv, bid_iv, ask_iv, "
+            "oi_usd, index_price, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (snap.timestamp, snap.underlying, snap.mark_iv, snap.bid_iv, snap.ask_iv,
+             snap.oi_usd, snap.index_price, time.time()),
+        )
 
     def get_options_data(self, underlying: str | None = None, hours: float = 24, limit: int = 200) -> list[dict]:
         """Get historical Deribit IV snapshots."""
@@ -837,6 +962,7 @@ class DataStore:
             params.append(underlying.upper())
         query += " ORDER BY timestamp DESC LIMIT ?"
         params.append(limit)
+        self._drain()
         with self._lock:
             rows = self._conn.execute(query, params).fetchall()
         return [
