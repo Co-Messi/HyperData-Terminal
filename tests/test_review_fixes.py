@@ -1,7 +1,12 @@
 """Regression tests for the third adversarial review (.roast/REPORT-latest.md).
 
-One class per finding ID. Each test failed against the pre-fix tree and
-passes after the fix; the docstrings say what the pre-fix behavior was.
+One class per finding ID. A test whose docstring starts with "Pre-fix:"
+(or names the pre-fix behaviour) failed against the pre-fix tree and
+passes after the fix. A test whose docstring starts with "Control:" or
+"Guard:" passed BEFORE the fix too: it pins behaviour the fix must not
+break (the other side of a branch, a bound, a preserved invariant) and is
+kept deliberately — it is not evidence that the finding was real, the
+"Pre-fix:" test next to it is.
 """
 from __future__ import annotations
 
@@ -80,7 +85,8 @@ class TestM1DeadSchema:
         assert "snapshots" not in tables and "paper_trades" not in tables
 
     def test_non_empty_legacy_table_is_preserved(self, tmp_path):
-        """Dropping user data is never the migration's call — a populated
+        """Control: passed pre-fix too (nothing dropped anything then).
+        Dropping user data is never the migration's call — a populated
         legacy table is left alone and reported."""
         path = tmp_path / "legacy.db"
         conn = sqlite3.connect(str(path))
@@ -1006,6 +1012,8 @@ class TestM2PersistFirst:
         assert "REFUSED" in caplog.text and "not open" in caplog.text
 
     def test_with_db_the_same_trade_executes_and_is_logged(self):
+        """Control: passed pre-fix too. The refusal in the test above must
+        not have made the normal path (DB open) refuse as well."""
         from src.strategies.base import Signal
         trader = _paper_trader()
         trader._execute_trade("t", Signal("BTC", "BUY", size_usd=1_000.0))
@@ -1295,6 +1303,9 @@ class TestM8Scoring:
         assert e._compute_risk_adjusted([-0.01, -0.012, -0.009]) < 0
 
     def test_composite_is_bounded(self):
+        """Guard: passed pre-fix too. Pins the composite's [-0.65, 1] range
+        and that the documented weights still sum to 1 after the M8
+        re-weighting; it does not by itself show M8 was a bug."""
         from data_layer.smart_money import WalletProfile
         e = self._engine()
         best = WalletProfile(address="0x" + "1" * 40, discovered_at=0, last_seen=0, last_analyzed=0,
@@ -2306,6 +2317,8 @@ class TestS7ShardPlanFixed:
             await e.stop()
 
     def test_add_symbol_before_start_is_silent(self, caplog):
+        """Control: adding a symbol BEFORE start() is the supported path and
+        must stay quiet."""
         from src.data_layer.orderflow_engine import OrderFlowEngine
         e = OrderFlowEngine(symbols=["BTC"])
         with caplog.at_level("WARNING"):
