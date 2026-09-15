@@ -39,19 +39,33 @@ PARSE_ERROR_LOG_INTERVAL = 60.0
 
 VENUES = ("hyperliquid", "binance")
 
-# Hyperliquid closes a WebSocket (code 1006, no close frame) once it carries
-# roughly ten `trades` subscriptions — measured live: 8 subscriptions stay up
-# indefinitely, the 10th kills the socket within ~0.2s even when sent 1s
-# apart. The single 50-symbol socket therefore died 0.6s after EVERY connect
-# and the old zero-sleep reconnect loop re-harvested it ~1.5x/second (107
-# connects in a 75s run), which read as "connected" throughout. Symbols are
-# sharded across sockets of at most this many subscriptions.
+# Hyperliquid closes a WebSocket (code 1006, no close frame, no error
+# message) when it receives a `trades` subscription for a coin that is not in
+# its `meta` universe. Measured live per symbol: PEPE, BONK and FLOKI in
+# DEFAULT_SYMBOLS are not listed (Hyperliquid carries them as kPEPE/kBONK/
+# kFLOKI); every other symbol keeps a socket up indefinitely. The single
+# 50-symbol socket therefore died ~0.6s after EVERY connect, and the old
+# zero-sleep reconnect loop re-harvested it ~1.5x/second (107 connects in a
+# 75s run) while reading "connected". (An earlier reading of the same data
+# blamed a ~10-subscription cap; that was wrong — the 10th symbol in the
+# sweep was PEPE.)
+#
+# Two defences: subscriptions are filtered against the live universe
+# (HL_UNIVERSE_TTL), and symbols are still sharded across sockets so that a
+# coin delisted BETWEEN universe refreshes takes down at most one shard —
+# not the whole venue — until the next refresh.
 HL_SUBSCRIPTIONS_PER_SOCKET = 8
+HL_INFO_URL = "https://api.hyperliquid.xyz/info"
+HL_UNIVERSE_TTL = 3600.0
 
 # Backoff ceiling after a short-lived clean close (server dropped us right
 # after subscribing). Lower than the error ceiling on purpose: a flaky shard
 # must not take its symbols dark for a minute at a time.
 HL_SHORT_CLOSE_MAX_BACKOFF = 15.0
+
+# How long stop() lets the shard loops unwind (and close their sessions)
+# before cancelling whatever is left.
+STOP_GRACE_SECONDS = 5.0
 
 # Upper bound on remembered trade IDs per venue (oldest evicted first).
 MAX_SEEN_IDS = 100_000
@@ -268,6 +282,11 @@ class OrderFlowEngine:
         self._hl_tasks: list[asyncio.Task] = []
         self._hl_sockets: dict[int, aiohttp.ClientWebSocketResponse] = {}
         self._hl_sessions: dict[int, aiohttp.ClientSession] = {}
+        # Live Hyperliquid coin universe (None = not fetched / fetch failed).
+        self._hl_universe: set[str] | None = None
+        self._hl_universe_at: float = 0.0
+        self._hl_universe_lock: asyncio.Lock | None = None
+        self._hl_unlisted_warned: set[str] = set()
         self._binance_task: asyncio.Task | None = None
 
     # -- public API ---------------------------------------------------------
@@ -321,6 +340,57 @@ class OrderFlowEngine:
         """Partition the symbol list into subscription shards, one socket each."""
         n = HL_SUBSCRIPTIONS_PER_SOCKET
         return [self.symbols[i:i + n] for i in range(0, len(self.symbols), n)]
+
+    async def _fetch_hl_universe(self, session: aiohttp.ClientSession) -> set[str] | None:
+        """The set of coins Hyperliquid currently lists (cached HL_UNIVERSE_TTL).
+
+        Returns None if it cannot be fetched, in which case subscriptions go
+        out unfiltered (the socket will tell us, loudly, via the reconnect
+        loop) rather than the whole venue going dark on a REST hiccup.
+        """
+        if self._hl_universe_lock is None:
+            self._hl_universe_lock = asyncio.Lock()
+        async with self._hl_universe_lock:
+            if self._hl_universe is not None and time.time() - self._hl_universe_at < HL_UNIVERSE_TTL:
+                return self._hl_universe
+            try:
+                async with session.post(
+                    HL_INFO_URL, json={"type": "meta"}, timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    data = await resp.json()
+                names = {
+                    a["name"] for a in data.get("universe", [])
+                    if isinstance(a, dict) and isinstance(a.get("name"), str)
+                }
+            except Exception as exc:
+                logger.warning(
+                    "[hl] could not fetch the meta universe (%s: %s) — subscribing unfiltered",
+                    type(exc).__name__, exc,
+                )
+                return self._hl_universe
+            if names:
+                self._hl_universe = names
+                self._hl_universe_at = time.time()
+            return self._hl_universe
+
+    def _hl_listed(self, symbols: list[str], universe: set[str] | None) -> list[str]:
+        """Drop symbols Hyperliquid does not list — one such subscription
+        closes the socket — and say so once per symbol, with the alias HL
+        uses when there is an obvious one (PEPE -> kPEPE)."""
+        if universe is None:
+            return list(symbols)
+        listed = [s for s in symbols if s in universe]
+        for s in symbols:
+            if s in universe or s in self._hl_unlisted_warned:
+                continue
+            self._hl_unlisted_warned.add(s)
+            alias = f"k{s}" if f"k{s}" in universe else None
+            logger.warning(
+                "[hl] %s is not listed on Hyperliquid (not in the meta universe) — trades "
+                "subscription skipped; subscribing would close the socket.%s",
+                s, f" Hyperliquid lists it as {alias}." if alias else "",
+            )
+        return listed
 
     @property
     def hl_sockets_open(self) -> int:
@@ -467,16 +537,29 @@ class OrderFlowEngine:
         )
 
     async def stop(self) -> None:
-        """Gracefully disconnect."""
+        """Gracefully disconnect.
+
+        Closing a shard's socket makes its loop unwind through the `finally`
+        in _connect_and_listen, which closes that shard's ClientSession.
+        The loops are given time to do that BEFORE being cancelled:
+        cancelling a task that is inside `await session.close()` leaves the
+        session half-closed ("Unclosed client session" at interpreter exit —
+        one per healthy shard, seen live).
+        """
         self._running = False
+        closed_any = False
         for ws in list(self._hl_sockets.values()):
             if not ws.closed:
                 await ws.close()
+                closed_any = True
+        pending = [t for t in self._hl_tasks if not t.done()]
+        if pending and closed_any:
+            await asyncio.wait(pending, timeout=STOP_GRACE_SECONDS)
         for session in list(self._hl_sessions.values()):
             if not session.closed:
                 await session.close()
         for task in [*self._hl_tasks, self._binance_task]:
-            if task:
+            if task and not task.done():
                 task.cancel()
                 try:
                     await task
@@ -669,11 +752,16 @@ class OrderFlowEngine:
         """One connection lifecycle for one shard: connect, subscribe its
         symbols, read messages until the socket closes."""
         shards = self._hl_shards()
-        symbols = shards[shard] if shard < len(shards) else []
+        wanted = shards[shard] if shard < len(shards) else []
         session = aiohttp.ClientSession()
         self._hl_sessions[shard] = session
         ws = None
         try:
+            symbols = self._hl_listed(wanted, await self._fetch_hl_universe(session))
+            if not symbols:
+                logger.warning("[hl-%d] no listed symbols in this shard (%s) — idling", shard, wanted)
+                await asyncio.sleep(HL_UNIVERSE_TTL)
+                return
             # heartbeat=20 so a half-open HL socket raises instead of silently
             # freezing the CVD buckets (the other venue/socket already does this).
             ws = await session.ws_connect(WS_URL, heartbeat=20)
@@ -704,10 +792,14 @@ class OrderFlowEngine:
             self._hl_sessions.pop(shard, None)
             if not self._hl_sockets:
                 self._venue_disconnected("hyperliquid")
-            if ws is not None and not ws.closed:
-                await ws.close()
-            if not session.closed:
-                await session.close()
+            # shield: a cancellation arriving mid-close must not abandon the
+            # session half-closed (see stop()).
+            try:
+                if ws is not None and not ws.closed:
+                    await asyncio.shield(ws.close())
+            finally:
+                if not session.closed:
+                    await asyncio.shield(session.close())
 
     def _handle_message(self, data: dict) -> None:
         """Parse a WebSocket JSON message and create Trade objects.
