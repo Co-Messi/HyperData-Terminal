@@ -905,3 +905,93 @@ class TestH5QuickCheck:
 
         with pytest.raises(sqlite3.DatabaseError, match="quick_check failed"):
             DataStore._check_integrity(_Fake())
+
+
+# ── M2 / M3: paper trader persist-first and reverse semantics ────
+
+def _paper_trader(price=100.0, balance=10_000.0, with_db=True, **kw):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from src.strategies.paper_trader import CREATE_TABLE_SQL, PaperTrader
+    hub = MagicMock()
+    hub.market.assets = {"BTC": SimpleNamespace(price=price)}
+    trader = PaperTrader(hub, [], starting_balance=balance, **kw)
+    if with_db:
+        trader._db = sqlite3.connect(":memory:")
+        trader._db.execute(CREATE_TABLE_SQL)
+    return trader
+
+
+class TestM2PersistFirst:
+    def test_no_db_means_no_trade(self, caplog):
+        """Pre-fix: `if self._db:` skipped the whole persistence block and
+        apply_mutation() ran anyway — the one case the docstring's
+        "a trade that cannot be logged is not executed" did not cover."""
+        from src.strategies.base import Signal
+        trader = _paper_trader(with_db=False)
+        assert trader._db is None
+        with caplog.at_level("ERROR"):
+            trader._execute_trade("t", Signal("BTC", "BUY", size_usd=1_000.0))
+        assert trader.positions == {}
+        assert trader.trades == []
+        assert trader.balance == 10_000.0
+        assert "REFUSED" in caplog.text and "not open" in caplog.text
+
+    def test_with_db_the_same_trade_executes_and_is_logged(self):
+        from src.strategies.base import Signal
+        trader = _paper_trader()
+        trader._execute_trade("t", Signal("BTC", "BUY", size_usd=1_000.0))
+        assert trader.positions["BTC"]["size_usd"] == 1_000.0
+        assert trader._db.execute("SELECT COUNT(*) FROM paper_trades").fetchone()[0] == 1
+
+
+class TestM3ReverseSemantics:
+    def test_default_close_only_flattens_and_warns(self, caplog):
+        """Default behaviour is unchanged (test_close_realizes_pnl still holds)
+        but is now explicit and logged instead of silent."""
+        from src.strategies.base import Signal
+        trader = _paper_trader(balance=1_000.0)
+        trader._execute_trade("t", Signal("BTC", "BUY", size_usd=500.0))
+        with caplog.at_level("WARNING"):
+            trader._execute_trade("t", Signal("BTC", "SELL", size_usd=500.0))
+        assert "BTC" not in trader.positions
+        assert "closing only" in caplog.text
+        assert len(trader.trades) == 1 + 1
+
+    def test_reverse_flag_opens_opposite_side_as_second_logged_trade(self):
+        """Pre-fix there was no way to get the strategy's directional intent
+        honoured: a strong SELL left the book flat until the next tick."""
+        from src.strategies.base import Signal
+        trader = _paper_trader(balance=1_000.0, reverse_on_opposite_signal=True)
+        trader._execute_trade("t", Signal("BTC", "BUY", size_usd=500.0))
+        trader.hub.market.assets["BTC"].price = 110.0
+        trader._execute_trade("t", Signal("BTC", "SELL", size_usd=500.0))
+        pos = trader.positions["BTC"]
+        assert pos["side"] == "short"
+        assert pos["size_usd"] == 500.0
+        assert pos["entry_price"] == 110.0
+        # +50 realised on the close, then 500 posted for the short.
+        assert trader.balance == pytest.approx(1_000.0 + 50.0 - 500.0)
+        assert [t["action"] for t in trader.trades] == ["BUY", "SELL", "SELL"]
+        assert trader._db.execute("SELECT COUNT(*) FROM paper_trades").fetchone()[0] == 3
+
+    def test_reverse_is_balance_checked(self):
+        """If the reverse leg cannot be afforded the book is simply flat —
+        never negative."""
+        from src.strategies.base import Signal
+        trader = _paper_trader(balance=500.0, reverse_on_opposite_signal=True)
+        trader._execute_trade("t", Signal("BTC", "BUY", size_usd=500.0))
+        trader.hub.market.assets["BTC"].price = 10.0     # -90%: close credits 50
+        trader._execute_trade("t", Signal("BTC", "SELL", size_usd=500.0))
+        assert "BTC" not in trader.positions
+        assert trader.balance == pytest.approx(50.0)
+
+    @pytest.mark.asyncio
+    async def test_start_logs_close_only_semantics(self, tmp_path, caplog):
+        trader = _paper_trader(with_db=False)
+        trader.db_path = tmp_path / "pt.db"
+        with caplog.at_level("WARNING"):
+            await trader.start()
+        await trader.stop()
+        assert "close-only semantics" in caplog.text
