@@ -41,7 +41,7 @@ import logging
 import math
 import os
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from typing import Any
 
 from aiohttp import WSMsgType, web
@@ -52,6 +52,9 @@ logger = logging.getLogger(__name__)
 EVENT_TYPES = {"trade", "liquidation", "signal", "funding_update", "iv_update", "alert", "heartbeat"}
 
 MAX_WS_CONNECTIONS = 10
+# Per-source-address cap so one client opening sockets cannot consume the
+# whole global budget and lock everyone else out.
+MAX_WS_CONNECTIONS_PER_IP = 3
 # Per-client outbound queue depth. When a slow client's queue is full, new
 # events are dropped for that client (counted) instead of spawning unbounded
 # send tasks that compete with ingestion.
@@ -210,30 +213,48 @@ def _make_auth_middleware(api_key: str):
 
 
 class _RateLimiter:
-    """Sliding-window per-IP request limiter for the REST surface."""
+    """Sliding-window per-IP request limiter for the REST surface.
+
+    Tracked keys live in an LRU (OrderedDict): every hit moves the key to
+    the end, and when the table exceeds MAX_TRACKED_KEYS the least recently
+    seen key is evicted in O(1). The previous implementation swept the whole
+    dict on every request once it held >10k keys, and removed nothing while
+    those keys were all active — O(n) per request at exactly the moment the
+    limiter was needed.
+    """
+
+    MAX_TRACKED_KEYS = 10_000
 
     def __init__(self, max_requests: int = RATE_LIMIT_REQUESTS,
-                 window_s: float = RATE_LIMIT_WINDOW_S) -> None:
+                 window_s: float = RATE_LIMIT_WINDOW_S,
+                 max_tracked_keys: int = MAX_TRACKED_KEYS) -> None:
         self.max_requests = max_requests
         self.window_s = window_s
-        self._hits: dict[str, deque[float]] = {}
+        self.max_tracked_keys = max_tracked_keys
+        self._hits: OrderedDict[str, deque[float]] = OrderedDict()
+        self.evictions = 0
 
     def allow(self, key: str, now: float | None = None) -> bool:
         now = time.time() if now is None else now
         dq = self._hits.get(key)
         if dq is None:
-            dq = self._hits.setdefault(key, deque())
+            dq = deque()
+            self._hits[key] = dq
+        else:
+            self._hits.move_to_end(key)
         cutoff = now - self.window_s
         while dq and dq[0] < cutoff:
             dq.popleft()
         if len(dq) >= self.max_requests:
             return False
         dq.append(now)
-        # Bound tracked IPs so a scan can't grow this dict forever.
-        if len(self._hits) > 10_000:
-            stale = [k for k, v in self._hits.items() if not v or v[-1] < cutoff]
-            for k in stale:
-                del self._hits[k]
+        # Bound tracked keys: evict the least recently seen. A key evicted
+        # while still inside its window simply restarts its count — the
+        # worst case is a slightly generous limit for that one key, never
+        # a full-table scan.
+        while len(self._hits) > self.max_tracked_keys:
+            self._hits.popitem(last=False)
+            self.evictions += 1
         return True
 
 
@@ -288,10 +309,13 @@ def _float_param(request: web.Request, name: str, default: float,
 
 class _WSClient:
     __slots__ = ("ws", "subscriptions", "ping_misses", "connected_at",
-                 "queue", "writer_task", "dropped_msgs", "msg_times", "bad_msgs")
+                 "queue", "writer_task", "dropped_msgs", "msg_times", "bad_msgs",
+                 "remote")
 
-    def __init__(self, ws: web.WebSocketResponse, subscriptions: set[str] | None = None):
+    def __init__(self, ws: web.WebSocketResponse, subscriptions: set[str] | None = None,
+                 remote: str = "unknown"):
         self.ws = ws
+        self.remote = remote
         # Default to EMPTY — clients must opt in via subscribe message
         self.subscriptions: set[str] = subscriptions if subscriptions is not None else set()
         self.ping_misses: int = 0
@@ -793,11 +817,18 @@ class HyperDataAPI:
                 logger.warning("[ws] Rejected cross-origin upgrade from %s", origin)
                 return web.json_response({"error": "Origin not allowed"}, status=403)
 
+        # Per-IP cap first (M6): one client must not be able to fill the
+        # global budget; then the global cap.
+        remote = request.remote or "unknown"
+        from_same_ip = sum(1 for c in self._ws_clients if c.remote == remote)
+        if from_same_ip >= MAX_WS_CONNECTIONS_PER_IP:
+            logger.info("[ws] Rejected %s: %d connections already open from this address", remote, from_same_ip)
+            return web.json_response({"error": "Too many connections from this address"}, status=429)
         if len(self._ws_clients) >= MAX_WS_CONNECTIONS:
             return web.json_response({"error": "Too many connections"}, status=429)
         ws = web.WebSocketResponse(heartbeat=20, max_msg_size=WS_MAX_MSG_BYTES)
         await ws.prepare(request)
-        client = _WSClient(ws, subscriptions=set())
+        client = _WSClient(ws, subscriptions=set(), remote=remote)
         client.writer_task = asyncio.create_task(
             self._writer_loop(client), name="ws-writer"
         )

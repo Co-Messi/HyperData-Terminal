@@ -2,6 +2,12 @@
 
 Each class wraps a data source from HyperDataHub and renders a compact
 rich Panel suitable for the multi-panel CombinedDashboard layout.
+
+Markup safety: Rich parses `[...]` markup in bare `str` cells. Symbols and
+other strings that originate in exchange payloads are always wrapped in
+`Text(...)` (or built via `Text.append`, which never parses markup) so a
+symbol like `[bold` cannot restyle a table or raise MarkupError inside the
+Live render loop.
 """
 from __future__ import annotations
 
@@ -84,7 +90,7 @@ class HubLiqWatch:
             ds = "bold bright_red" if pos.distance_pct < 1 else ("yellow" if pos.distance_pct < 2 else "white")
             sign = "+" if pos.unrealized_pnl >= 0 else ""
             table.add_row(
-                Text(pos.side[0].upper(), style=s), pos.symbol,
+                Text(pos.side[0].upper(), style=s), Text(pos.symbol),
                 fmt_usd(pos.size_usd), Text(fmt_pct(pos.distance_pct), style=ds),
                 Text(f"{sign}{fmt_usd(pos.unrealized_pnl)}", style=ps),
                 f"{pos.leverage:.0f}x",
@@ -295,7 +301,7 @@ class HubMarket:
                 prem_style = "dim"
             prem_str = f"{prem:+.2f}%" if prem != 0.0 else "--"
             table.add_row(
-                str(i), a.symbol, fmt_price(a.price),
+                str(i), Text(a.symbol), fmt_price(a.price),
                 Text(fmt_pct(a.price_change_24h_pct), style=chg_style),
                 Text(fmt_funding(a.funding_rate), style=fund_style),
                 Text(prem_str, style=prem_style),
@@ -367,7 +373,7 @@ class HubWhales:
             sign = "+" if p.unrealized_pnl >= 0 else ""
             sz_style = "bold bright_yellow" if p.size_usd >= 5e6 else ("bold bright_white" if p.size_usd >= 1e6 else "bright_white")
             table.add_row(
-                Text(p.side[0].upper(), style=ss), p.symbol,
+                Text(p.side[0].upper(), style=ss), Text(p.symbol),
                 Text(fmt_usd(p.size_usd), style=sz_style),
                 Text(f"{sign}{fmt_usd(p.unrealized_pnl)}", style=ps),
                 Text(fmt_pct(p.distance_pct), style=ds),
@@ -651,7 +657,7 @@ class HubHLP:
             sign = "+" if p.unrealized_pnl >= 0 else ""
             sz_style = "bold bright_yellow" if p.size_usd >= 5_000_000 else "bright_white"
             pos_table.add_row(
-                Text(p.side[0].upper(), style=ss), p.symbol,
+                Text(p.side[0].upper(), style=ss), Text(p.symbol),
                 Text(fmt_usd(p.size_usd), style=sz_style),
                 Text(f"{sign}{fmt_usd(p.unrealized_pnl)}", style=ps),
                 f"{p.leverage:.0f}x",

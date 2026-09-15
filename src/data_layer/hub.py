@@ -432,50 +432,34 @@ class HyperDataHub:
             await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
 
+        # Every component is stopped even if an earlier one raises, and a
+        # component that fails to stop is LOGGED (a leaked socket or task at
+        # shutdown is evidence, not noise). Nine bare `except: pass` blocks
+        # used to live here.
         if not self.demo:
-            try:
-                await self.liquidations.stop()
-            except Exception:
-                pass
-            try:
-                await self.orderflow.stop()
-            except Exception:
-                pass
-            try:
-                await self.smart_money.stop()
-            except Exception:
-                pass
-            try:
-                await self.hlp.stop()
-            except Exception:
-                pass
-            try:
-                await self.funding.stop()
-            except Exception:
-                pass
-            try:
-                await self.lsr.stop()
-            except Exception:
-                pass
-            try:
-                await self.orderbook.stop()
-            except Exception:
-                pass
-            try:
-                await self.spot.stop()
-            except Exception:
-                pass
-            try:
-                await self.deribit.stop()
-            except Exception:
-                pass
+            components = (
+                ("liquidation_feed", self.liquidations),
+                ("orderflow_engine", self.orderflow),
+                ("smart_money", self.smart_money),
+                ("hlp_tracker", self.hlp),
+                ("funding_rates", self.funding),
+                ("long_short_ratio", self.lsr),
+                ("orderbook", self.orderbook),
+                ("spot_prices", self.spot),
+                ("deribit_iv", self.deribit),
+            )
+            for name, component in components:
+                try:
+                    await component.stop()
+                except Exception:
+                    logger.exception("Error stopping %s (continuing shutdown)", name)
 
         # Stop API server
         if self._api_server:
             try:
                 await self._api_server.stop()
             except Exception:
-                pass
+                logger.exception("Error stopping api_server (continuing shutdown)")
 
         # Flush and close persistence
         try:

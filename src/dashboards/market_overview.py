@@ -199,7 +199,7 @@ class MarketOverviewDashboard:
 
             table.add_row(
                 str(idx),
-                asset.symbol,
+                Text(asset.symbol),        # exchange-supplied: never parse as markup
                 fmt_price(asset.price),
                 Text(fmt_pct(asset.price_change_24h_pct), style=chg_style),
                 Text(fmt_funding(asset.funding_rate), style=fund_style),
@@ -264,7 +264,7 @@ class MarketOverviewDashboard:
             bar = make_bar(abs_ann, max_annualized, width=20)
 
             table.add_row(
-                asset.symbol,
+                Text(asset.symbol),
                 Text(fmt_funding(asset.funding_rate), style=rate_style),
                 Text(fmt_pct(annualized, include_sign=True), style=rate_style),
                 Text(bar, style=rate_style),
@@ -391,7 +391,7 @@ class MarketOverviewDashboard:
             fund_style = "bright_green" if asset.funding_rate >= 0 else "bright_red"
 
             table.add_row(
-                asset.symbol,
+                Text(asset.symbol),
                 fmt_price(asset.price),
                 Text(fmt_pct(asset.price_change_24h_pct), style=chg_style),
                 Text(fmt_funding(asset.funding_rate), style=fund_style),
