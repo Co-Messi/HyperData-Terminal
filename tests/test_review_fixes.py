@@ -841,3 +841,67 @@ class TestH7HealthStatus:
         """M12: the advertised docs URL 404'd."""
         body = await self._health("demo", None)
         assert body["docs"] == "https://github.com/Co-Messi/HyperData-Terminal"
+
+
+# ── H5: integrity_check result was discarded ─────────────────────
+
+class TestH5QuickCheck:
+    @staticmethod
+    def _page_corrupted_db(path):
+        """A DataStore-created file (real schema, so table/index creation is
+        a no-op on reopen) whose HEADER is intact but whose `liquidations`
+        root page is garbage — it opens fine; only quick_check notices."""
+        DataStore(path).close()
+        conn = sqlite3.connect(str(path))
+        conn.execute("PRAGMA journal_mode=DELETE")      # everything in the main file
+        conn.executemany(
+            "INSERT INTO liquidations (timestamp, exchange, symbol, side, size_usd, price, "
+            "quantity, confirmed, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            [(1.0, "x" * 400, "BTC", "long", 1.0, 1.0, 1.0, 1, 1.0) for _ in range(200)],
+        )
+        conn.commit()
+        root = conn.execute("SELECT rootpage FROM sqlite_master WHERE name='liquidations'").fetchone()[0]
+        conn.close()
+        raw = bytearray(path.read_bytes())
+        page_size = int.from_bytes(raw[16:18], "big") or 4096
+        start = (root - 1) * page_size
+        assert root > 1 and len(raw) >= start + page_size
+        raw[start:start + 256] = b"\xff" * 256          # smash the table page, leave page 1
+        path.write_bytes(bytes(raw))
+        # Sanity: the file still opens and its schema still reads; only the
+        # integrity verdict is bad. That is what the pre-fix code missed.
+        probe = sqlite3.connect(str(path))
+        assert probe.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()[0] > 0
+        assert probe.execute("PRAGMA quick_check").fetchone()[0] != "ok"
+        probe.close()
+
+    def test_page_level_corruption_is_quarantined(self, tmp_path):
+        """Pre-fix: `conn.execute("PRAGMA integrity_check")` never fetched the
+        result, so this file opened 'successfully' and the app ran on it."""
+        path = tmp_path / "hyperdata.db"
+        self._page_corrupted_db(path)
+        store = DataStore(path)
+        try:
+            quarantined = list((tmp_path / "corrupted").glob("hyperdata.db.*"))
+            assert len(quarantined) == 1
+            assert store.get_db_stats()["liquidations_stored"] == 0   # fresh DB
+            # And the recreated DB passes its own check.
+            DataStore._check_integrity(store._conn)
+        finally:
+            store.close()
+
+    def test_check_integrity_raises_on_non_ok(self):
+        conn = sqlite3.connect(":memory:")
+        DataStore._check_integrity(conn)            # healthy -> no raise
+        conn.close()
+
+        class _Fake:
+            def execute(self, sql):
+                class _Cur:
+                    @staticmethod
+                    def fetchone():
+                        return ("*** in database main ***\nPage 2: btree page corrupted",)
+                return _Cur()
+
+        with pytest.raises(sqlite3.DatabaseError, match="quick_check failed"):
+            DataStore._check_integrity(_Fake())

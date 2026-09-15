@@ -54,7 +54,7 @@ class DataStore:
             conn = sqlite3.connect(str(self.db_path), check_same_thread=False, timeout=10)
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
-            conn.execute("PRAGMA integrity_check")
+            self._check_integrity(conn)
             self._conn = conn
             self._init_tables()
         except sqlite3.DatabaseError as exc:
@@ -112,6 +112,23 @@ class DataStore:
         # Ctrl-C → KeyboardInterrupt unwinds to interpreter exit). The
         # time-based commit above covers uncatchable kills.
         atexit.register(self._atexit_flush)
+
+    @staticmethod
+    def _check_integrity(conn: sqlite3.Connection) -> None:
+        """Run SQLite's quick_check and RAISE on anything but 'ok'.
+
+        PRAGMA integrity_check / quick_check do not raise — they return rows,
+        `('ok',)` or a list of corruption descriptions. The previous code
+        executed the pragma and discarded the cursor, so only corruption loud
+        enough to fail the open itself ("file is not a database") reached the
+        quarantine path; page-level damage passed straight through and the
+        app ran on a broken DB. quick_check skips the index-consistency scan
+        so startup on a large DB stays fast.
+        """
+        row = conn.execute("PRAGMA quick_check").fetchone()
+        verdict = row[0] if row else None
+        if verdict != "ok":
+            raise sqlite3.DatabaseError(f"quick_check failed: {verdict!r}")
 
     def _maybe_commit(self) -> None:
         """Commit when 50 events have accrued OR COMMIT_INTERVAL has elapsed.
