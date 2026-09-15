@@ -25,10 +25,10 @@ logger = logging.getLogger(__name__)
 
 DB_PATH = Path(__file__).resolve().parents[2] / "data" / "hyperdata.db"
 
-# Commit at least this often (seconds) regardless of event count. Bounds the
-# worst-case data loss on an uncatchable crash (SIGKILL/OOM) to this window,
-# and ensures low-frequency tables don't sit uncommitted behind the shared
-# 50-event batch counter.
+# Writer-thread wake-up interval (seconds). Every batch the writer applies is
+# committed immediately (see DataStore._apply), so this only bounds how long
+# the thread sleeps between checks when the queue is idle; worst-case data
+# loss on an uncatchable crash (SIGKILL/OOM) is whatever was still queued.
 COMMIT_INTERVAL_SECONDS = 5.0
 
 # Delete rows older than this on prune(); keeps the DB (and the periodic
@@ -195,6 +195,19 @@ class DataStore:
                     self._q_cond.notify_all()
 
     def _apply(self, batch: list[tuple[str, tuple]]) -> None:
+        """Execute one batch and COMMIT it.
+
+        Each batch is its own transaction. Holding the write transaction open
+        across batches (committing only every 50 events / 5s) kept SQLite's
+        WAL write lock for seconds at a time under load, and address_store —
+        a second connection to the same file — starved on the millisecond
+        gaps and failed with "database is locked" despite its 10s busy
+        timeout. In WAL mode with synchronous=NORMAL a commit is not an
+        fsync, so per-batch commits are cheap; a batch under load is dozens
+        of rows, idle it is one.
+        """
+        if not batch:
+            return
         with self._lock:
             for sql, params in batch:
                 try:
@@ -202,10 +215,8 @@ class DataStore:
                     self._event_count += 1
                 except sqlite3.Error:
                     logger.exception("DataStore write failed: %s", sql[:60])
-            # Time-based commit also fires on the periodic empty wake-up so a
-            # trickle of events is never left uncommitted past the interval.
-            if batch or self._conn.in_transaction:
-                self._maybe_commit()
+            self._conn.commit()
+            self._last_commit_at = time.time()
 
     def _drain(self, timeout: float = DRAIN_TIMEOUT_SECONDS) -> bool:
         """Block until every write enqueued so far has been applied.
@@ -249,18 +260,6 @@ class DataStore:
         verdict = row[0] if row else None
         if verdict != "ok":
             raise sqlite3.DatabaseError(f"quick_check failed: {verdict!r}")
-
-    def _maybe_commit(self) -> None:
-        """Commit when 50 events have accrued OR COMMIT_INTERVAL has elapsed.
-
-        Caller MUST already hold ``self._lock`` (threading.Lock is not
-        reentrant). Replaces the old fixed every-50-events commit so a slow
-        table is still flushed within COMMIT_INTERVAL_SECONDS.
-        """
-        now = time.time()
-        if self._event_count % 50 == 0 or (now - self._last_commit_at) >= COMMIT_INTERVAL_SECONDS:
-            self._conn.commit()
-            self._last_commit_at = now
 
     def _atexit_flush(self) -> None:
         """Best-effort flush registered with atexit; never raises."""

@@ -563,15 +563,34 @@ class OrderFlowEngine:
     # -- internal: WebSocket loop -------------------------------------------
 
     async def _run_forever(self) -> None:
-        """Main loop with auto-reconnect and exponential backoff."""
+        """Main loop with auto-reconnect and exponential backoff.
+
+        Backoff applies to a CLEAN close too when the connection was
+        short-lived: a server that closes right after the 50-symbol subscribe
+        burst used to be reconnected in a tight loop (observed: 138
+        reconnects in 92s), which then trips the venue's message rate limit
+        and keeps the storm going. Only a connection that lived past
+        STALE_AFTER_SECONDS resets the backoff.
+        """
         backoff = 1.0
         max_backoff = 60.0
 
         while self._running:
+            started = time.time()
             try:
                 await self._connect_and_listen()
-                # If we get here cleanly the connection was closed normally.
-                backoff = 1.0
+                lived = time.time() - started
+                if lived >= STALE_AFTER_SECONDS:
+                    backoff = 1.0          # healthy session; server-side churn is normal
+                    continue
+                if not self._running:
+                    break
+                logger.info(
+                    "WebSocket closed by server after %.1fs (short-lived) — reconnecting in %.1fs",
+                    lived, backoff,
+                )
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, max_backoff)
             except (
                 aiohttp.WSServerHandshakeError,
                 aiohttp.ClientError,

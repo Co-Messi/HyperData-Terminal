@@ -1679,6 +1679,62 @@ class TestH6WriterThread:
         assert "asyncio.to_thread(self.store.prune)" in src
         assert "asyncio.to_thread(address_store.prune)" in src
 
+    def test_each_batch_is_committed_so_the_write_lock_is_released(self, tmp_path):
+        """Found in the live run: holding the transaction open between
+        commits (every 50 events / 5s) starved address_store's second
+        connection — 'database is locked' despite a 10s busy timeout. After a
+        batch is applied the connection must not be mid-transaction."""
+        import time as _t
+
+        store = DataStore(tmp_path / "commit.db")
+        try:
+            # Steady state under load: a commit happened moments ago and the
+            # event count is not on a 50 boundary — exactly when the old
+            # "every 50 events or 5s" rule kept the transaction open.
+            store._last_commit_at = _t.time()
+            for i in range(3):
+                store._save_liquidation(_Liq(i))
+            assert store._drain()
+            with store._lock:
+                assert store._conn.in_transaction is False
+            # A second connection can write immediately, without waiting.
+            other = sqlite3.connect(str(tmp_path / "commit.db"), timeout=0.2)
+            other.execute("INSERT INTO discovered_addresses (address, source, first_seen, last_seen) "
+                          "VALUES ('0x' || substr(hex(randomblob(20)), 1, 40), 't', 1, 1)")
+            other.commit()
+            other.close()
+        finally:
+            store.close()
+
+
+class TestReconnectBackoff:
+    @pytest.mark.asyncio
+    async def test_short_lived_clean_close_backs_off(self, monkeypatch, caplog):
+        """Found in the live run: 138 HL reconnects in 92s. A clean close
+        reset the backoff to 1s and looped with NO sleep at all."""
+        import asyncio
+
+        from src.data_layer.orderflow_engine import OrderFlowEngine
+        e = OrderFlowEngine(symbols=["BTC"])
+        calls = {"n": 0}
+
+        async def closes_immediately():
+            calls["n"] += 1
+
+        monkeypatch.setattr(e, "_connect_and_listen", closes_immediately)
+        e._running = True
+        with caplog.at_level("INFO"):
+            try:
+                # _run_forever swallows the cancellation and returns, so on
+                # 3.13 wait_for may return None rather than raise; either way
+                # only the attempt count matters here.
+                await asyncio.wait_for(e._run_forever(), timeout=0.3)
+            except asyncio.TimeoutError:
+                pass
+        # 1s backoff -> exactly one connect attempt inside 0.3s (pre-fix: hundreds).
+        assert calls["n"] == 1
+        assert "short-lived" in caplog.text
+
 
 # ── M13: extraction equivalence (demo generators, liquidation processing) ──
 
