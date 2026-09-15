@@ -54,8 +54,10 @@ class TestM1DeadSchema:
         tables = _tables(tmp_path / "fresh.db")
         assert "snapshots" not in tables
         assert "paper_trades" not in tables
+        assert "wallets" not in tables            # S2: dead too, dropped in v4
         assert "discovered_addresses" in tables   # M10: now in the versioned schema
         assert not hasattr(DataStore, "save_paper_trade")
+        assert not hasattr(DataStore, "save_wallet") and not hasattr(DataStore, "load_wallets")
 
     def test_v2_db_upgrades_and_drops_empty_dead_tables(self, tmp_path):
         path = tmp_path / "legacy.db"
@@ -245,19 +247,15 @@ class TestC1Tiers:
         assert got[0].wallet_confidence == 0.4
         assert "wallet_confidence" in SmartMoneySignal.__dataclass_fields__
 
-    def test_confidence_persisted_with_wallet_and_signal(self, tmp_path):
+    def test_confidence_persisted_with_signal(self, tmp_path):
+        """Signals are the ONLY persisted carrier of a tier, so the
+        confidence rides with them. (Wallet profiles are not persisted —
+        see TestS2NoDeadWalletTable.)"""
         from types import SimpleNamespace
 
-        from data_layer.smart_money import WalletProfile
         store = DataStore(tmp_path / "w.db")
         try:
-            w = WalletProfile(address="0x" + "a" * 40, discovered_at=1, last_seen=1,
-                              last_analyzed=1, tier="smart", rank=1, confidence=0.7)
-            store.save_wallet(w)
-            loaded = store.load_wallets()
-            assert loaded[0].confidence == 0.7
-
-            sig = SimpleNamespace(timestamp=1.0, address=w.address, tier="smart", action="OPEN_LONG",
+            sig = SimpleNamespace(timestamp=1.0, address="0x" + "a" * 40, tier="smart", action="OPEN_LONG",
                                   symbol="BTC", size_usd=1.0, wallet_rank=1, signal_type="follow",
                                   wallet_confidence=0.7)
             store.save_signal(sig)
@@ -265,11 +263,10 @@ class TestC1Tiers:
         finally:
             store.close()
 
-    def test_legacy_wallets_table_gains_confidence_column(self, tmp_path):
+    def test_legacy_signals_table_gains_confidence_column(self, tmp_path):
         path = tmp_path / "legacy.db"
         conn = sqlite3.connect(str(path))
         conn.executescript("""
-            CREATE TABLE wallets (address TEXT PRIMARY KEY, tier TEXT DEFAULT 'unknown');
             CREATE TABLE smart_money_signals (id INTEGER PRIMARY KEY, timestamp REAL NOT NULL);
             CREATE TABLE schema_version (version INTEGER NOT NULL, applied_at REAL NOT NULL);
             INSERT INTO schema_version VALUES (2, 0);
@@ -278,10 +275,8 @@ class TestC1Tiers:
         conn.close()
         DataStore(path).close()
         conn = sqlite3.connect(str(path))
-        cols = {r[1] for r in conn.execute("PRAGMA table_info(wallets)")}
         sig_cols = {r[1] for r in conn.execute("PRAGMA table_info(smart_money_signals)")}
         conn.close()
-        assert "confidence" in cols
         assert "wallet_confidence" in sig_cols
 
     def test_smart_money_panel_shows_confidence(self):
@@ -309,6 +304,62 @@ class TestC1Tiers:
         assert "CONF" in text
         assert text.count("42%") >= 9   # 5 smart + 3 dumb rows + the signal line
 
+
+# ── S2: wallets.confidence was migrated and written by a method nothing called ──
+
+class TestS2NoDeadWalletTable:
+    """Pre-fix: DataStore.save_wallet/load_wallets existed, v3 added a
+    `confidence` column to `wallets`, and attach() never registered a
+    wallet callback — so the column was 0.0 forever and the table had no
+    writer anywhere in src/. Chosen fix: remove, not wire (SmartMoneyEngine
+    recomputes profiles from fills every session; loading persisted scores
+    whose formula changed would have been the dishonest option)."""
+
+    def test_empty_legacy_wallets_table_is_dropped(self, tmp_path, caplog):
+        path = tmp_path / "v3.db"
+        conn = sqlite3.connect(str(path))
+        conn.executescript("""
+            CREATE TABLE wallets (address TEXT PRIMARY KEY, tier TEXT, confidence REAL DEFAULT 0.0);
+            CREATE TABLE schema_version (version INTEGER NOT NULL, applied_at REAL NOT NULL);
+            INSERT INTO schema_version VALUES (3, 0);
+        """)
+        conn.commit()
+        conn.close()
+        with caplog.at_level("INFO"):
+            store = DataStore(path)
+            try:
+                assert store.get_schema_version() == DataStore.SCHEMA_VERSION == 4
+            finally:
+                store.close()
+        assert "wallets" not in _tables(path)
+        assert "Dropped empty legacy table wallets" in caplog.text
+
+    def test_populated_legacy_wallets_table_is_kept_and_reported(self, tmp_path, caplog):
+        """Control: dropping user data is never the migration's call."""
+        path = tmp_path / "v3.db"
+        conn = sqlite3.connect(str(path))
+        conn.executescript("""
+            CREATE TABLE wallets (address TEXT PRIMARY KEY, tier TEXT, confidence REAL DEFAULT 0.0);
+            INSERT INTO wallets VALUES ('0xabc', 'smart', 0.5);
+            CREATE TABLE schema_version (version INTEGER NOT NULL, applied_at REAL NOT NULL);
+            INSERT INTO schema_version VALUES (3, 0);
+        """)
+        conn.commit()
+        conn.close()
+        with caplog.at_level("WARNING"):
+            DataStore(path).close()
+        assert "wallets" in _tables(path)
+        assert "Legacy table wallets has 1 rows" in caplog.text
+
+    def test_no_wallet_persistence_surface_remains(self):
+        import inspect
+
+        from src.data_layer import persistence, smart_money
+        assert "wallets" not in inspect.getsource(persistence.DataStore._init_tables).replace(
+            "no `wallets` table", "")
+        assert not hasattr(persistence.DataStore, "save_wallet")
+        assert not hasattr(persistence.DataStore, "load_wallets")
+        assert "persisted DB column" not in inspect.getsource(smart_money)
 
 # ── C2 / M7: no wildcard CORS on loopback, Host guard, one origin policy ──
 

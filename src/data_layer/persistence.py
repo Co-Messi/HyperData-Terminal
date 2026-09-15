@@ -312,26 +312,9 @@ class DataStore:
                     last_seen REAL
                 );
 
-                CREATE TABLE IF NOT EXISTS wallets (
-                    address TEXT PRIMARY KEY,
-                    discovered_at REAL,
-                    last_analyzed REAL,
-                    total_trades INTEGER DEFAULT 0,
-                    winning_trades INTEGER DEFAULT 0,
-                    losing_trades INTEGER DEFAULT 0,
-                    total_realized_pnl REAL DEFAULT 0.0,
-                    total_volume_usd REAL DEFAULT 0.0,
-                    win_rate REAL DEFAULT 0.0,
-                    pnl_score REAL DEFAULT 0.0,
-                    sharpe_ratio REAL DEFAULT 0.0,
-                    composite_score REAL DEFAULT 0.0,
-                    rank INTEGER DEFAULT 0,
-                    tier TEXT DEFAULT 'unknown',
-                    account_value REAL DEFAULT 0.0,
-                    confidence REAL DEFAULT 0.0
-                );
-                CREATE INDEX IF NOT EXISTS idx_wallet_tier ON wallets(tier);
-                CREATE INDEX IF NOT EXISTS idx_wallet_rank ON wallets(rank);
+                -- NOTE: there is deliberately no `wallets` table. SmartMoneyEngine
+                -- recomputes every WalletProfile from fills each session and
+                -- nothing ever wrote one here (S2); v4 drops the dead table.
 
                 CREATE TABLE IF NOT EXISTS smart_money_signals (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -431,14 +414,18 @@ class DataStore:
     #       tables were dead (no writer anywhere) and were removed in v3, so
     #       v2 is now a no-op.
     #   v3  drop the dead `snapshots` / `paper_trades` tables (only if empty);
-    #       add wallets.confidence and smart_money_signals.wallet_confidence
-    #       so a persisted smart/dumb label never travels without its
-    #       sample-size confidence
-    SCHEMA_VERSION = 3
+    #       add smart_money_signals.wallet_confidence so a persisted
+    #       smart/dumb label never travels without its sample-size confidence
+    #   v4  drop the dead `wallets` table (only if empty): save_wallet /
+    #       load_wallets had no production caller — SmartMoneyEngine keeps
+    #       profiles in memory and recomputes them from fills — so the
+    #       column v3 added to it (`confidence`) could only ever be 0.0.
+    SCHEMA_VERSION = 4
 
-    # Tables that no code path has ever written to. Dropped in v3 when empty;
-    # a non-empty one is left in place and reported rather than destroyed.
-    _DEAD_TABLES = ("snapshots", "paper_trades")
+    # Tables that no code path has ever written to, by the version that
+    # drops them. A dead table is dropped only when EMPTY; a populated one
+    # is left in place and reported rather than destroyed.
+    _DEAD_TABLES = {3: ("snapshots", "paper_trades"), 4: ("wallets",)}
 
     def _add_column(self, table: str, col: str, col_type: str) -> None:
         """ALTER TABLE ADD COLUMN that tolerates the column already existing
@@ -451,10 +438,10 @@ class DataStore:
                 logger.error("Migration failed for %s.%s: %s", table, col, exc)
                 raise
 
-    def _migrate_v3(self) -> None:
-        self._add_column("wallets", "confidence", "REAL DEFAULT 0.0")
-        self._add_column("smart_money_signals", "wallet_confidence", "REAL NOT NULL DEFAULT 0.0")
-        for table in self._DEAD_TABLES:
+    def _drop_dead_tables(self, version: int) -> None:
+        """Drop the tables `version` retires — only the empty ones. Table
+        names are hardcoded literals — no injection."""
+        for table in self._DEAD_TABLES[version]:
             exists = self._conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
             ).fetchone()
@@ -471,9 +458,16 @@ class DataStore:
             self._conn.execute(f"DROP TABLE {table}")
             logger.info("Dropped empty legacy table %s", table)
 
+    def _migrate_v3(self) -> None:
+        self._add_column("smart_money_signals", "wallet_confidence", "REAL NOT NULL DEFAULT 0.0")
+        self._drop_dead_tables(3)
+
+    def _migrate_v4(self) -> None:
+        self._drop_dead_tables(4)
+
     # version -> migration step. Steps run in order for every version above
     # the DB's recorded one, each followed by a schema_version row.
-    _MIGRATIONS = {3: _migrate_v3}
+    _MIGRATIONS = {3: _migrate_v3, 4: _migrate_v4}
 
     def _run_migrations(self) -> None:
         """Versioned migrations. Caller holds the lock.
@@ -711,67 +705,11 @@ class DataStore:
              getattr(signal, "wallet_confidence", 0.0)),
         )
 
-    def save_wallet(self, profile) -> None:
-        """Save or update a wallet profile."""
-        with self._lock:
-            self._conn.execute(
-                """INSERT OR REPLACE INTO wallets
-                   (address, discovered_at, last_analyzed, total_trades, winning_trades,
-                    losing_trades, total_realized_pnl, total_volume_usd, win_rate,
-                    pnl_score, sharpe_ratio, composite_score, rank, tier, account_value,
-                    confidence)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (profile.address, profile.discovered_at, profile.last_analyzed,
-                 profile.total_trades, profile.winning_trades, profile.losing_trades,
-                 profile.total_realized_pnl, profile.total_volume_usd,
-                 profile.win_rate, profile.pnl_score, profile.sharpe_ratio,
-                 profile.composite_score, profile.rank, profile.tier,
-                 profile.account_value, getattr(profile, "confidence", 0.0)),
-            )
-            self._conn.commit()
-
     def save_signal(self, signal) -> None:
         """Explicitly save a smart money signal (non-callback path): queued,
         then flushed so it is durable when this returns."""
         self._save_smart_money_signal(signal)
         self.flush()
-
-    def load_wallets(self) -> list:
-        """Load all wallet profiles from the database."""
-        from src.data_layer.smart_money import WalletProfile
-
-        self._drain()
-        with self._lock:
-            rows = self._conn.execute(
-                """SELECT address, discovered_at, last_analyzed, total_trades,
-                          winning_trades, losing_trades, total_realized_pnl,
-                          total_volume_usd, win_rate, pnl_score, sharpe_ratio,
-                          composite_score, rank, tier, account_value, confidence
-                   FROM wallets ORDER BY rank ASC"""
-            ).fetchall()
-
-        profiles = []
-        for r in rows:
-            profiles.append(WalletProfile(
-                address=r[0],
-                discovered_at=r[1] or 0.0,
-                last_seen=r[1] or 0.0,  # use discovered_at as fallback
-                last_analyzed=r[2] or 0.0,
-                total_trades=r[3] or 0,
-                winning_trades=r[4] or 0,
-                losing_trades=r[5] or 0,
-                total_realized_pnl=r[6] or 0.0,
-                total_volume_usd=r[7] or 0.0,
-                win_rate=r[8] or 0.0,
-                pnl_score=r[9] or 0.0,
-                sharpe_ratio=r[10] or 0.0,
-                composite_score=r[11] or 0.0,
-                rank=r[12] or 0,
-                tier=r[13] or "unknown",
-                account_value=r[14] or 0.0,
-                confidence=r[15] or 0.0,
-            ))
-        return profiles
 
     def get_signals(self, hours: float = 24) -> list[dict]:
         """Get smart money signals from the last N hours."""
