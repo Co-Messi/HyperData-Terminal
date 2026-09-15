@@ -59,6 +59,17 @@ def test_lock_pin_satisfies_pyproject_range(name):
     )
 
 
+@pytest.mark.parametrize("name", ["rich", "pandas"])
+def test_tested_lower_bounds_are_the_lock_pins(name):
+    """S6: H1 widened rich/pandas down to versions nothing ever tests (CI
+    runs the lock pins, and the pyproject leg resolves to the newest in
+    range). The floor must be the pin, so a user cannot land on a version
+    the suite has never seen."""
+    req = _pyproject_requirements()[name]
+    floors = [Version(spec.version) for spec in req.specifier if spec.operator == ">="]
+    assert floors == [_lock_pins()[name]]
+
+
 def test_lock_has_no_undeclared_direct_deps():
     extra = set(_lock_pins()) - set(_pyproject_requirements())
     assert not extra, f"pinned in requirements.lock but not declared in pyproject.toml: {sorted(extra)}"
