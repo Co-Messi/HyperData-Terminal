@@ -12,6 +12,16 @@ jobs:
     strategy:
       matrix:
         python-version: ["3.12", "3.13"]
+        # "lock": the pinned set from requirements.lock (reproducible).
+        # "pyproject": plain `pip install -e .` — exactly what the README
+        # tells a user to run. Both must pass. The lock leg used to install
+        # the package with dependency resolution disabled, which hid that the
+        # lock contradicted pyproject.toml; it now resolves, and `pip check`
+        # below fails on any conflict.
+        install: ["lock"]
+        include:
+          - python-version: "3.13"
+            install: "pyproject"
 
     steps:
       # Actions pinned by commit SHA (not mutable tags) so a compromised tag
@@ -23,13 +33,19 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install dependencies
-        # requirements.lock pins the runtime deps; -e . adds the package
-        # itself; test tooling is pinned so CI is deterministic.
+      - name: Install dependencies (${{ matrix.install }})
+        # Test tooling is pinned so CI is deterministic.
         run: |
-          pip install -r requirements.lock
-          pip install -e . --no-deps
+          if [ "${{ matrix.install }}" = "lock" ]; then
+            pip install -r requirements.lock
+          fi
+          pip install -e .
           pip install pytest==9.1.1 pytest-asyncio==1.4.0 ruff==0.15.20 pip-audit==2.10.1
+
+      - name: Verify the installed set is consistent
+        # Fails on any dependency conflict — e.g. a lock pin outside the
+        # range pyproject.toml declares.
+        run: pip check
 
       - name: Lint
         run: ruff check src/ tests/
@@ -49,4 +65,5 @@ jobs:
       - name: Run tests
         # The full suite, position scanner included — its network calls are
         # mocked; only tests marked `live` need real exchange connections.
+        # tests/test_dependency_lock.py asserts the lock satisfies pyproject.
         run: python -m pytest tests/ -q

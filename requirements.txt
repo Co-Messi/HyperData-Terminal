@@ -1,6 +1,8 @@
-aiohttp>=3.9.0
-rich>=13.7.0
-pyfiglet>=1.0.2
-pandas>=2.2.0
-numpy>=1.26.0
-python-dotenv>=1.0.0
+# Mirrors [project].dependencies in pyproject.toml (the source of truth).
+# For reproducible installs use requirements.lock instead.
+aiohttp>=3.9.0,<4.0
+rich>=13.7.0,<15
+pyfiglet>=1.0.2,<2.0
+pandas>=2.2.0,<4
+numpy>=1.26.0,<3.0
+python-dotenv>=1.0.0,<2.0
