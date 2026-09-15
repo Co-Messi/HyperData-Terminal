@@ -20,3 +20,6 @@ venv/
 .claude/
 .worktrees/
 .roast/
+
+# Editor/tool backup files (a hook in this environment drops these next to edited files)
+*.bak
