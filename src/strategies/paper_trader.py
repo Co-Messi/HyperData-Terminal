@@ -64,10 +64,22 @@ class PaperTrader:
         strategies: list[Strategy],
         check_interval: int = 30,
         starting_balance: float = 10_000.0,
+        reverse_on_opposite_signal: bool = False,
     ) -> None:
+        """
+        reverse_on_opposite_signal: what an opposite-side signal means for an
+        open position. False (default) = CLOSE ONLY — a SELL on a long flattens
+        the book and does NOT open a short; the strategy's directional intent
+        is dropped until its next signal. True = close and immediately open
+        the reverse position at the signal's size (both trades are logged).
+        The default is logged at start() so the divergence from "what the
+        strategy asked for" is never silent.
+        """
         self.hub = hub
         self.strategies = strategies
         self.check_interval = check_interval
+        self.reverse_on_opposite_signal = reverse_on_opposite_signal
+        self._warned_close_only = False
 
         # Portfolio state
         self.balance: float = starting_balance
@@ -102,6 +114,14 @@ class PaperTrader:
 
         self._running = True
         self._task = asyncio.create_task(self._loop(), name="paper-trader")
+
+        if not self.reverse_on_opposite_signal:
+            logger.warning(
+                "PaperTrader close-only semantics: an opposite-side signal CLOSES an "
+                "open position and does not open the reverse. Paper results will lag "
+                "a backtest that reverses by one check_interval (%ss). Pass "
+                "reverse_on_opposite_signal=True to reverse instead.", self.check_interval,
+            )
 
         strat_names = ", ".join(s.name for s in self.strategies)
         console.print(
@@ -179,16 +199,28 @@ class PaperTrader:
         """Execute a paper trade: update positions, log to SQLite, print.
 
         Accounting invariants:
+        - a trade that cannot be logged is not executed — including when the
+          trade log is not open at all (`_db is None`), which is a hard refusal,
+          not a silent skip of the audit trail;
         - balance never goes negative (adds to a position are balance-checked
           exactly like opens);
         - adding to a position updates the size-weighted average entry price;
-        - an opposite-side signal closes the whole position (explicit
-          close-all semantics; partial reduction is not modeled).
+        - an opposite-side signal closes the whole position (partial
+          reduction is not modeled) and, only if reverse_on_opposite_signal,
+          then opens the reverse at the signal's size as a second logged trade.
         """
         if not self._signal_is_valid(signal):
             logger.warning(
                 "Rejected invalid signal from %s: action=%r symbol=%r size_usd=%r",
                 strategy_name, signal.action, signal.symbol, signal.size_usd,
+            )
+            return
+
+        if self._db is None:
+            logger.error(
+                "Paper trade REFUSED (%s %s %s): the trade log is not open — call "
+                "start() first. A trade that cannot be logged is not executed.",
+                strategy_name, signal.action, signal.symbol,
             )
             return
 
@@ -206,12 +238,21 @@ class PaperTrader:
         # books. Otherwise a DB error silently diverges get_portfolio()
         # from the audit trail.
         pnl = 0.0
+        reverse_after_close = False
         apply_mutation: Any
         if signal.symbol in self.positions:
             pos = self.positions[signal.symbol]
             # Closing a long (SELL) or closing a short (BUY)
             if (pos["side"] == "long" and signal.action == "SELL") or \
                (pos["side"] == "short" and signal.action == "BUY"):
+                reverse_after_close = self.reverse_on_opposite_signal
+                if not reverse_after_close and not self._warned_close_only:
+                    self._warned_close_only = True
+                    logger.warning(
+                        "%s %s on an open %s: closing only (reverse_on_opposite_signal=False) — "
+                        "the reverse position is NOT opened",
+                        signal.action, signal.symbol, pos["side"],
+                    )
                 price_change_pct = (price - pos["entry_price"]) / pos["entry_price"]
                 if pos["side"] == "short":
                     price_change_pct = -price_change_pct
@@ -275,25 +316,24 @@ class PaperTrader:
         }
 
         # Persist FIRST; a trade that cannot be logged is not executed.
-        if self._db:
-            try:
-                self._db.execute(
-                    "INSERT INTO paper_trades "
-                    "(timestamp, strategy, symbol, action, price, size_usd, "
-                    "confidence, reason, pnl) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        trade["timestamp"], trade["strategy"], trade["symbol"],
-                        trade["action"], trade["price"], trade["size_usd"],
-                        trade["confidence"], trade["reason"], trade["pnl"],
-                    ),
-                )
-                self._db.commit()
-            except sqlite3.Error:
-                logger.exception(
-                    "Failed to persist trade to SQLite — trade NOT executed "
-                    "(books stay consistent with the audit log)"
-                )
-                return
+        try:
+            self._db.execute(
+                "INSERT INTO paper_trades "
+                "(timestamp, strategy, symbol, action, price, size_usd, "
+                "confidence, reason, pnl) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    trade["timestamp"], trade["strategy"], trade["symbol"],
+                    trade["action"], trade["price"], trade["size_usd"],
+                    trade["confidence"], trade["reason"], trade["pnl"],
+                ),
+            )
+            self._db.commit()
+        except sqlite3.Error:
+            logger.exception(
+                "Failed to persist trade to SQLite — trade NOT executed "
+                "(books stay consistent with the audit log)"
+            )
+            return
 
         apply_mutation()
         self.trades.append(trade)
@@ -308,6 +348,12 @@ class PaperTrader:
             f"Confidence: {signal.confidence:.0%} | "
             f"{signal.reason}{pnl_str}"
         )
+
+        # Reverse: the position is now flat, so re-running the same signal
+        # opens the opposite side with every check (validity, balance,
+        # persist-first) applied and a second row in the audit log.
+        if reverse_after_close:
+            self._execute_trade(strategy_name, signal)
 
     # ------------------------------------------------------------------
     # Portfolio summary

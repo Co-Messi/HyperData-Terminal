@@ -439,11 +439,21 @@ class TestHubDegradedStartup:
 
 # ── Paper trader accounting invariants ───────────────────────────
 
+def _trader_with_db(price=100.0, balance=10_000.0, **kw) -> PaperTrader:
+    """A PaperTrader with an in-memory trade log — required since M2: a
+    trader whose log is not open refuses every trade."""
+    from src.strategies.paper_trader import CREATE_TABLE_SQL
+    hub = MagicMock()
+    hub.market.assets = {"BTC": SimpleNamespace(price=price)}
+    trader = PaperTrader(hub, [], starting_balance=balance, **kw)
+    trader._db = sqlite3.connect(":memory:")
+    trader._db.execute(CREATE_TABLE_SQL)
+    return trader
+
+
 class TestPaperTraderAccounting:
     def _trader(self, price=100.0, balance=10_000.0) -> PaperTrader:
-        hub = MagicMock()
-        hub.market.assets = {"BTC": SimpleNamespace(price=price)}
-        return PaperTrader(hub, [], starting_balance=balance)
+        return _trader_with_db(price=price, balance=balance)
 
     def test_add_to_position_is_balance_checked(self):
         trader = self._trader(balance=10_000.0)
@@ -689,9 +699,7 @@ class TestWSOriginCheck:
 
 class TestPaperTraderRound2:
     def _trader(self, price=100.0, balance=10_000.0) -> PaperTrader:
-        hub = MagicMock()
-        hub.market.assets = {"BTC": SimpleNamespace(price=price)}
-        return PaperTrader(hub, [], starting_balance=balance)
+        return _trader_with_db(price=price, balance=balance)
 
     def test_catastrophic_close_floors_at_zero(self):
         """A short losing far more than the posted margin must not drive
