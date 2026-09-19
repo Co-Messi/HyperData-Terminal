@@ -952,10 +952,17 @@ class TestH5QuickCheck:
         raw[start:start + 256] = b"\xff" * 256          # smash the table page, leave page 1
         path.write_bytes(bytes(raw))
         # Sanity: the file still opens and its schema still reads; only the
-        # integrity verdict is bad. That is what the pre-fix code missed.
+        # integrity check objects. That is what the pre-fix code missed.
+        # SQLite builds differ in HOW quick_check objects: some return a
+        # non-"ok" row, others raise DatabaseError. DataStore quarantines on
+        # either, so accept either here.
         probe = sqlite3.connect(str(path))
         assert probe.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()[0] > 0
-        assert probe.execute("PRAGMA quick_check").fetchone()[0] != "ok"
+        try:
+            verdict = probe.execute("PRAGMA quick_check").fetchone()[0]
+        except sqlite3.DatabaseError:
+            verdict = "raised"
+        assert verdict != "ok"
         probe.close()
 
     def test_page_level_corruption_is_quarantined(self, tmp_path):
