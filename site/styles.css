@@ -126,10 +126,12 @@ h3 {
 .rule {
   height: 1px; background: var(--rule-gold-strong); border: 0;
   transform-origin: left center;
-  transform: scaleX(0);
   transition: transform 1100ms var(--ease-out);
 }
-.rule.in { transform: scaleX(1); }
+/* Hidden start states apply only once the page is known to run script.js
+   (html.js), so the page stays fully readable if JavaScript is off or fails. */
+.js .rule { transform: scaleX(0); }
+.js .rule.in { transform: scaleX(1); }
 
 /* ---------- Buttons ---------- */
 .btn {
@@ -449,11 +451,11 @@ details p { color: var(--ink-2); max-width: 60ch; }
 
 /* ---------- Reveal (scroll) ---------- */
 .rv {
-  opacity: 0; transform: translateY(20px);
   transition: opacity 900ms var(--ease-out), transform 1000ms var(--ease-out);
   transition-delay: calc(var(--i, 0) * 110ms);
 }
-.rv.in { opacity: 1; transform: none; }
+.js .rv { opacity: 0; transform: translateY(20px); }
+.js .rv.in { opacity: 1; transform: none; }
 
 /* ---------- Reduced motion ---------- */
 @media (prefers-reduced-motion: reduce) {
@@ -463,7 +465,7 @@ details p { color: var(--ink-2); max-width: 60ch; }
     transition-duration: 0.001ms !important;
     transition-delay: 0ms !important;
   }
-  .rv { opacity: 1; transform: none; }
-  .rule { transform: none; }
+  .js .rv { opacity: 1; transform: none; }
+  .js .rule { transform: none; }
   .term-cur { animation: none; }
 }
