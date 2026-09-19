@@ -3,6 +3,7 @@
    when prefers-reduced-motion is set or when JS is unavailable. */
 (function () {
   'use strict';
+  window.__hdReady = true;   // tells the inline <head> fallback that reveals will run
 
   var reduceMq = window.matchMedia('(prefers-reduced-motion: reduce)');
   function reduced() { return reduceMq.matches; }
