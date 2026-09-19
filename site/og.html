@@ -3,88 +3,61 @@
 <head>
   <meta charset="utf-8">
   <title>og-image source</title>
-  <!-- Source for og-image.png. Render this page at exactly 1280x640 and screenshot it. Not linked from the site. -->
+  <!-- Source for og-image.png. Render at exactly 1280x640 and screenshot. Not linked from the site. -->
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Newsreader:ital,opsz,wght@0,6..72,400;1,6..72,400&display=swap">
   <style>
-    html, body { margin: 0; width: 1280px; height: 640px; overflow: hidden; }
+    html, body { margin: 0; width: 1280px; height: 640px; overflow: hidden; background: #0d0d0f; }
     body {
-      background: #0e1020; color: #e8e9f2;
-      font-family: "Instrument Sans", "Helvetica Neue", Helvetica, Arial, sans-serif;
+      color: #ebe6da; position: relative;
+      font-family: "Newsreader", "Iowan Old Style", Palatino, Georgia, serif;
       -webkit-font-smoothing: antialiased;
-      position: relative;
     }
-    .grid {
-      position: absolute; inset: 0;
-      background-image:
-        linear-gradient(to right, rgba(164,140,255,0.07) 1px, transparent 1px),
-        linear-gradient(to bottom, rgba(164,140,255,0.07) 1px, transparent 1px);
-      background-size: 64px 64px;
-      mask-image: radial-gradient(ellipse 80% 90% at 30% 40%, #000 30%, transparent 100%);
-      -webkit-mask-image: radial-gradient(ellipse 80% 90% at 30% 40%, #000 30%, transparent 100%);
+    .rule { position: absolute; left: 72px; right: 72px; height: 1px; background: rgba(240,180,41,.5); }
+    .rule.top { top: 64px; } .rule.bottom { top: 576px; }
+    .brand { position: absolute; left: 72px; top: 30px; font-size: 22px; letter-spacing: -0.01em; }
+    .brand i { display: inline-block; width: 9px; height: 15px; background: #f0b429; margin-right: 10px; vertical-align: -1px; }
+    .brand em { color: #a8a195; }
+    .meta { position: absolute; right: 72px; top: 34px; font-family: "JetBrains Mono", Menlo, monospace; font-size: 14px; color: #8a8472; }
+    h1 {
+      position: absolute; left: 72px; top: 112px; width: 680px; margin: 0;
+      font-weight: 400; font-size: 74px; line-height: 0.98; letter-spacing: -0.035em;
     }
-    .card { position: absolute; left: 80px; top: 76px; width: 660px; }
-    .brand { display: flex; align-items: center; gap: 14px; font-size: 26px; font-weight: 600; letter-spacing: -0.01em; }
-    .brand svg { width: 40px; height: 40px; }
-    .brand span span { color: #9a9db5; font-weight: 500; }
-    h1 { margin: 44px 0 0; font-size: 62px; line-height: 1.02; letter-spacing: -0.035em; font-weight: 600; }
-    .sub { margin: 28px 0 0; font-size: 22px; line-height: 1.4; color: #b4b7cc; max-width: 30ch; }
-    .facts { margin: 40px 0 0; display: flex; gap: 36px; font-size: 18px; color: #9a9db5; }
-    .facts b { display: block; color: #e8e9f2; font-size: 22px; font-weight: 600; letter-spacing: -0.01em; }
-    .term {
-      position: absolute; right: 80px; top: 96px; width: 400px;
-      background: #0b0d1a; border: 1px solid #262a45; border-radius: 12px;
-      box-shadow: 0 40px 80px -30px rgba(0,0,0,0.7);
-      font-family: "JetBrains Mono", ui-monospace, Menlo, monospace; font-size: 14.5px; line-height: 1.7;
-      overflow: hidden;
-    }
-    .bar { height: 38px; background: #12152a; border-bottom: 1px solid #262a45; display: flex; align-items: center; padding: 0 16px; gap: 7px; }
-    .bar i { width: 11px; height: 11px; border-radius: 50%; background: #262a45; display: block; }
-    .bar span { margin-inline: auto; color: #9a9db5; font-size: 12.5px; padding-right: 50px; }
-    pre { margin: 0; padding: 20px 22px 22px; font: inherit; }
-    .c { color: #9a9db5; } .a { color: #a48cff; } .live { color: #3ddc97; } .stale { color: #f5b942; }
-    .cur { display: inline-block; width: 8px; height: 17px; background: #a48cff; vertical-align: -3px; }
+    .sub { position: absolute; left: 72px; top: 372px; width: 600px; font-size: 24px; line-height: 1.4; color: #a8a195; }
+    .ledger { position: absolute; right: 72px; top: 118px; width: 380px; font-family: "JetBrains Mono", Menlo, monospace; font-size: 17px; border-top: 1px solid rgba(240,180,41,.5); }
+    .ledger div { display: flex; justify-content: space-between; padding: 14px 0; border-bottom: 1px solid #232125; }
+    .ledger span:first-child { color: #a8a195; }
+    .ledger span:last-child { color: #f0b429; font-weight: 500; }
+    .ledger span.plain { color: #ebe6da; font-weight: 400; }
+    .cmd { position: absolute; left: 72px; top: 596px; font-family: "JetBrains Mono", Menlo, monospace; font-size: 15px; color: #8a8472; }
+    .cmd b { color: #ebe6da; font-weight: 400; }
+    .cmd i { display: inline-block; width: 8px; height: 16px; background: #f0b429; vertical-align: -2px; margin-left: 2px; }
+    .lic { position: absolute; right: 72px; top: 596px; font-family: "JetBrains Mono", Menlo, monospace; font-size: 15px; color: #8a8472; }
   </style>
 </head>
 <body>
-  <div class="grid"></div>
-  <div class="card">
-    <div class="brand">
-      <svg viewBox="0 0 64 64" aria-hidden="true"><rect width="64" height="64" rx="14" fill="#151831"/><path d="M14 46 C 26 40, 38 30, 50 14" fill="none" stroke="#3ec0f0" stroke-width="5" stroke-linecap="round"/><path d="M16 52 C 28 47, 40 38, 52 22" fill="none" stroke="#a48cff" stroke-width="5" stroke-linecap="round"/></svg>
-      <span>HyperData <span>Terminal</span></span>
-    </div>
-    <h1>Real-time crypto market intelligence, right in your terminal.</h1>
-    <p class="sub">Live data from Hyperliquid, Binance, Bybit, OKX and Deribit. Open source. No API keys.</p>
-    <div class="facts">
-      <div><b>5</b>exchanges</div>
-      <div><b>6</b>dashboards</div>
-      <div><b>17+</b>API endpoints</div>
-      <div><b>Apache-2.0</b>license</div>
-    </div>
+  <div class="brand"><i></i>HyperData <em>Terminal</em></div>
+  <div class="meta">Open-source crypto market-data terminal</div>
+  <div class="rule top"></div>
+  <h1>Real-time crypto market intelligence, right in your terminal.</h1>
+  <p class="sub">Public feeds from Hyperliquid, Binance, Bybit, OKX and Deribit. Open source. No API keys.</p>
+  <div class="ledger">
+    <div><span>Exchanges</span><span>5</span></div>
+    <div><span>Dashboards</span><span>6</span></div>
+    <div><span>Data components</span><span>14</span></div>
+    <div><span>API endpoints</span><span>17+</span></div>
+    <div><span>License</span><span class="plain">Apache-2.0</span></div>
+    <div><span>Runtime</span><span class="plain">Python 3.12+</span></div>
   </div>
-  <div class="term">
-    <div class="bar"><i></i><i></i><i></i><span>hyperdata</span></div>
-<pre><span class="c">$</span> pip install -e .
-<span class="c">$</span> hyperdata
-
-  <span class="a">[1]</span>  Liquidation Watch
-  <span class="a">[2]</span>  Liquidation Stream
-  <span class="a">[3]</span>  Liquidation Heatmap
-  <span class="a">[4]</span>  CVD Order Flow
-  <span class="a">[5]</span>  Market Overview
-  <span class="a">[6]</span>  Whale Tracker
-  <span class="a">[0]</span>  All Dashboards
-
-  feeds  <span class="live">✓ LIVE</span>   <span class="c">cross-checked</span>
-  Select: <span class="cur"></span></pre>
-  </div>
+  <div class="rule bottom"></div>
+  <div class="cmd">~ % <b>pip install -e . &amp;&amp; hyperdata</b><i></i></div>
+  <div class="lic">github.com/Co-Messi/HyperData-Terminal</div>
   <script>
-    // Renderer waits for data-fonts-ready="1" so the capture never shows fallback fonts.
     Promise.all([
-      document.fonts.load('14.5px "JetBrains Mono"'),
-      document.fonts.load('600 62px "Instrument Sans"'),
-      document.fonts.load('500 22px "Instrument Sans"')
+      document.fonts.load('17px "JetBrains Mono"'),
+      document.fonts.load('400 78px "Newsreader"'),
+      document.fonts.load('24px "Newsreader"')
     ]).then(function () { return document.fonts.ready; })
       .then(function () { document.documentElement.setAttribute('data-fonts-ready', '1'); });
   </script>
