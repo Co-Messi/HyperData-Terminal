@@ -841,3 +841,22 @@ def test_smart_money_panel_explains_warmup_until_tiers_exist(n, warming):
     console.print(HubSmartMoney(hub).build_compact())
     text = console.export_text()
     assert (f"tiers start at 10 ranked ({n} so far)" in text) is warming
+
+
+@pytest.mark.parametrize("argv", [
+    ["paper", "--balance", "0"], ["paper", "--balance=-5"], ["paper", "--balance", "abc"],
+    ["paper", "--interval", "0"], ["paper", "--minutes", "0"],
+])
+def test_paper_rejects_non_positive_numbers(argv):
+    """Codex P2: --balance 0 divided by zero on exit, before the hub was stopped."""
+    from hyperdata_terminal.cli import build_parser
+
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(argv)
+
+
+def test_paper_accepts_positive_numbers():
+    from hyperdata_terminal.cli import build_parser
+
+    args = build_parser().parse_args(["paper", "--balance", "500", "--interval", "5", "--minutes", "0.5"])
+    assert (args.balance, args.interval, args.minutes) == (500.0, 5, 0.5)

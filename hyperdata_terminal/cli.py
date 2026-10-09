@@ -17,6 +17,7 @@ import logging.handlers
 import os
 import signal
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 from hyperdata_terminal import __version__
@@ -71,6 +72,19 @@ def _api_port(args: argparse.Namespace) -> int | None:
         return None
 
 
+def _positive(kind: type) -> Callable[[str], float]:
+    """argparse type: a number above zero (a zero balance divided by zero on exit)."""
+    def parse(text: str) -> float:
+        try:
+            value = kind(text)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"not a number: {text!r}") from None
+        if not value > 0:
+            raise argparse.ArgumentTypeError(f"must be above zero, got {text}")
+        return value
+    return parse
+
+
 def build_parser() -> argparse.ArgumentParser:
     from hyperdata_terminal.paths import DATA_DIR
 
@@ -112,10 +126,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="built-in name (cvd_momentum, funding_rate_arb, liquidation_cascade, whale_follow, "
              "llm_agent), a path to your own .py file, or module:Class. Repeatable. Default: cvd_momentum",
     )
-    paper.add_argument("--interval", type=int, default=30, help="seconds between evaluations (default 30)")
-    paper.add_argument("--balance", type=float, default=10_000.0, help="starting paper balance in USD")
+    paper.add_argument("--interval", type=_positive(int), default=30, help="seconds between evaluations (default 30)")
+    paper.add_argument("--balance", type=_positive(float), default=10_000.0, help="starting paper balance in USD")
     paper.add_argument("--reverse", action="store_true", help="an opposite signal closes AND reverses")
-    paper.add_argument("--minutes", type=float, default=None, help="stop after this many minutes")
+    paper.add_argument("--minutes", type=_positive(float), default=None, help="stop after this many minutes")
 
     verify = sub.add_parser("verify", help="one-shot data integrity report (exit 1 on failure)")
     verify.add_argument("--wait", type=int, default=15, help="seconds to collect before checking")
