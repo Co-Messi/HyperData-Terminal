@@ -28,6 +28,9 @@ from hyperdata_terminal.utils.helpers import format_usd as fmt_usd
 
 # Spot is polled every 5s; older than this means every spot source is failing.
 SPOT_STALE_AFTER_SECONDS = 60
+# L/S snapshots carry the venue's 5 minute bucket time and are polled every
+# 30s, so 20 minutes without a newer bucket means every source is failing.
+LSR_STALE_AFTER_SECONDS = 1200
 
 
 def _confidence_text(confidence: float, prefix: str = "") -> Text:
@@ -618,11 +621,17 @@ class HubHLP:
         header = Text()
         header.append(" AUM: ", style="dim")
         header.append(f"{fmt_usd(stats['account_value'])}", style="bold bright_white")
+        if stats.get("aum_source") != "vaultDetails":
+            # Fallback sum: misses Strategy X, so it is a floor, not the AUM.
+            header.append(" (partial)", style="yellow")
         header.append("  PnL: ", style="dim")
-        pnl = stats["session_pnl"]
-        pnl_style = "bold bright_green" if pnl >= 0 else "bold bright_red"
-        header.append(f"{'+'if pnl>=0 else ''}{fmt_usd(pnl)}", style=pnl_style)
-        header.append(f"  Pos: {stats['num_positions']}\n", style="bright_white")
+        if stats.get("pnl_known"):
+            pnl = stats["session_pnl"]
+            pnl_style = "bold bright_green" if pnl >= 0 else "bold bright_red"
+            header.append(f"{'+'if pnl>=0 else ''}{fmt_usd(pnl)}", style=pnl_style)
+        else:
+            header.append("--", style="dim")
+        header.append(f"  Pos: {stats['num_positions']}", style="bright_white")
 
         # ── Net delta with Z-score ──
         delta_line = Text()
@@ -641,7 +650,7 @@ class HubHLP:
         delta_line.append(f"{zscore:+.2f}", style=z_style)
         if abs(zscore) > 2:
             delta_line.append(" EXTREME", style="bold bright_red")
-        delta_line.append(f"  Exposure: {fmt_usd(stats['total_exposure'])}\n", style="dim")
+        delta_line.append(f"  Gross: {fmt_usd(stats['total_exposure'])}", style="dim")
 
         # ── Delta sparkline (last 10 snapshots) ──
         spark_line = Text()
@@ -658,7 +667,6 @@ class HubHLP:
                 idx = max(0, min(idx, len(blocks) - 1))
                 style = "bright_green" if d >= 0 else "bright_red"
                 spark_line.append(blocks[idx], style=style)
-            spark_line.append("\n")
 
         # ── Top 5 positions ──
         top_pos = self.hub.hlp.get_top_positions(5)
@@ -698,12 +706,15 @@ class HubHLP:
                 liq_lines.append(f" {fmt_usd(t.size_usd)}", style="bold white")
                 liq_lines.append(f" {t.direction}\n", style="dim")
         else:
-            liq_lines.append(" No liquidation absorptions yet\n", style="dim")
+            liq_lines.append(" No liquidation absorptions in the last hour", style="dim")
+        # Group puts each element on its own lines; trailing newlines would add
+        # blank rows and push the footer out of a 50 row terminal.
+        liq_lines.rstrip()
 
         # ── Footer stats ──
         footer = Text()
         # The first fills poll returns days of history; count the last 24h so
-        # this never contradicts "No liquidation absorptions yet" above.
+        # this never contradicts the last-hour line above.
         absorbed_24h = len(self.hub.hlp.get_liquidation_absorptions(1440))
         footer.append(f" Snaps:{stats['total_snapshots']}", style="dim")
         footer.append(f"  Fills:{stats['total_trades']}", style="dim")
@@ -714,7 +725,7 @@ class HubHLP:
         elements = [header, delta_line]
         if len(history) >= 2:
             elements.append(spark_line)
-        elements.extend([pos_table, Text(""), liq_lines, footer])
+        elements.extend([pos_table, liq_lines, footer])
 
         return Panel(
             Group(*elements),
@@ -770,9 +781,11 @@ class HubMarketIntel:
             else:
                 lines.append("basis --     ", style="dim")
             ls = self.hub.lsr.get_latest(sym)
-            if ls:
+            if ls and now - ls.timestamp <= LSR_STALE_AFTER_SECONDS:
                 r_style = "bright_green" if ls.long_short_ratio > 1.0 else "bright_red"
                 lines.append(f"  L/S {ls.long_short_ratio:.2f} ({ls.long_ratio * 100:.0f}% long)\n", style=r_style)
+            elif ls:
+                lines.append("  L/S stale\n", style="dim yellow")
             else:
                 lines.append("  L/S --\n", style="dim")
 

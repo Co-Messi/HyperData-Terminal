@@ -112,17 +112,96 @@ class TestHlp:
         assert snap.total_exposure_usd == pytest.approx(1_900_000)  # not the netted 100K
         assert HLPTracker.build_snapshot(states).account_value == 6_000_000  # fallback: summed
 
-    def test_aum_source_switch_does_not_fake_session_pnl(self):
+    @staticmethod
+    def _details(aum, cum_pnl):
+        return {"portfolio": [
+            ["day", {"accountValueHistory": [[1, "0"], [2, str(aum)]], "pnlHistory": [[1, "0"], [2, "7"]]}],
+            ["allTime", {"accountValueHistory": [[2, str(aum)]], "pnlHistory": [[1, "0"], [2, str(cum_pnl)]]}],
+        ]}
+
+    def test_session_pnl_ignores_deposits_and_withdrawals(self):
+        """Second review: AUM fell $103K in a day while PnL rose $20K. Session PnL
+        must follow Hyperliquid's cumulative PnL series, not the AUM."""
         from hyperdata_terminal.data_layer.hlp_tracker import HLPTracker
 
         tracker = HLPTracker()
         states = [_state(79_000_000, [])]
-        tracker.record_snapshot(HLPTracker.build_snapshot(states))                      # vaultDetails down
-        tracker.record_snapshot(HLPTracker.build_snapshot(states, reported_aum=179_900_000))  # it came back
-        tracker.record_snapshot(HLPTracker.build_snapshot(states, reported_aum=179_950_000))
-        pnl = [s.session_pnl for s in tracker.snapshots]
-        assert pnl == [0.0, 0.0, pytest.approx(50_000)]  # never +$100M
+        tracker.record_snapshot(HLPTracker.build_snapshot(states))  # vaultDetails not read yet
+        tracker.apply_vault_details(self._details(179_900_000, 138_601_049))
+        tracker.record_snapshot(HLPTracker.build_snapshot(states, reported_aum=tracker.reported_aum))
+        # A $2M withdrawal and $20,497 of profit later:
+        tracker.apply_vault_details(self._details(177_920_497, 138_621_546))
+        tracker.record_snapshot(HLPTracker.build_snapshot(states, reported_aum=tracker.reported_aum))
+        snaps = list(tracker.snapshots)
+        assert [s.pnl_known for s in snaps] == [False, True, True]
+        assert [round(s.session_pnl) for s in snaps] == [0, 0, 20_497]
         assert tracker.get_stats()["aum_source"] == "vaultDetails"
+
+    def test_stale_reported_aum_falls_back_and_says_so(self):
+        from hyperdata_terminal.data_layer.hlp_tracker import HLPTracker
+
+        tracker = HLPTracker()
+        tracker.apply_vault_details(self._details(179_900_000, 1.0), now=time.time() - 3600)
+        assert not tracker._details_fresh()  # an hour old: not shown as current
+
+    def test_one_liquidation_filled_by_two_vaults_is_one_absorption(self):
+        from hyperdata_terminal.data_layer.hlp_tracker import HLPTracker
+
+        tracker = HLPTracker()
+        absorbed = []
+        tracker.on_hlp_absorption(lambda a, first: absorbed.append((a.size_usd, first)))
+        liq = {"coin": "APT", "side": "A", "dir": "Open Short", "time": 5_000, "hash": "0x69fa",
+               "liquidation": {"method": "market"}}
+        tracker.process_fills("0xA", [dict(liq, px="2", sz="10", tid=1), dict(liq, px="2", sz="5", tid=2)])
+        tracker.process_fills("0xB", [dict(liq, px="2", sz="20", tid=3)])
+        tracker.flush_absorptions()
+        assert len(tracker.absorptions) == 1 and absorbed == [(70.0, True)]
+        group = tracker.absorptions["0x69fa"]
+        assert group.size == 35 and group.vault == "0xA,0xB"
+        # A later poll adds a third vault's share: same absorption, reported as an update.
+        tracker.process_fills("0xC", [dict(liq, px="2", sz="1", tid=4)])
+        tracker.flush_absorptions()
+        assert absorbed[-1] == (72.0, False)
+
+    async def test_busy_vault_pages_forward_during_a_spike(self):
+        from hyperdata_terminal.data_layer.hlp_tracker import HLPTracker
+
+        tracker = HLPTracker()
+        tracker._fill_watermark["0xbusy"] = 0
+        backlog = [{"coin": "X", "px": "1", "sz": "1", "side": "B", "dir": "Open Long", "tid": i, "time": 10 + i}
+                   for i in range(4500)]
+        backlog[4200]["liquidation"] = {"method": "market"}
+        backlog[4200]["hash"] = "0xspike"
+        pages = []
+
+        async def fake_post(payload):
+            start = payload["startTime"]
+            page = [f for f in backlog if f["time"] >= start][: HLPTracker.FILLS_PAGE_LIMIT]
+            pages.append(len(page))
+            return page
+
+        tracker._post = fake_post
+        await tracker._fetch_fills("0xbusy")
+        assert pages[:3] == [2000, 2000, 502]  # inclusive start time: one overlap fill per page
+        assert "0xspike" in tracker.absorptions
+
+    def test_absorption_upsert_survives_restart_and_growth(self, tmp_path):
+        from hyperdata_terminal.data_layer.hlp_tracker import HLPTrade
+        from hyperdata_terminal.data_layer.persistence import DataStore
+
+        def absorption(size):
+            return HLPTrade(1.0, "JUP", "sell", 1, size, size, "Open Short", 0, True, "market", "0xA", "0xd80d")
+
+        store = DataStore(tmp_path / "s.db")
+        try:
+            store._save_hlp_absorption(absorption(10), True)
+            store._save_hlp_absorption(absorption(30), False)   # B's share arrived a poll later
+            store._save_hlp_absorption(absorption(30), True)    # quick restart re-reads it
+            store.flush()
+            rows = store._conn.execute("SELECT COUNT(*), MAX(size) FROM hlp_trades").fetchone()
+        finally:
+            store.close()
+        assert rows == (1, 30)
 
     async def test_failed_vault_details_is_retried_next_pass(self):
         from hyperdata_terminal.data_layer.hlp_tracker import HLPTracker
@@ -179,7 +258,7 @@ class TestHlp:
         assert requests[0]["type"] == "userFillsByTime"
         assert len(tracker.trades) == 1 and len(tracker.absorptions) == 1  # only the flagged fill kept
         resume = tracker._fill_watermark["0xbusy"]
-        assert resume == int((tracker._started_at - HLPTracker.NOTIFY_BACKFILL_SECONDS) * 1000)
+        assert resume == int(tracker._started_at * 1000)
         await tracker._fetch_fills("0xbusy")
         assert requests[1]["startTime"] == resume  # no paging through a day of fills
 
@@ -373,3 +452,60 @@ def test_no_third_party_brand_in_the_package():
     pkg = Path(__file__).resolve().parents[1] / "hyperdata_terminal"
     hits = [p.name for p in pkg.rglob("*.py") if "Moon Dev" in p.read_text()]
     assert hits == []
+
+
+# ── second review round ──────────────────────────────────────────────────
+
+
+def test_strategy_helpers_from_different_folders_do_not_collide(tmp_path):
+    from hyperdata_terminal.strategies.loader import load_strategies
+
+    paths = []
+    for name, value in (("alpha", 1), ("beta", 2)):
+        folder = tmp_path / name
+        folder.mkdir()
+        (folder / "pr12_shared_helpers.py").write_text(f"VALUE = {value}\n")
+        f = folder / f"{name}.py"
+        f.write_text(
+            "import pr12_shared_helpers\n"
+            "from hyperdata_terminal.strategies import Strategy\n"
+            "class S(Strategy):\n"
+            f"    name = '{name}'\n"
+            "    value = pr12_shared_helpers.VALUE\n"
+            "    def evaluate(self, hub):\n"
+            "        return None\n"
+        )
+        paths.append(str(f))
+    loaded = {s.name: s.value for s in load_strategies(paths)}
+    assert loaded == {"alpha": 1, "beta": 2}
+
+
+def test_source_cooldown_separates_geoblocks_from_blips():
+    import aiohttp
+
+    from hyperdata_terminal.utils.helpers import (
+        BLOCKED_SOURCE_COOLDOWN,
+        TRANSIENT_SOURCE_COOLDOWN,
+        source_cooldown_seconds,
+    )
+
+    def http(status):
+        return aiohttp.ClientResponseError(request_info=None, history=(), status=status)
+
+    assert source_cooldown_seconds(http(451)) == BLOCKED_SOURCE_COOLDOWN
+    assert source_cooldown_seconds(http(403)) == BLOCKED_SOURCE_COOLDOWN
+    assert source_cooldown_seconds(http(502)) == TRANSIENT_SOURCE_COOLDOWN
+    assert source_cooldown_seconds(TimeoutError()) == TRANSIENT_SOURCE_COOLDOWN
+    assert TRANSIENT_SOURCE_COOLDOWN < 60
+
+
+def test_mcp_hlp_vault_reports_aum_source_and_pnl_validity(tmp_path, monkeypatch):
+    from hyperdata_terminal.data_layer.hlp_tracker import HLPTracker
+    from hyperdata_terminal.mcp_server import HubTools
+    from tests.test_launch_readiness import _isolated_hub
+
+    hub = _isolated_hub(tmp_path, monkeypatch)
+    hub.hlp.record_snapshot(HLPTracker.build_snapshot([_state(79_000_000, [])]))
+    out = HubTools(hub).hlp_vault()
+    assert out["aum_source"] == "clearinghouseState" and out["aum_is_partial"] is True
+    assert out["session_pnl_usd"] is None  # unknown, not a misleading 0

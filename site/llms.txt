@@ -9,7 +9,7 @@ Install: `pipx install hyperdata-terminal` then run `hyperdata`. Or run once wit
 - Liquidation heatmap: price levels where tracked Hyperliquid positions get liquidated (longs below price, shorts above). A free, terminal alternative to paid liquidation heatmap sites.
 - Whale tracker: the largest open Hyperliquid positions with entry, liquidation price, PnL and leverage.
 - Liquidation watch: positions closest to liquidation.
-- Liquidation stream: confirmed liquidations from OKX, Bybit, Binance (sampled at source) and Hyperliquid (only the rare ones an HLP vault absorbs). Hyperliquid large trades are shown separately as estimated and never counted as liquidations.
+- Liquidation stream: confirmed liquidations from OKX, Bybit, Binance (sampled at source) and Hyperliquid (only the ones an HLP vault took the other side of). Hyperliquid large trades are shown separately as estimated and never counted as liquidations.
 - Order flow: cumulative volume delta for 1m to 24h windows from Hyperliquid and Binance trades, with per venue attribution and warmup labels.
 - Market overview: price, 24h change, funding (hourly and annualized), open interest and volume for every Hyperliquid perp.
 - HLP vault: Hyperliquid's market maker vault: reported AUM, net delta and z score, gross exposure, positions across its child vaults, absorbed liquidations.

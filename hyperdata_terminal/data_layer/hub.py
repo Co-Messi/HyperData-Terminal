@@ -223,6 +223,7 @@ class HyperDataHub:
         self.orderflow.on_trade(self._handle_trade)
         self.smart_money.on_signal(self._handle_signal)
         self.hlp.on_hlp_trade(self._handle_hlp_trade)
+        self.hlp.on_hlp_absorption(self._handle_hlp_absorption)
 
     # ── Event bus ─────────────────────────────────────────────────
 
@@ -272,28 +273,29 @@ class HyperDataHub:
 
     def _handle_hlp_trade(self, trade: HLPTrade) -> None:
         self.status.hlp_trades += 1
-        if trade.is_liquidation:
-            self.status.hlp_liquidation_absorptions += 1
-            self._emit_hlp_liquidation(trade)
         for cb in self._on_hlp_trade_cbs:
             try:
                 cb(trade)
             except Exception:
                 logger.exception("HLP trade callback error")
 
-    # A fill older than this (relative to hub start) is history from the
-    # first userFills poll, not a liquidation that happened while running.
-    HLP_LIQ_BACKFILL_SECONDS = 300
+    def _handle_hlp_absorption(self, absorption: HLPTrade, first_seen: bool) -> None:
+        """One liquidation HLP absorbed (all vaults' fills of it, summed)."""
+        if first_seen and not absorption.is_history:
+            self.status.hlp_liquidation_absorptions += 1
+            self._emit_hlp_liquidation(absorption)
 
     def _emit_hlp_liquidation(self, trade: HLPTrade) -> None:
         """Feed an HLP liquidation absorption into the liquidation stream as a
         CONFIRMED Hyperliquid liquidation (Hyperliquid itself flagged the fill).
 
-        Only fills from this session (plus a short backfill) are forwarded; the
-        first poll returns days of history that must not inflate the counters.
+        Called once per transaction hash, for absorptions from this session
+        only: first poll history must not inflate the counters, and a
+        liquidation filled by Strategy A and B is still one liquidation. (If
+        a later poll adds another vault's share, the event keeps the size
+        seen first; persistence stores the full size.)
         """
-        started = self.status.started_at or time.time()
-        if trade.timestamp < started - self.HLP_LIQ_BACKFILL_SECONDS:
+        if trade.is_history:
             return
         event = LiquidationEvent(
             timestamp=trade.timestamp,

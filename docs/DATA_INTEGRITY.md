@@ -16,7 +16,7 @@ report a `coverage` block plus a per-exchange `method` tag:
 | **OKX** | `confirmed` | Real `liquidation-orders` feed across all SWAP instruments. |
 | **Bybit** | `confirmed` | Real `allLiquidation` v5 feed across the tracked symbols (those with a Bybit linear perp). Subscriptions are batched because Bybit caps args per request. |
 | **Binance** | `sampled` | The `!forceOrder` stream is **throttled by Binance to ~1 liquidation per symbol per second**. Large cascades are undercounted *at the source* — this cannot be fixed client-side, only disclosed. |
-| **Hyperliquid** | `partial` | Hyperliquid has **no public liquidation feed**. *Confirmed* events are liquidations an HLP vault took the other side of: Hyperliquid marks those fills with a `liquidation` object (`method: market` or `backstop`), and the HLP tracker polls every child vault's fills (~2 min delay). In practice these are mostly backstop takeovers by the Liquidator vaults, which are rare (often days apart), so expect `HYP:0` most of the time. Liquidations filled by other traders are invisible. |
+| **Hyperliquid** | `partial` | Hyperliquid has **no public liquidation feed**. *Confirmed* events are liquidations an HLP vault took the other side of: Hyperliquid marks those fills with a `liquidation` object (`method: market` or `backstop`), and the HLP tracker polls every child vault's fills (~2 min delay). In practice most are `market` fills by Strategy A/B when HLP happened to be the book counterparty (several per hour in a live check), grouped by transaction hash so a liquidation both vaults filled counts once; Liquidator backstops are rarer. Liquidations filled by other traders are invisible. |
 
 Separately, Hyperliquid trades ≥ `HL_LIQUIDATION_MIN_USD` (default $10k) are
 reported as **large prints**: `confirmed=False`, shown with `~`. In a test
@@ -108,24 +108,36 @@ several Liquidators) that hold the positions.
 
 - **AUM** is the latest point of the parent's `vaultDetails` portfolio (what
   Hyperliquid's UI shows), refreshed every 5 minutes along with the child
-  list. Summing `clearinghouseState` instead misses Strategy X, which shows
-  neither equity nor positions there (about $100M of the ~$180M at the time
-  of writing); that sum is only a fallback.
+  list; a failed refresh is retried on the next 30s pass. Summing
+  `clearinghouseState` instead misses Strategy X, which shows neither equity
+  nor positions there (about $100M of the ~$180M at the time of writing).
+  That sum is only a fallback, used when no reading is younger than 15
+  minutes, and it is labelled: `(partial)` in the panel, `aum_source` and
+  `aum_is_partial` in MCP, `aum_source` in `hlp_snapshots`.
+- **Session PnL** is the change in Hyperliquid's own cumulative PnL series
+  (`allTime.pnlHistory`) since the first reading this session. It is never
+  the change in AUM: deposits and withdrawals move AUM by hundreds of
+  thousands of dollars in minutes while PnL moves by hundreds. Until a
+  reading exists the panel shows `--` and MCP returns `null`.
 - **Positions** are netted per coin across vaults, because Strategy A and B
   usually hold opposite sides of the same coin. **Gross exposure** is summed
   per vault before netting, so the netting never hides how much is on.
   Strategy X's positions are not visible.
 - A snapshot pass in which any vault request fails is discarded rather than
   shown as a partial sum.
-- **Absorptions** come from the `liquidation` object on child vault fills.
-  Fills are read with `userFillsByTime` from a per vault watermark (about 80
-  of Hyperliquid's 1200 per minute weight budget), so an empty or lagging
-  response can never replay old fills. The first poll seeds 24 hours of
-  absorptions from the quiet Liquidator vaults as history without emitting
-  them; the busy strategy vaults start at session start, because a day of
-  their fills is far more than one 2000 fill page. Only absorptions are
-  persisted, not the ~220 ordinary market making fills a minute (a 2 x 250s
-  soak with a restart stored 2 rows, both live, none duplicated).
+- **Absorptions** come from the `liquidation` object on child vault fills,
+  read with `userFillsByTime` from a per vault watermark, so an empty or
+  lagging response can never replay old fills. A full 2000 fill page means a
+  backlog: the tracker pages forward (up to 6 pages per vault per poll) and
+  logs a warning if it still cannot catch up. One liquidation is often
+  filled by both Strategy A and B: fills are grouped by transaction hash
+  into one absorption with the sizes summed, emitted once as a confirmed
+  Hyperliquid liquidation, and stored as one `hlp_trades` row (upserted by
+  hash, so a restart or a later share of the same liquidation never adds a
+  row). The first poll seeds 24 hours of absorptions from the quiet
+  Liquidator vaults as history, which is stored but never emitted as a live
+  liquidation; the busy strategy vaults start at session start. Ordinary
+  market making fills (~300 a minute) are not stored.
 
 ## Staleness watchdog (frozen feeds never read as live)
 

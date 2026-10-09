@@ -9,7 +9,9 @@ geoblocked in several regions (HTTP 451). The collector then falls back to
 Bybit's account-ratio and OKX's long-short-account-ratio-contract. All three
 are ratios of accounts net long vs net short on that venue, so they measure
 the same thing on different crowds; ``source`` says which crowd you are
-looking at. A failing source is skipped for SOURCE_COOLDOWN seconds.
+looking at. A geoblocked source (401/403/451) is skipped for 10 minutes; a
+transient failure for 30 seconds, so one network blip cannot freeze the
+whole chain.
 """
 from __future__ import annotations
 
@@ -20,13 +22,14 @@ from dataclasses import dataclass
 
 import aiohttp
 
+from hyperdata_terminal.utils.helpers import source_cooldown_seconds
+
 logger = logging.getLogger(__name__)
 
 BINANCE_LSR_URL = "https://fapi.binance.com/futures/data/globalLongShortAccountRatio"
 BYBIT_LSR_URL = "https://api.bybit.com/v5/market/account-ratio"
 OKX_LSR_URL = "https://www.okx.com/api/v5/rubik/stat/contracts/long-short-account-ratio-contract"
 POLL_INTERVAL = 30.0
-SOURCE_COOLDOWN = 600.0
 DEFAULT_SYMBOLS = ["BTC", "ETH", "SOL"]
 LSR_SOURCES = ("binance", "bybit", "okx")
 HTTP_TIMEOUT = aiohttp.ClientTimeout(total=8)
@@ -144,8 +147,9 @@ class LongShortCollector:
                 *(self._fetch_symbol(sym, source) for sym in self.symbols), return_exceptions=True,
             )
             if all(isinstance(r, BaseException) for r in results):
-                self._source_down_until[source] = now + SOURCE_COOLDOWN
-                logger.info("L/S source %s unavailable (%s); trying the next one", source, results[0])
+                cooldown = min(source_cooldown_seconds(r) for r in results)
+                self._source_down_until[source] = now + cooldown
+                logger.info("L/S source %s unavailable (%s); skipping it for %.0fs", source, results[0], cooldown)
                 continue
             if self.active_source != source:
                 logger.info("L/S ratios now from %s", source)

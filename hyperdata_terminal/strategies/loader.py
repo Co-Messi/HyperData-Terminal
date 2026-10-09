@@ -69,15 +69,30 @@ def _strategy_classes_in_file(path: Path) -> list[type[Strategy]]:
         spec = importlib.util.spec_from_file_location(module_name, resolved)
         if spec is None or spec.loader is None:
             raise StrategyLoadError(f"cannot import {path}")
-        # Let the strategy import helper modules that sit next to it.
-        _ensure_on_path(resolved.parent)
         module = importlib.util.module_from_spec(spec)
         sys.modules[module_name] = module
+        # Let the strategy import helper modules that sit next to it, but only
+        # while it loads: two strategy folders that each have a helpers.py must
+        # each get their own (the module cache would otherwise hand the second
+        # strategy the first folder's helpers). Helpers stay bound in the
+        # strategy's globals; import them at module top level.
+        folder = resolved.parent
+        before = set(sys.modules)
+        sys.path.insert(0, str(folder))
         try:
             spec.loader.exec_module(module)
         except Exception as exc:
             sys.modules.pop(module_name, None)
             raise StrategyLoadError(f"{path} failed to import: {exc!r}") from exc
+        finally:
+            try:
+                sys.path.remove(str(folder))
+            except ValueError:
+                pass
+            for name in set(sys.modules) - before - {module_name}:
+                origin = getattr(sys.modules.get(name), "__file__", None)
+                if origin and Path(origin).resolve().is_relative_to(folder):
+                    del sys.modules[name]
         cached = module
 
     defined = [

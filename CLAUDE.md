@@ -81,7 +81,7 @@ Components: liquidation_feed (4 exchanges), orderflow_engine (CVD), position_sca
 - **WebSocket broadcast**: `_broadcast()` enqueues per client; each client has a bounded queue drained by its own writer task.
 - **Live by default**: every CLI entry point runs `HyperDataHub(demo=False)`. A `demo=True` path (synthetic generators in `hub_demo.py`) exists only as an offline dev tool; the health monitor is disabled under demo.
 - **Confirmed vs estimated**: Hyperliquid large prints are `LiquidationEvent(confirmed=False)`. Anything that totals liquidations for display, alerts or strategies uses `get_stats(include_estimated=False)`.
-- **HLP**: AUM from the parent's `vaultDetails`, positions netted per coin, gross exposure per vault, fills via `userFillsByTime` watermarks; only absorptions are persisted.
+- **HLP**: AUM and session PnL from the parent's `vaultDetails` (never PnL from the AUM change), positions netted per coin, gross exposure per vault, fills via `userFillsByTime` watermarks with forward paging, absorptions grouped by transaction hash and upserted by hash.
 - **Estimated liquidations live in `LiquidationFeed.estimated_events`**, apart from confirmed `events`, so they can never evict confirmed ones.
 - **Source fallbacks**: spot (Binance, Coinbase, OKX) and L/S (Binance, Bybit, OKX) record `source` on every snapshot and skip a failing source for 10 minutes.
 - **Symbol normalization**: `normalize_symbol()` strips USDT/USD/PERP suffixes.

@@ -354,7 +354,8 @@ class DataStore:
                     num_positions INTEGER NOT NULL,
                     session_pnl REAL NOT NULL,
                     total_unrealized_pnl REAL NOT NULL,
-                    created_at REAL NOT NULL
+                    created_at REAL NOT NULL,
+                    aum_source TEXT NOT NULL DEFAULT 'clearinghouseState'
                 );
                 CREATE INDEX IF NOT EXISTS idx_hlp_snap_ts ON hlp_snapshots(timestamp);
 
@@ -369,7 +370,9 @@ class DataStore:
                     direction TEXT NOT NULL,
                     closed_pnl REAL NOT NULL,
                     is_liquidation INTEGER NOT NULL DEFAULT 0,
-                    created_at REAL NOT NULL
+                    created_at REAL NOT NULL,
+                    fill_hash TEXT,
+                    vault TEXT NOT NULL DEFAULT ''
                 );
                 CREATE INDEX IF NOT EXISTS idx_hlp_trade_ts ON hlp_trades(timestamp);
                 CREATE INDEX IF NOT EXISTS idx_hlp_trade_liq ON hlp_trades(is_liquidation);
@@ -436,7 +439,10 @@ class DataStore:
     #   v5  long_short_ratios.source: which venue's accounts a row counts
     #       (Binance, or the Bybit/OKX fallback where Binance is blocked), so
     #       stored history never silently mixes crowds. Existing rows were all
-    #       Binance, hence the default.
+    #       Binance, hence the default. hlp_snapshots.aum_source;
+    #       hlp_trades.fill_hash (unique) and .vault, so an absorbed
+    #       liquidation is one row however many vaults filled it or how often
+    #       the tracker restarts.
     SCHEMA_VERSION = 5
 
     # Tables that no code path has ever written to, by the version that
@@ -484,6 +490,12 @@ class DataStore:
 
     def _migrate_v5(self) -> None:
         self._add_column("long_short_ratios", "source", "TEXT NOT NULL DEFAULT 'binance'")
+        self._add_column("hlp_snapshots", "aum_source", "TEXT NOT NULL DEFAULT 'clearinghouseState'")
+        self._add_column("hlp_trades", "fill_hash", "TEXT")
+        self._add_column("hlp_trades", "vault", "TEXT NOT NULL DEFAULT ''")
+        # One row per absorbed liquidation: a restart re-reading the same
+        # fills upserts instead of duplicating. Old rows (NULL hash) are distinct.
+        self._conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_hlp_trade_hash ON hlp_trades(fill_hash)")
 
     # version -> migration step. Steps run in order for every version above
     # the DB's recorded one, each followed by a schema_version row.
@@ -527,7 +539,7 @@ class DataStore:
             hub.smart_money.on_signal(self._save_smart_money_signal)
         # Attach to HLP tracker
         if hasattr(hub, "hlp") and hub.hlp is not None:
-            hub.hlp.on_hlp_trade(self._save_hlp_trade)
+            hub.hlp.on_hlp_absorption(self._save_hlp_absorption)
             self._hlp_snapshot_count = 0
             self._hlp_hub = hub
 
@@ -775,25 +787,33 @@ class DataStore:
 
     # ── HLP Persistence ──────────────────────────────────────
 
-    def _save_hlp_trade(self, trade) -> None:
-        """Callback: queue an HLP liquidation absorption for the writer thread.
+    def _save_hlp_absorption(self, absorption, first_seen: bool = True) -> None:
+        """Callback: upsert one liquidation HLP absorbed, keyed by transaction hash.
 
-        Only absorptions are stored. HLP's strategy vaults make ~220 ordinary
-        market making fills a minute (~390k rows a day), which would swamp the
-        table without saying anything the snapshots don't.
+        Only absorptions are stored: HLP's strategy vaults make ~300 ordinary
+        market making fills a minute (~400k rows a day), which would swamp the
+        table without saying anything the snapshots don't. The upsert keeps
+        one row per liquidation when several vaults fill it, when a later poll
+        adds a vault's share (size grows), and across restarts.
         """
-        if not getattr(trade, "is_liquidation", False):
+        if not getattr(absorption, "is_liquidation", False):
             return
+        fill_hash = getattr(absorption, "fill_hash", "") or None
         self._enqueue(
             """INSERT INTO hlp_trades
                (timestamp, symbol, side, price, size, size_usd, direction,
-                closed_pnl, is_liquidation, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (trade.timestamp, trade.symbol, trade.side, trade.price,
-             trade.size, trade.size_usd, trade.direction,
-             trade.closed_pnl, 1 if trade.is_liquidation else 0,
-             time.time()),
+                closed_pnl, is_liquidation, created_at, fill_hash, vault)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(fill_hash) DO UPDATE SET
+                 price = excluded.price, size = excluded.size,
+                 size_usd = excluded.size_usd, vault = excluded.vault""",
+            (absorption.timestamp, absorption.symbol, absorption.side, absorption.price,
+             absorption.size, absorption.size_usd, absorption.direction,
+             absorption.closed_pnl, 1, time.time(), fill_hash, getattr(absorption, "vault", "")),
         )
+
+    # Old name, kept for callers and tests.
+    _save_hlp_trade = _save_hlp_absorption
 
     def save_hlp_snapshot(self, snapshot) -> None:
         """Queue an HLP snapshot (called periodically from the status loop)."""
@@ -801,13 +821,13 @@ class DataStore:
             """INSERT INTO hlp_snapshots
                (timestamp, account_value, net_delta, delta_zscore,
                 total_exposure, num_positions, session_pnl,
-                total_unrealized_pnl, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                total_unrealized_pnl, created_at, aum_source)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (snapshot.timestamp, snapshot.account_value,
              snapshot.net_delta_usd, snapshot.delta_zscore,
              snapshot.total_exposure_usd, snapshot.num_positions,
              snapshot.session_pnl, snapshot.total_unrealized_pnl,
-             time.time()),
+             time.time(), getattr(snapshot, "aum_source", "clearinghouseState")),
         )
 
     def maybe_save_hlp_snapshot(self) -> None:

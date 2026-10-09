@@ -100,6 +100,25 @@ def format_pct_value(value: float) -> str:
     return f"{value:.2f}%"
 
 
+BLOCKED_SOURCE_COOLDOWN = 600.0   # 401/403/451: forbidden or geoblocked, will not change soon
+TRANSIENT_SOURCE_COOLDOWN = 30.0  # timeouts, resets, 5xx: retry soon
+
+
+def source_cooldown_seconds(exc: BaseException) -> float:
+    """How long a fallback chain should skip a source after this failure.
+
+    A geoblock (Binance 451, Bybit 403) is permanent for this machine, so the
+    source is skipped for minutes. A network blip must not knock out every
+    source in the chain for that long: one shared outage would otherwise
+    leave basis and L/S frozen for ten minutes after the network came back.
+    """
+    import aiohttp
+
+    if isinstance(exc, aiohttp.ClientResponseError) and exc.status in (401, 403, 451):
+        return BLOCKED_SOURCE_COOLDOWN
+    return TRANSIENT_SOURCE_COOLDOWN
+
+
 def format_distance_pct(value: float) -> str:
     """Format a distance-to-liquidation that is already a percentage.
 

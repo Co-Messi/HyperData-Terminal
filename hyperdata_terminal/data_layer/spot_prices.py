@@ -8,7 +8,8 @@ Binance spot is the primary source, but it answers HTTP 451 in restricted
 regions (the US among them). The collector then falls back to Coinbase
 (USD) and OKX (USDT), and records which venue priced each snapshot so a
 USD vs USDT spot is never passed off as the same thing. A source that fails
-is skipped for SOURCE_COOLDOWN seconds instead of being retried every poll.
+is skipped for a while instead of being retried every poll: 10 minutes when
+it is geoblocked (401/403/451), 30 seconds after a transient failure.
 
 Usage:
     collector = SpotPriceCollector()
@@ -25,13 +26,14 @@ from dataclasses import dataclass
 
 import aiohttp
 
+from hyperdata_terminal.utils.helpers import source_cooldown_seconds
+
 logger = logging.getLogger(__name__)
 
 BINANCE_SPOT_URL = "https://api.binance.com/api/v3/ticker/price"
 COINBASE_TICKER_URL = "https://api.exchange.coinbase.com/products/{product}/ticker"
 OKX_TICKER_URL = "https://www.okx.com/api/v5/market/ticker"
 POLL_INTERVAL = 5.0
-SOURCE_COOLDOWN = 600.0
 DEFAULT_SYMBOLS = ["BTC", "ETH", "SOL"]
 HTTP_TIMEOUT = aiohttp.ClientTimeout(total=8)
 
@@ -160,8 +162,9 @@ class SpotPriceCollector:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                self._source_down_until[source] = now + SOURCE_COOLDOWN
-                logger.info("spot source %s unavailable (%s); trying the next one", source, exc)
+                cooldown = source_cooldown_seconds(exc)
+                self._source_down_until[source] = now + cooldown
+                logger.info("spot source %s unavailable (%s); skipping it for %.0fs", source, exc, cooldown)
                 continue
             if spot:
                 if self.active_source != source:

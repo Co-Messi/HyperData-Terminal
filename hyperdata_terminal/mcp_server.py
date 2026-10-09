@@ -327,8 +327,16 @@ class HubTools:
         stats = self.hub.hlp.get_stats()
         top_pos = self.hub.hlp.get_top_positions(max(1, min(top, 50)))
         absorptions = self.hub.hlp.get_liquidation_absorptions(60)
+        aum_source = stats.get("aum_source") or ""
         return self._with_meta({
             "aum_usd": _num(stats["account_value"], 0),
+            # "vaultDetails" = what Hyperliquid reports. "clearinghouseState" = a
+            # fallback sum that misses Strategy X (~$100M); treat it as a floor.
+            "aum_source": aum_source,
+            "aum_is_partial": aum_source != "vaultDetails",
+            # From Hyperliquid's cumulative PnL series, not the AUM change
+            # (deposits and withdrawals move AUM far more than PnL does).
+            "session_pnl_usd": _num(stats["session_pnl"], 0) if stats.get("pnl_known") else None,
             "net_delta_usd": _num(stats["net_delta"], 0),
             "net_delta_zscore": _num(stats["delta_zscore"], 2),
             "gross_exposure_usd": _num(stats["total_exposure"], 0),

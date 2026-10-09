@@ -237,7 +237,7 @@ class TestHLP:
         from hyperdata_terminal.data_layer.hlp_tracker import HLPTracker
 
         tracker = HLPTracker()
-        tracker._started_at = time.time()
+        tracker._started_at = time.time() - 1
         seen = []
         tracker.on_hlp_trade(seen.append)
         now_ms = int(time.time() * 1000)
@@ -254,13 +254,15 @@ class TestHLP:
         hub = _isolated_hub(tmp_path, monkeypatch)
         hub.status.started_at = time.time()
 
-        def trade(ts):
+        def absorption(ts, history):
             return HLPTrade(timestamp=ts, symbol="BTC", side="buy", price=80_000, size=2, size_usd=160_000,
                             direction="Liquidated Cross Long", closed_pnl=0, is_liquidation=True,
-                            liquidation_method="backstop")
+                            liquidation_method="backstop", fill_hash=f"0x{ts}", is_history=history)
 
-        hub._handle_hlp_trade(trade(time.time() - 86_400))  # history from the first poll
-        hub._handle_hlp_trade(trade(time.time()))
+        hub._handle_hlp_absorption(absorption(time.time() - 86_400, True), first_seen=True)  # first poll history
+        live = absorption(time.time(), False)
+        hub._handle_hlp_absorption(live, first_seen=True)
+        hub._handle_hlp_absorption(live, first_seen=False)  # another vault's share of the same liquidation
         await asyncio.sleep(0)
         await asyncio.sleep(0)
         events = list(hub.liquidations.events)
