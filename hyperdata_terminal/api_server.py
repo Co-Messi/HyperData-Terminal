@@ -46,6 +46,7 @@ from typing import Any
 
 from aiohttp import WSMsgType, web
 
+from hyperdata_terminal import __version__
 from hyperdata_terminal.data_layer.liquidation_processing import LiquidationProcessor
 
 logger = logging.getLogger(__name__)
@@ -553,8 +554,9 @@ class HyperDataAPI:
 
         self._liq_stats["broadcast"] += 1
 
+        confirmed = getattr(ev, "confirmed", True)
         ex = ev.exchange.lower()
-        if ex in self._liq_count:
+        if confirmed and ex in self._liq_count:
             self._liq_count[ex] += 1
 
         # Clean symbol
@@ -566,7 +568,10 @@ class HyperDataAPI:
         ex_map = {"binance": "BIN", "bybit": "BYB", "okx": "OKX", "hyperliquid": "HYP"}
         ex_short = ex_map.get(ev.exchange, ev.exchange[:3].upper())
 
-        cascade = self._check_cascade(ev)
+        # A Hyperliquid large print (confirmed=False) is usually an ordinary
+        # trade: it is still broadcast, flagged, but never feeds cascade
+        # detection or the per-exchange liquidation counts.
+        cascade = self._check_cascade(ev) if confirmed else None
 
         self._broadcast("liquidation", {
             "exchange": ex_short,
@@ -654,11 +659,12 @@ class HyperDataAPI:
                 if not self._ws_clients:
                     continue
 
-                stats = self.hub.liquidations.get_stats(window_minutes=60)
+                stats = self.hub.liquidations.get_stats(window_minutes=60, include_estimated=False)
                 msg = json.dumps({"type": "heartbeat", "data": {
                     "ws_clients": len(self._ws_clients),
                     "liq_total_1h": stats.get("total_count", 0),
                     "liq_volume_1h": stats.get("total_volume_usd", 0),
+                    "estimated_large_prints_1h": stats.get("heuristic_count", 0),
                     "by_exchange": self._liq_count,
                 }, "ts": time.time()})
 
@@ -849,11 +855,12 @@ class HyperDataAPI:
             "orderflow_venues": orderflow_venues,
             # H4: how old the whale/danger-zone data actually is.
             "position_scan": self.hub.positions.freshness(),
-            "version": "1.0.0",
+            "version": __version__,
             "mode": s.mode,
             "uptime": f"{h}h {m}m",
             "uptime_seconds": s.uptime_seconds,
-            "total_liquidations": s.total_liquidations,
+            "total_liquidations": s.total_liquidations,  # confirmed only
+            "total_estimated_liquidations": s.total_estimated_liquidations,  # HL large prints
             "total_trades": s.total_trades_processed,
             "tracked_assets": s.tracked_assets,
             "tracked_positions": s.tracked_positions,
@@ -994,6 +1001,8 @@ class HyperDataAPI:
                 data[sym] = {
                     "long_ratio": snap.long_ratio, "short_ratio": snap.short_ratio,
                     "long_short_ratio": snap.long_short_ratio, "timestamp": snap.timestamp,
+                    # Which venue's accounts: Binance, or a Bybit/OKX fallback where Binance is blocked.
+                    "source": getattr(snap, "source", "binance"),
                 }
         return web.json_response(data)
 
@@ -1005,6 +1014,7 @@ class HyperDataAPI:
                 data[sym] = {
                     "spot_price": snap.spot_price, "perp_price": snap.perp_price,
                     "basis_pct": snap.basis_pct, "timestamp": snap.timestamp,
+                    "source": getattr(snap, "source", "binance"),  # spot venue (USD on Coinbase, USDT elsewhere)
                 }
         return web.json_response(data)
 

@@ -7,14 +7,18 @@ HLP vault addresses, their positions, trades, and behavior patterns.
 HLP is a *parent* vault that holds idle USDC and allocates it to child
 vaults (Strategy A/B/X, several Liquidators). The parent itself carries no
 positions, so tracking only the parent address shows "0 positions, net
-delta 0" forever. The child list comes from ``vaultDetails`` on the parent
-(refreshed hourly, with a static fallback), and every snapshot aggregates
-the parent plus all children.
+delta 0" forever. The child list and the AUM Hyperliquid reports come from
+``vaultDetails`` on the parent (every 5 minutes, with a static fallback
+list), and every snapshot aggregates positions across all vaults. Strategy X
+(~$100M at the time of writing) shows neither equity nor positions in
+clearinghouseState, so AUM includes it but the visible positions do not.
 
 Liquidation absorptions are read from the ``liquidation`` object Hyperliquid
-attaches to a fill that took the other side of a liquidation
-(``method: "market"`` when a strategy vault was the book counterparty,
-``"backstop"`` when a Liquidator vault took the position over).
+attaches to a fill that took the other side of a liquidation: mostly
+``"backstop"`` takeovers by a Liquidator vault (rare, often days apart),
+occasionally ``"market"`` when a strategy vault was the book counterparty.
+Most Hyperliquid liquidations are filled by other traders and never show up
+here.
 """
 
 from __future__ import annotations
@@ -117,34 +121,43 @@ class HLPTracker:
     HLP_VAULTS = {"main": PARENT_VAULT}
 
     SNAPSHOT_INTERVAL = 30      # Take snapshot every 30 seconds
-    # userFills costs 20 weight per vault on Hyperliquid's 1200/min budget,
-    # shared with the position scanner; two minutes keeps HLP well under 10%.
+    # vaultDetails on the parent: the child list and the AUM Hyperliquid
+    # reports (clearinghouseState misses Strategy X, ~$100M of it).
+    VAULT_DETAILS_INTERVAL = 300
+    # userFillsByTime from a per vault watermark: weight 20 plus 1 per 20
+    # fills returned. Strategy A/B fill ~110 times a minute each, so a 2
+    # minute poll costs ~31 per busy vault and 20 per quiet one: about 80 of
+    # Hyperliquid's 1200 per minute budget for all seven vaults.
     FILLS_INTERVAL = 120
-    CHILD_REFRESH_INTERVAL = 3600
+    FILLS_PAGE_LIMIT = 2000       # userFillsByTime returns at most this many, oldest first
+    FIRST_POLL_LOOKBACK = 86_400  # seed 24h of absorptions from the (quiet) Liquidator vaults
     ZSCORE_WINDOW = 100         # Use last 100 snapshots for Z-score
-    # userFills returns each vault's last 2000 fills: days of history on the
-    # first poll. Those seed the display history but fire no callbacks, or
-    # every start would push ~12k old rows through persistence (duplicating
-    # them on each restart) and the hub's liquidation stream. Fills up to
-    # this long before start still notify, to cover a quick restart.
+    # Fills older than session start minus this seed the display history but
+    # fire no callbacks: otherwise every start pushes old fills through
+    # persistence (duplicating them on each restart) and the hub's liquidation
+    # stream. Fills just before start still notify, to cover a quick restart.
     NOTIFY_BACKFILL_SECONDS = 120
 
     def __init__(self) -> None:
         self.snapshots: deque[HLPSnapshot] = deque(maxlen=2000)  # ~16 hours at 30s
         self.trades: deque[HLPTrade] = deque(maxlen=5000)
+        # Absorptions get their own buffer: Strategy A/B add ~220 ordinary fills
+        # a minute, which would push a day of absorptions out of `trades` in
+        # about 20 minutes.
+        self.absorptions: deque[HLPTrade] = deque(maxlen=2000)
         self._session: aiohttp.ClientSession | None = None
         self._running = False
         self._tasks: list[asyncio.Task] = []
-        # Per vault: the tids of the latest userFills response. The endpoint
-        # returns the most recent fills, so a tid that has dropped out of the
-        # response can never come back; keeping exactly the latest set is
-        # both bounded and duplicate free (a global set pruned by size
-        # re-admitted still-returned fills as "new" once 6+ vaults were polled).
-        self._seen_fill_tids: dict[str, set[int]] = {}
+        # Per vault: newest fill time processed (ms) and the tids seen at that
+        # exact time. Fills at or before the watermark are never processed
+        # again, and an empty or short response changes nothing.
+        self._fill_watermark: dict[str, int] = {}
+        self._tids_at_watermark: dict[str, set[int]] = {}
         self._callbacks: list = []
         self._session_start_value: float = 0.0
         self.child_vaults: list[str] = list(self.FALLBACK_CHILD_VAULTS)
-        self._children_refreshed_at: float = 0.0
+        self._vault_details_at: float = 0.0
+        self.reported_aum: float = 0.0  # from vaultDetails; 0 until fetched
         self._started_at: float = 0.0  # 0 = not started: every fill notifies (tests, ad hoc use)
 
     @property
@@ -195,16 +208,31 @@ class HLPTracker:
             logger.exception("[hlp] %s request failed", payload.get("type"))
             return None
 
-    async def refresh_child_vaults(self) -> None:
-        """Re-read the parent's child vault list (falls back to the last known list)."""
+    async def refresh_vault_details(self) -> None:
+        """Re-read the parent's child list and reported AUM (keeps the last known on failure)."""
         data = await self._post({"type": "vaultDetails", "vaultAddress": self.PARENT_VAULT})
-        children = (
-            (data or {}).get("relationship", {}).get("data", {}).get("childAddresses")
-            if isinstance(data, dict) else None
-        )
+        self._vault_details_at = time.time()
+        if not isinstance(data, dict):
+            return
+        children = (data.get("relationship") or {}).get("data", {}).get("childAddresses")
         if isinstance(children, list) and children:
             self.child_vaults = [str(c).lower() for c in children if isinstance(c, str)]
-        self._children_refreshed_at = time.time()
+        aum = self.parse_reported_aum(data)
+        if aum > 0:
+            self.reported_aum = aum
+
+    # Backwards compatible name.
+    refresh_child_vaults = refresh_vault_details
+
+    @staticmethod
+    def parse_reported_aum(vault_details: dict) -> float:
+        """Latest point of the parent's day accountValueHistory (what the Hyperliquid UI shows)."""
+        try:
+            portfolio = dict(vault_details.get("portfolio") or [])
+            history = (portfolio.get("day") or {}).get("accountValueHistory") or []
+            return float(history[-1][1]) if history else 0.0
+        except (TypeError, ValueError, IndexError):
+            return 0.0
 
     # ── Snapshot Loop ────────────────────────────────────────
 
@@ -212,8 +240,8 @@ class HLPTracker:
         """Periodically snapshot the whole HLP (parent plus every child vault)."""
         while self._running:
             try:
-                if time.time() - self._children_refreshed_at > self.CHILD_REFRESH_INTERVAL:
-                    await self.refresh_child_vaults()
+                if time.time() - self._vault_details_at > self.VAULT_DETAILS_INTERVAL:
+                    await self.refresh_vault_details()
                 snapshot = await self._take_aggregate_snapshot()
                 if snapshot:
                     snapshot.delta_zscore = self._compute_delta_zscore(snapshot.net_delta_usd)
@@ -231,7 +259,7 @@ class HLPTracker:
     async def _take_aggregate_snapshot(self) -> HLPSnapshot | None:
         """One snapshot summing every HLP vault; None unless every vault answered.
 
-        A partial sum would show a fake drop in AUM and delta whenever one
+        A partial sum would show a fake drop in delta and exposure whenever one
         child request fails, so a pass with any failure is discarded.
         """
         states = []
@@ -240,7 +268,7 @@ class HLPTracker:
             if not isinstance(state, dict):
                 return None
             states.append(state)
-        return self.build_snapshot(states)
+        return self.build_snapshot(states, reported_aum=self.reported_aum)
 
     async def _take_snapshot(self, address: str) -> HLPSnapshot | None:
         """Snapshot of a single vault (kept for ad hoc inspection)."""
@@ -248,15 +276,22 @@ class HLPTracker:
         return self.build_snapshot([state]) if isinstance(state, dict) else None
 
     @staticmethod
-    def build_snapshot(states: list[dict]) -> HLPSnapshot:
+    def build_snapshot(states: list[dict], reported_aum: float = 0.0) -> HLPSnapshot:
         """Aggregate clearinghouseState payloads into one HLP snapshot.
 
-        Positions in the same coin held by different child vaults are merged
-        (signed size and value summed, entry price size weighted), because
-        to the market HLP is one book.
+        Positions in the same coin held by different child vaults are netted
+        into one position, because to the market HLP is one book: Strategy A
+        and B often hold opposite sides of the same coin. ``total_exposure_usd``
+        is the gross notional (each vault's positions summed before netting),
+        so the netting never hides how much HLP actually has on.
+
+        ``account_value`` is ``reported_aum`` (vaultDetails, includes Strategy
+        X) when known; the sum of clearinghouse account values misses Strategy
+        X, whose holdings are not visible through clearinghouseState at all.
         """
         account_value = 0.0
         total_margin_used = 0.0
+        gross_exposure_usd = 0.0
         merged: dict[str, dict] = {}
 
         for data in states:
@@ -271,6 +306,7 @@ class HLPTracker:
                 if size_raw == 0 or not symbol:
                     continue
                 value = abs(float(pos_info.get("positionValue", 0) or 0))
+                gross_exposure_usd += value
                 signed_value = value if size_raw > 0 else -value
                 entry_price = float(pos_info.get("entryPx", 0) or 0)
                 leverage_info = pos_info.get("leverage", {})
@@ -292,9 +328,9 @@ class HLPTracker:
 
         positions: list[HLPPosition] = []
         net_delta_usd = 0.0
-        total_exposure_usd = 0.0
         total_unrealized_pnl = 0.0
         for symbol, m in merged.items():
+            total_unrealized_pnl += m["pnl"]
             if m["size"] == 0:
                 continue  # child vaults netted each other out
             size_usd = abs(m["signed_value"])
@@ -310,16 +346,14 @@ class HLPTracker:
                 leverage=m["leverage"] or 1.0,
             ))
             net_delta_usd += m["signed_value"]
-            total_exposure_usd += size_usd
-            total_unrealized_pnl += m["pnl"]
 
         return HLPSnapshot(
             timestamp=time.time(),
-            account_value=account_value,
+            account_value=reported_aum if reported_aum > 0 else account_value,
             total_margin_used=total_margin_used,
             positions=positions,
             net_delta_usd=net_delta_usd,
-            total_exposure_usd=total_exposure_usd,
+            total_exposure_usd=gross_exposure_usd,
             num_positions=len(positions),
             total_unrealized_pnl=total_unrealized_pnl,
         )
@@ -339,34 +373,60 @@ class HLPTracker:
             await asyncio.sleep(self.FILLS_INTERVAL)
 
     async def _fetch_fills(self, address: str) -> None:
-        """Fetch a vault's recent fills and process the ones not seen before."""
-        fills = await self._post({"type": "userFills", "user": address})
+        """Fetch a vault's fills since its watermark and process the new ones."""
+        first = address not in self._fill_watermark
+        now = time.time()
+        if first:
+            start_ms = int((now - self.FIRST_POLL_LOOKBACK) * 1000)
+        else:
+            start_ms = self._fill_watermark[address]
+        fills = await self._post({
+            "type": "userFillsByTime", "user": address, "startTime": start_ms, "aggregateByTime": False,
+        })
         if not isinstance(fills, list):
             return
+        if first and len(fills) >= self.FILLS_PAGE_LIMIT:
+            # A busy strategy vault: a full page from 24h ago does not reach
+            # the present, and paging through a day of market making fills
+            # would burn the rate budget. Keep the page's flagged absorptions
+            # as history and resume just before session start.
+            self.process_fills(address, [f for f in fills if isinstance(f, dict) and f.get("liquidation")])
+            resume_ms = int(((self._started_at or now) - self.NOTIFY_BACKFILL_SECONDS) * 1000)
+            if resume_ms > self._fill_watermark.get(address, 0):
+                self._fill_watermark[address] = resume_ms
+                self._tids_at_watermark[address] = set()
+            return
         self.process_fills(address, fills)
+        self._fill_watermark.setdefault(address, start_ms)  # a quiet vault: nothing returned yet
 
     def process_fills(self, address: str, fills: list[dict]) -> list[HLPTrade]:
-        """Turn a userFills response into HLPTrades; returns the new ones."""
-        seen = self._seen_fill_tids.get(address, set())
-        current: set[int] = set()
+        """Turn fills (any order) into HLPTrades; returns the ones not seen before."""
+        watermark = self._fill_watermark.get(address, 0)
+        seen_at_mark = self._tids_at_watermark.get(address, set())
         new_trades: list[HLPTrade] = []
 
-        # The API lists newest first; process oldest first so callbacks and
-        # the trades deque stay in time order.
-        for fill in reversed(fills):
-            if not isinstance(fill, dict):
-                continue
-            tid = fill.get("tid", 0)
-            current.add(tid)
-            if tid in seen:
-                continue
+        def _time(f):
+            t = f.get("time", 0)
+            return int(t) if isinstance(t, (int, float)) else 0
 
+        for fill in sorted((f for f in fills if isinstance(f, dict)), key=_time):
+            t_ms = _time(fill)
+            tid = fill.get("tid", 0)
+            if t_ms < watermark or (t_ms == watermark and tid in seen_at_mark):
+                continue
             try:
                 trade = self._parse_fill(fill, address)
             except (TypeError, ValueError):
                 logger.debug("[hlp] unparseable fill: %.200s", fill)
                 continue
+            if t_ms > watermark:
+                watermark, seen_at_mark = t_ms, {tid}
+            else:
+                seen_at_mark.add(tid)
+
             self.trades.append(trade)
+            if trade.is_liquidation:
+                self.absorptions.append(trade)
             new_trades.append(trade)
 
             if self._started_at and trade.timestamp < self._started_at - self.NOTIFY_BACKFILL_SECONDS:
@@ -377,7 +437,9 @@ class HLPTracker:
                 except Exception:
                     logger.exception("[hlp] trade callback error")
 
-        self._seen_fill_tids[address] = current
+        if new_trades:
+            self._fill_watermark[address] = watermark
+            self._tids_at_watermark[address] = seen_at_mark
         return new_trades
 
     @staticmethod
@@ -450,9 +512,9 @@ class HLPTracker:
         return list(self.trades)[-n:]
 
     def get_liquidation_absorptions(self, minutes: int = 60) -> list[HLPTrade]:
-        """Get trades where HLP absorbed a liquidation."""
+        """Liquidations HLP absorbed in the last N minutes, oldest first."""
         cutoff = time.time() - minutes * 60
-        return [t for t in self.trades if t.is_liquidation and t.timestamp > cutoff]
+        return sorted((t for t in self.absorptions if t.timestamp > cutoff), key=lambda t: t.timestamp)
 
     def get_delta_history(self, n: int = 100) -> list[tuple[float, float]]:
         """Return (timestamp, net_delta_usd) pairs for charting."""
@@ -470,5 +532,6 @@ class HLPTracker:
             "total_unrealized_pnl": snap.total_unrealized_pnl if snap else 0,
             "total_snapshots": len(self.snapshots),
             "total_trades": len(self.trades),
-            "liquidation_absorptions": sum(1 for t in self.trades if t.is_liquidation),
+            "liquidation_absorptions": len(self.absorptions),
+            "aum_source": "vaultDetails" if self.reported_aum > 0 else "clearinghouseState",
         }

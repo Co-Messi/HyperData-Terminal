@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 import logging
 import time
@@ -386,9 +387,33 @@ class HyperliquidConnection:
                     )
             await asyncio.sleep(self.POLL_INTERVAL)
 
+    # Default symbols Hyperliquid lists under another name (kPEPE, kBONK, kFLOKI).
+    # Subscribing to an unlisted coin makes Hyperliquid close the socket, which
+    # turned this connection into a reconnect loop every ~2 seconds.
+    UNLISTED_DEFAULTS = frozenset({"PEPE", "BONK", "FLOKI"})
+    MAX_COINS = 16
+
+    async def _listed_coins(self) -> list[str]:
+        """The first MAX_COINS default symbols that Hyperliquid actually lists."""
+        listed: set[str] | None = None
+        try:
+            async with self._session.post(self.API_URL, json={"type": "meta"}, timeout=HTTP_TIMEOUT) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    listed = {a["name"] for a in data.get("universe", []) if not a.get("isDelisted")}
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("[hyperliquid] meta fetch failed; using the static unlisted filter", exc_info=True)
+        if listed:
+            coins = [c for c in DEFAULT_SYMBOLS if c in listed]
+        else:
+            coins = [c for c in DEFAULT_SYMBOLS if c not in self.UNLISTED_DEFAULTS]
+        return coins[: self.MAX_COINS]
+
     async def _ws_loop(self) -> None:
         """Connect to trades WS and detect liquidation-like events."""
-        coins = DEFAULT_SYMBOLS[:16]
+        coins = await self._listed_coins()
         backoff = 1.0
 
         while self._running:
@@ -471,7 +496,12 @@ class _TimeWindow:
 
 class LiquidationFeed:
     def __init__(self, max_events: int = 10_000):
+        # Confirmed liquidations. Estimated events (Hyperliquid large prints)
+        # get their own buffer: they arrive far faster, and sharing one deque
+        # let them evict confirmed liquidations after a few hours, silently
+        # truncating every 4h/24h window.
         self.events: deque[LiquidationEvent] = deque(maxlen=max_events)
+        self.estimated_events: deque[LiquidationEvent] = deque(maxlen=max_events)
         self.callbacks: list[Callable[[LiquidationEvent], Any]] = []
         self._connections: list[ExchangeConnection | HyperliquidConnection] = []
         self._lock = asyncio.Lock()
@@ -522,7 +552,10 @@ class LiquidationFeed:
 
     async def _dispatch(self, event: LiquidationEvent) -> None:
         async with self._lock:
-            self.events.append(event)
+            if getattr(event, "confirmed", True):
+                self.events.append(event)
+            else:
+                self.estimated_events.append(event)
         for cb in self.callbacks:
             try:
                 result = cb(event)
@@ -531,8 +564,10 @@ class LiquidationFeed:
             except Exception:
                 logger.exception("callback error")
 
-    def get_stats(self, window_minutes: int = 60, include_estimated: bool = True) -> dict[str, Any]:
-        """Aggregate liquidations in the window.
+    def get_stats(
+        self, window_minutes: int = 60, include_estimated: bool = True, symbol: str | None = None,
+    ) -> dict[str, Any]:
+        """Aggregate liquidations in the window, optionally for one symbol.
 
         include_estimated=False drops heuristic events (Hyperliquid large
         prints) from every total, side and breakdown; confirmed_* and
@@ -541,6 +576,7 @@ class LiquidationFeed:
         exposes ``include_estimated`` as a query parameter.
         """
         cutoff = time.time() - (window_minutes * 60)
+        only = symbol.upper() if symbol else None
         totals = _TimeWindow()
         by_exchange: dict[str, _TimeWindow] = {}
         by_symbol: dict[str, _TimeWindow] = {}
@@ -550,8 +586,10 @@ class LiquidationFeed:
         heuristic_volume_usd = 0.0
         _coverage = exchange_coverage()
 
-        for ev in self.events:
+        for ev in itertools.chain(self.events, self.estimated_events):
             if ev.timestamp < cutoff:
+                continue
+            if only and ev.symbol != only:
                 continue
 
             if getattr(ev, "confirmed", True):
@@ -616,17 +654,23 @@ class LiquidationFeed:
         minutes: int = 5,
         symbol: str | None = None,
         exchange: str | None = None,
+        include_estimated: bool = True,
     ) -> list[LiquidationEvent]:
+        """Events in the window, newest first."""
         cutoff = time.time() - (minutes * 60)
+        sources = (self.events, self.estimated_events) if include_estimated else (self.events,)
         results: list[LiquidationEvent] = []
-        for ev in reversed(self.events):
+        for ev in itertools.chain(*sources):
             if ev.timestamp < cutoff:
                 continue
             if symbol and ev.symbol != symbol.upper():
                 continue
             if exchange and ev.exchange != exchange.lower():
                 continue
+            if not include_estimated and not getattr(ev, "confirmed", True):
+                continue
             results.append(ev)
+        results.sort(key=lambda e: e.timestamp, reverse=True)
         return results
 
 

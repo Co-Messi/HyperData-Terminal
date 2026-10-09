@@ -393,7 +393,8 @@ class DataStore:
                     long_ratio REAL NOT NULL,
                     short_ratio REAL NOT NULL,
                     long_short_ratio REAL NOT NULL,
-                    created_at REAL NOT NULL
+                    created_at REAL NOT NULL,
+                    source TEXT NOT NULL DEFAULT 'binance'
                 );
                 CREATE INDEX IF NOT EXISTS idx_lsr_ts ON long_short_ratios(timestamp);
                 CREATE INDEX IF NOT EXISTS idx_lsr_symbol ON long_short_ratios(symbol);
@@ -432,7 +433,11 @@ class DataStore:
     #       load_wallets had no production caller — SmartMoneyEngine keeps
     #       profiles in memory and recomputes them from fills — so the
     #       column v3 added to it (`confidence`) could only ever be 0.0.
-    SCHEMA_VERSION = 4
+    #   v5  long_short_ratios.source: which venue's accounts a row counts
+    #       (Binance, or the Bybit/OKX fallback where Binance is blocked), so
+    #       stored history never silently mixes crowds. Existing rows were all
+    #       Binance, hence the default.
+    SCHEMA_VERSION = 5
 
     # Tables that no code path has ever written to, by the version that
     # drops them. A dead table is dropped only when EMPTY; a populated one
@@ -477,9 +482,12 @@ class DataStore:
     def _migrate_v4(self) -> None:
         self._drop_dead_tables(4)
 
+    def _migrate_v5(self) -> None:
+        self._add_column("long_short_ratios", "source", "TEXT NOT NULL DEFAULT 'binance'")
+
     # version -> migration step. Steps run in order for every version above
     # the DB's recorded one, each followed by a schema_version row.
-    _MIGRATIONS = {3: _migrate_v3, 4: _migrate_v4}
+    _MIGRATIONS = {3: _migrate_v3, 4: _migrate_v4, 5: _migrate_v5}
 
     def _run_migrations(self) -> None:
         """Versioned migrations. Caller holds the lock.
@@ -768,7 +776,14 @@ class DataStore:
     # ── HLP Persistence ──────────────────────────────────────
 
     def _save_hlp_trade(self, trade) -> None:
-        """Callback: queue an HLP trade for the writer thread."""
+        """Callback: queue an HLP liquidation absorption for the writer thread.
+
+        Only absorptions are stored. HLP's strategy vaults make ~220 ordinary
+        market making fills a minute (~390k rows a day), which would swamp the
+        table without saying anything the snapshots don't.
+        """
+        if not getattr(trade, "is_liquidation", False):
+            return
         self._enqueue(
             """INSERT INTO hlp_trades
                (timestamp, symbol, side, price, size, size_usd, direction,
@@ -890,13 +905,14 @@ class DataStore:
     def save_long_short_ratio(self, snap) -> None:
         self._enqueue(
             "INSERT INTO long_short_ratios (timestamp, symbol, long_ratio, short_ratio, "
-            "long_short_ratio, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (snap.timestamp, snap.symbol, snap.long_ratio, snap.short_ratio, snap.long_short_ratio, time.time()),
+            "long_short_ratio, created_at, source) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (snap.timestamp, snap.symbol, snap.long_ratio, snap.short_ratio, snap.long_short_ratio, time.time(),
+             getattr(snap, "source", "binance")),
         )
 
     def get_long_short_ratios(self, symbol: str | None = None, hours: float = 24, limit: int = 200) -> list[dict]:
         cutoff = time.time() - (hours * 3600)
-        query = ("SELECT timestamp, symbol, long_ratio, short_ratio, long_short_ratio "
+        query = ("SELECT timestamp, symbol, long_ratio, short_ratio, long_short_ratio, source "
                  "FROM long_short_ratios WHERE timestamp > ?")
         params: list = [cutoff]
         if symbol:
@@ -909,7 +925,7 @@ class DataStore:
             rows = self._conn.execute(query, params).fetchall()
         return [
             {"timestamp": r[0], "symbol": r[1], "long_ratio": r[2],
-             "short_ratio": r[3], "long_short_ratio": r[4]}
+             "short_ratio": r[3], "long_short_ratio": r[4], "source": r[5]}
             for r in rows
         ]
 

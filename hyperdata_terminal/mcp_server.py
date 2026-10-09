@@ -180,10 +180,10 @@ class HubTools:
     ) -> dict[str, Any]:
         minutes = max(1, min(int(minutes), 1440))
         feed = self.hub.liquidations
-        stats = feed.get_stats(window_minutes=minutes, include_estimated=include_estimated)
-        events = feed.get_recent(minutes=minutes, symbol=self._sym(symbol) if symbol else None)
-        if not include_estimated:
-            events = [e for e in events if getattr(e, "confirmed", True)]
+        sym = self._sym(symbol) if symbol else None
+        # Totals, breakdowns and the event list all respect the symbol filter.
+        stats = feed.get_stats(window_minutes=minutes, include_estimated=include_estimated, symbol=sym)
+        events = feed.get_recent(minutes=minutes, symbol=sym, include_estimated=include_estimated)
         return self._with_meta({
             "window_minutes": minutes,
             "symbol": self._sym(symbol) if symbol else "ALL",
@@ -410,8 +410,14 @@ def build_server(hub_factory=None):
     def tools() -> HubTools:
         return state["tools"]
 
+    # Every tool is `async def` on purpose. The MCP SDK runs a plain `def` tool
+    # on a worker thread, where it would iterate deques and mutate CVD buckets
+    # while the hub's event loop writes to them ("deque mutated during
+    # iteration", lost updates in the running sums). An async tool with no
+    # awaits runs to completion on the loop thread, atomically.
+
     @server.tool(annotations=read_only)
-    def get_market_overview(limit: int = 20, sort_by: str = "open_interest") -> dict[str, Any]:
+    async def get_market_overview(limit: int = 20, sort_by: str = "open_interest") -> dict[str, Any]:
         """Hyperliquid perps ranked by open_interest, volume, change (abs 24h move) or funding.
 
         Returns price, 24h change, hourly and annualized funding, OI, volume and mark premium.
@@ -419,13 +425,13 @@ def build_server(hub_factory=None):
         return tools().market_overview(limit=limit, sort_by=sort_by)
 
     @server.tool(annotations=read_only)
-    def get_asset(symbol: str) -> dict[str, Any]:
+    async def get_asset(symbol: str) -> dict[str, Any]:
         """Everything known about one asset: price, OI, funding on every venue, long/short account
         ratio, spot basis, order flow by timeframe and tracked positions near liquidation."""
         return tools().asset(symbol)
 
     @server.tool(annotations=read_only)
-    def get_liquidations(
+    async def get_liquidations(
         minutes: int = 60, symbol: str | None = None, include_estimated: bool = False, limit: int = 25,
     ) -> dict[str, Any]:
         """Liquidations across Binance, Bybit, OKX and Hyperliquid over the last N minutes (max 1440):
@@ -434,43 +440,45 @@ def build_server(hub_factory=None):
         return tools().liquidations(minutes=minutes, symbol=symbol, include_estimated=include_estimated, limit=limit)
 
     @server.tool(annotations=read_only)
-    def get_liquidation_heatmap(symbol: str = "BTC", buckets: int = 24, range_pct: float = 10.0) -> dict[str, Any]:
+    async def get_liquidation_heatmap(
+        symbol: str = "BTC", buckets: int = 24, range_pct: float = 10.0,
+    ) -> dict[str, Any]:
         """Where tracked Hyperliquid positions get liquidated: USD of longs (below price) and shorts
         (above price) per price level within +/- range_pct, plus the largest clusters."""
         return tools().liquidation_heatmap(symbol=symbol, buckets=buckets, range_pct=range_pct)
 
     @server.tool(annotations=read_only)
-    def get_whale_positions(
+    async def get_whale_positions(
         min_size_usd: float = 1_000_000, symbol: str | None = None, limit: int = 20,
     ) -> dict[str, Any]:
         """Largest open Hyperliquid positions (address, side, size, entry, liquidation price, PnL, leverage)."""
         return tools().whale_positions(min_size_usd=min_size_usd, symbol=symbol, limit=limit)
 
     @server.tool(annotations=read_only)
-    def get_positions_near_liquidation(max_distance_pct: float = 2.0, symbol: str | None = None,
+    async def get_positions_near_liquidation(max_distance_pct: float = 2.0, symbol: str | None = None,
                                        limit: int = 20) -> dict[str, Any]:
         """Tracked Hyperliquid positions within max_distance_pct of their liquidation price, closest first."""
         return tools().near_liquidation(max_distance_pct=max_distance_pct, symbol=symbol, limit=limit)
 
     @server.tool(annotations=read_only)
-    def get_order_flow(symbol: str = "BTC") -> dict[str, Any]:
+    async def get_order_flow(symbol: str = "BTC") -> dict[str, Any]:
         """Cumulative volume delta and buy/sell imbalance for 1m to 24h windows, per venue attribution."""
         return tools().order_flow(symbol)
 
     @server.tool(annotations=read_only)
-    def get_hlp_vault(top: int = 10) -> dict[str, Any]:
+    async def get_hlp_vault(top: int = 10) -> dict[str, Any]:
         """Hyperliquid's HLP market maker vault: AUM, net delta and its z-score, top positions and the
         liquidations it absorbed in the last hour."""
         return tools().hlp_vault(top=top)
 
     @server.tool(annotations=read_only)
-    def get_funding_extremes(min_annualized_pct: float = 50.0, limit: int = 15) -> dict[str, Any]:
+    async def get_funding_extremes(min_annualized_pct: float = 50.0, limit: int = 15) -> dict[str, Any]:
         """Assets whose Hyperliquid funding exceeds min_annualized_pct (either sign), with Binance and
         Bybit funding for comparison."""
         return tools().funding_extremes(min_annualized_pct=min_annualized_pct, limit=limit)
 
     @server.tool(annotations=read_only)
-    def get_data_health() -> dict[str, Any]:
+    async def get_data_health() -> dict[str, Any]:
         """Self-verification report: cross-checks against external sources, feed freshness and which
         venue each fallback source is using. Call this before trusting a surprising number."""
         return tools().data_health()

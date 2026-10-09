@@ -334,7 +334,8 @@ class TestS2NoDeadWalletTable:
         with caplog.at_level("INFO"):
             store = DataStore(path)
             try:
-                assert store.get_schema_version() == DataStore.SCHEMA_VERSION == 4
+                # v4 (the wallets drop) ran; later versions may stack on top.
+                assert store.get_schema_version() == DataStore.SCHEMA_VERSION >= 4
             finally:
                 store.close()
         assert "wallets" not in _tables(path)
