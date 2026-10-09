@@ -69,6 +69,9 @@ class HLPSnapshot:
     # PnL tracking
     total_unrealized_pnl: float = 0.0
     session_pnl: float = 0.0    # PnL since tracking started
+    # Where account_value came from: "vaultDetails" (what Hyperliquid reports)
+    # or "clearinghouseState" (summed fallback, misses Strategy X).
+    aum_source: str = "clearinghouseState"
 
 
 @dataclass
@@ -155,6 +158,7 @@ class HLPTracker:
         self._tids_at_watermark: dict[str, set[int]] = {}
         self._callbacks: list = []
         self._session_start_value: float = 0.0
+        self._session_start_source: str = ""
         self.child_vaults: list[str] = list(self.FALLBACK_CHILD_VAULTS)
         self._vault_details_at: float = 0.0
         self.reported_aum: float = 0.0  # from vaultDetails; 0 until fetched
@@ -211,9 +215,9 @@ class HLPTracker:
     async def refresh_vault_details(self) -> None:
         """Re-read the parent's child list and reported AUM (keeps the last known on failure)."""
         data = await self._post({"type": "vaultDetails", "vaultAddress": self.PARENT_VAULT})
-        self._vault_details_at = time.time()
         if not isinstance(data, dict):
-            return
+            return  # retried on the next snapshot pass, not in 5 minutes
+        self._vault_details_at = time.time()
         children = (data.get("relationship") or {}).get("data", {}).get("childAddresses")
         if isinstance(children, list) and children:
             self.child_vaults = [str(c).lower() for c in children if isinstance(c, str)]
@@ -244,17 +248,27 @@ class HLPTracker:
                     await self.refresh_vault_details()
                 snapshot = await self._take_aggregate_snapshot()
                 if snapshot:
-                    snapshot.delta_zscore = self._compute_delta_zscore(snapshot.net_delta_usd)
-                    self.snapshots.append(snapshot)
-
-                    if self._session_start_value == 0:
-                        self._session_start_value = snapshot.account_value
-                    snapshot.session_pnl = snapshot.account_value - self._session_start_value
+                    self.record_snapshot(snapshot)
             except asyncio.CancelledError:
                 return
             except Exception:
                 logger.exception("[hlp] snapshot error")
             await asyncio.sleep(self.SNAPSHOT_INTERVAL)
+
+    def record_snapshot(self, snapshot: HLPSnapshot) -> None:
+        """Append a snapshot, filling in its z score and session PnL.
+
+        Session PnL is measured against the first snapshot *from the same AUM
+        source*. If vaultDetails was down at start, AUM begins as the summed
+        clearinghouse value (~$100M short, no Strategy X); when the reported
+        figure arrives, the baseline resets instead of showing a fake +$100M.
+        """
+        snapshot.delta_zscore = self._compute_delta_zscore(snapshot.net_delta_usd)
+        if self._session_start_value == 0 or snapshot.aum_source != self._session_start_source:
+            self._session_start_value = snapshot.account_value
+            self._session_start_source = snapshot.aum_source
+        snapshot.session_pnl = snapshot.account_value - self._session_start_value
+        self.snapshots.append(snapshot)
 
     async def _take_aggregate_snapshot(self) -> HLPSnapshot | None:
         """One snapshot summing every HLP vault; None unless every vault answered.
@@ -350,6 +364,7 @@ class HLPTracker:
         return HLPSnapshot(
             timestamp=time.time(),
             account_value=reported_aum if reported_aum > 0 else account_value,
+            aum_source="vaultDetails" if reported_aum > 0 else "clearinghouseState",
             total_margin_used=total_margin_used,
             positions=positions,
             net_delta_usd=net_delta_usd,
@@ -533,5 +548,5 @@ class HLPTracker:
             "total_snapshots": len(self.snapshots),
             "total_trades": len(self.trades),
             "liquidation_absorptions": len(self.absorptions),
-            "aum_source": "vaultDetails" if self.reported_aum > 0 else "clearinghouseState",
+            "aum_source": snap.aum_source if snap else "",
         }

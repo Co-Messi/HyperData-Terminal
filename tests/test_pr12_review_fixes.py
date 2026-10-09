@@ -112,6 +112,30 @@ class TestHlp:
         assert snap.total_exposure_usd == pytest.approx(1_900_000)  # not the netted 100K
         assert HLPTracker.build_snapshot(states).account_value == 6_000_000  # fallback: summed
 
+    def test_aum_source_switch_does_not_fake_session_pnl(self):
+        from hyperdata_terminal.data_layer.hlp_tracker import HLPTracker
+
+        tracker = HLPTracker()
+        states = [_state(79_000_000, [])]
+        tracker.record_snapshot(HLPTracker.build_snapshot(states))                      # vaultDetails down
+        tracker.record_snapshot(HLPTracker.build_snapshot(states, reported_aum=179_900_000))  # it came back
+        tracker.record_snapshot(HLPTracker.build_snapshot(states, reported_aum=179_950_000))
+        pnl = [s.session_pnl for s in tracker.snapshots]
+        assert pnl == [0.0, 0.0, pytest.approx(50_000)]  # never +$100M
+        assert tracker.get_stats()["aum_source"] == "vaultDetails"
+
+    async def test_failed_vault_details_is_retried_next_pass(self):
+        from hyperdata_terminal.data_layer.hlp_tracker import HLPTracker
+
+        tracker = HLPTracker()
+
+        async def down(payload):
+            return None
+
+        tracker._post = down
+        await tracker.refresh_vault_details()
+        assert tracker._vault_details_at == 0.0  # still due: the snapshot loop retries in 30s
+
     def test_parse_reported_aum(self):
         from hyperdata_terminal.data_layer.hlp_tracker import HLPTracker
 
@@ -230,7 +254,11 @@ def test_env_file_sets_the_data_dir(tmp_path, monkeypatch):
         "cli._load_env()\n"
         "from hyperdata_terminal.paths import DATA_DIR; print(DATA_DIR)\n"
     )
-    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True, cwd=tmp_path)
+    import os
+
+    env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1])}
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True,
+                         cwd=tmp_path, env=env)
     assert out.stdout.strip() == str(target)
 
 
