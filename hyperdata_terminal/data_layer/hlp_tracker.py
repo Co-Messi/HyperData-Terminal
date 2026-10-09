@@ -122,6 +122,12 @@ class HLPTracker:
     FILLS_INTERVAL = 120
     CHILD_REFRESH_INTERVAL = 3600
     ZSCORE_WINDOW = 100         # Use last 100 snapshots for Z-score
+    # userFills returns each vault's last 2000 fills: days of history on the
+    # first poll. Those seed the display history but fire no callbacks, or
+    # every start would push ~12k old rows through persistence (duplicating
+    # them on each restart) and the hub's liquidation stream. Fills up to
+    # this long before start still notify, to cover a quick restart.
+    NOTIFY_BACKFILL_SECONDS = 120
 
     def __init__(self) -> None:
         self.snapshots: deque[HLPSnapshot] = deque(maxlen=2000)  # ~16 hours at 30s
@@ -139,6 +145,7 @@ class HLPTracker:
         self._session_start_value: float = 0.0
         self.child_vaults: list[str] = list(self.FALLBACK_CHILD_VAULTS)
         self._children_refreshed_at: float = 0.0
+        self._started_at: float = 0.0  # 0 = not started: every fill notifies (tests, ad hoc use)
 
     @property
     def vault_addresses(self) -> list[str]:
@@ -148,6 +155,7 @@ class HLPTracker:
 
     async def start(self) -> None:
         self._running = True
+        self._started_at = time.time()
         self._session = aiohttp.ClientSession()
         self._tasks = [
             asyncio.create_task(self._snapshot_loop(), name="hlp-snapshot"),
@@ -361,6 +369,8 @@ class HLPTracker:
             self.trades.append(trade)
             new_trades.append(trade)
 
+            if self._started_at and trade.timestamp < self._started_at - self.NOTIFY_BACKFILL_SECONDS:
+                continue  # history from the first poll: display only
             for cb in self._callbacks:
                 try:
                     cb(trade)

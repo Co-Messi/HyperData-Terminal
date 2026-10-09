@@ -233,6 +233,21 @@ class TestHLP:
         assert [t.timestamp for t in tracker.process_fills("0xv", [newer, liq_fill, plain_fill])] == [1_700_000_001.0]
         assert len(seen) == 3
 
+    def test_history_from_the_first_poll_fires_no_callbacks(self):
+        from hyperdata_terminal.data_layer.hlp_tracker import HLPTracker
+
+        tracker = HLPTracker()
+        tracker._started_at = time.time()
+        seen = []
+        tracker.on_hlp_trade(seen.append)
+        now_ms = int(time.time() * 1000)
+        base = {"coin": "BTC", "px": "1", "sz": "1", "side": "B", "dir": "Open Long"}
+        old = dict(base, time=now_ms - 86_400_000, tid=1)
+        new = dict(base, time=now_ms, tid=2)
+        trades = tracker.process_fills("0xv", [new, old])
+        assert len(trades) == 2 and len(tracker.trades) == 2  # both shown
+        assert [t.timestamp for t in seen] == [now_ms / 1000]  # only the live one persisted / emitted
+
     async def test_hub_emits_confirmed_liquidations_only_for_this_session(self, tmp_path, monkeypatch):
         from hyperdata_terminal.data_layer.hlp_tracker import HLPTrade
 

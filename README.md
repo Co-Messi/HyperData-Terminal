@@ -33,6 +33,7 @@ hyperdata
 pipx install hyperdata-terminal         # or: uv tool install hyperdata-terminal
 uvx hyperdata-terminal                  # or run once without installing
 pip install hyperdata-terminal          # into the current environment
+pipx install git+https://github.com/Co-Messi/HyperData-Terminal   # latest main
 ```
 
 Requires Python 3.12 or newer. Want the MCP server too? `pipx install "hyperdata-terminal[mcp]"`.
