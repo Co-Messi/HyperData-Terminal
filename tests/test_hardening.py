@@ -362,6 +362,7 @@ class TestMalformedPayloads:
     async def test_okx_malformed_detail_dropped_individually(self):
         feed = LiquidationFeed()
         conn = OKXConnection(feed)
+        conn._contracts = {"BTC-USDT-SWAP": ("linear", 0.01)}
         received = []
         feed.on_liquidation(received.append)
 

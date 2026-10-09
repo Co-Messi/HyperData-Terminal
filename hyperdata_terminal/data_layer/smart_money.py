@@ -324,11 +324,12 @@ class SmartMoneyEngine:
     # ── Rate limiting ─────────────────────────────────────────────────
 
     # Hyperliquid limits each IP to 1200 request weight per minute, shared by
-    # every component (the position scanner alone can use about half). A
+    # every component (measured: the rest of the app uses about 750). A
     # userFills call costs 20 plus 1 per 20 fills returned: an active wallet
     # returns 2000 fills, so ~120 weight. A batch of 20 wallets at 8 requests a
-    # second spent ~2400 weight in seconds and drew HTTP 429s that also starved
-    # the scanner and HLP tracker. Smart money now keeps to its own budget.
+    # second spent ~2400 weight in seconds and drew HTTP 429s, and going over a
+    # shared limit puts the scanner and HLP tracker at risk too. Smart money
+    # now keeps to its own budget.
     WEIGHT_BUDGET_PER_MIN = 360
 
     async def _rate_limit(self) -> None:
@@ -495,20 +496,18 @@ class SmartMoneyEngine:
                     len(batch), len(self.wallets),
                 )
 
-                for i, wallet in enumerate(batch, 1):
+                for wallet in batch:
                     if not self._running:
                         break
                     try:
                         await self.analyze_wallet(wallet.address)
                     except Exception:
                         logger.debug("[smart_money] Failed to analyze %s", wallet.address[:10])
-                    if i % 5 == 0:
-                        # The weight budget makes a batch take minutes; rank as
-                        # wallets come in so the panel fills during the first one.
-                        self.rank_all()
-
-                # Re-rank after each batch
-                self.rank_all()
+                    # The weight budget makes a batch take minutes (a few wallets
+                    # a minute), so rank after every wallet: tiers then appear the
+                    # moment enough wallets qualify, and the panel's ranked count
+                    # never runs ahead of its tiers.
+                    self.rank_all()
 
                 ranked_count = sum(1 for w in self.wallets.values() if self._qualifies_for_ranking(w))
                 logger.info(
@@ -845,7 +844,8 @@ class SmartMoneyEngine:
 
     def get_stats(self) -> dict:
         """Summary stats: total wallets, ranked wallets, signals generated."""
-        ranked = sum(1 for w in self.wallets.values() if self._qualifies_for_ranking(w))
+        # Wallets rank_all() has ranked, so the count always matches the tiers.
+        ranked = sum(1 for w in self.wallets.values() if w.rank > 0)
         smart = sum(1 for w in self.wallets.values() if w.tier == "smart")
         dumb = sum(1 for w in self.wallets.values() if w.tier == "dumb")
         average = sum(1 for w in self.wallets.values() if w.tier == "average")

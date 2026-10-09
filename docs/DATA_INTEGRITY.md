@@ -13,7 +13,7 @@ report a `coverage` block plus a per-exchange `method` tag:
 
 | Exchange | Method | What it means |
 |---|---|---|
-| **OKX** | `confirmed` | Real `liquidation-orders` feed across all SWAP instruments. |
+| **OKX** | `confirmed` | Real `liquidation-orders` feed across all SWAP instruments. OKX reports size in contracts (BTC-USDT-SWAP is 0.01 BTC, DOGE-USDT-SWAP 1000 DOGE, inverse BTC-USD-SWAP $100), converted with each swap's contract value from OKX's instrument list; a swap not in the list is dropped, not guessed. Versions before 1.0 multiplied contracts by price, so OKX rows stored by them are wrong (BTC 100x too large). |
 | **Bybit** | `confirmed` | Real `allLiquidation` v5 feed across the tracked symbols (those with a Bybit linear perp). Subscriptions are batched because Bybit caps args per request. |
 | **Binance** | `sampled` | The `!forceOrder` stream is **throttled by Binance to ~1 liquidation per symbol per second**. Large cascades are undercounted *at the source* — this cannot be fixed client-side, only disclosed. |
 | **Hyperliquid** | `partial` | Hyperliquid has **no public liquidation feed**. *Confirmed* events are liquidations an HLP vault took the other side of: Hyperliquid marks those fills with a `liquidation` object (`method: market` or `backstop`), and the HLP tracker polls every child vault's fills (~2 min delay). In practice most are `market` fills by Strategy A/B when HLP happened to be the book counterparty (several per hour in a live check), grouped by transaction hash so a liquidation both vaults filled counts once; Liquidator backstops are rarer. Liquidations filled by other traders are invisible. |
@@ -147,6 +147,17 @@ several Liquidators) that hold the positions.
   Pre-start fills are stored but never emitted as live liquidations, and
   absorptions read when the app stops are still stored. Ordinary market
   making fills (~300 a minute) are not stored.
+
+## Smart money warmup
+
+Wallets are ranked from their own fill history (`userFills`, about 120
+request weight for an active wallet). Hyperliquid allows 1200 weight a minute
+per IP, shared by every component, and the rest of the app uses about 750
+(measured), so smart money keeps to 360 a minute: a few wallets a minute.
+Tiers need 10 ranked wallets, so the smart and dumb money tables fill in over
+the first few minutes, and the panel says so while they do. Without the
+budget, a batch of wallets drew HTTP 429s, and because the limit is shared,
+going over it puts the scanner and the HLP tracker at risk too.
 
 ## Staleness watchdog (frozen feeds never read as live)
 

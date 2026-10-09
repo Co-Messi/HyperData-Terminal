@@ -270,14 +270,89 @@ class BybitConnection(ExchangeConnection):
 
 
 class OKXConnection(ExchangeConnection):
+    """OKX liquidation-orders for every SWAP.
+
+    OKX reports liquidation size in contracts, not coins: BTC-USDT-SWAP is
+    0.01 BTC a contract, DOGE-USDT-SWAP 1000 DOGE, and the inverse
+    BTC-USD-SWAP $100. Sizes are converted with each swap's contract value
+    from OKX's instrument list; a swap missing from it is dropped, never
+    guessed (contracts times price was off by 100x for BTC).
+    """
+
+    INSTRUMENTS_URL = "https://www.okx.com/api/v5/public/instruments?instType=SWAP"
+    SPEC_RETRY_SECONDS = 60       # while no contract sizes are loaded
+    SPEC_REFRESH_SECONDS = 600    # when a swap is missing (a new listing)
+
     def __init__(self, feed: LiquidationFeed):
         super().__init__(
             name="okx",
             ws_url="wss://ws.okx.com:8443/ws/v5/public",
             feed=feed,
         )
+        # instId -> (ctType, contract value): base coin for linear, USD for inverse
+        self._contracts: dict[str, tuple[str, float]] = {}
+        self._specs_attempted_at = 0.0
+        self._spec_task: asyncio.Task | None = None
+        self._unsized_logged: set[str] = set()
+        self.unsized_drops = 0
+
+    async def _load_contracts(self) -> None:
+        self._specs_attempted_at = time.time()
+        if self._session is None or self._session.closed:
+            return
+        try:
+            async with self._session.get(
+                self.INSTRUMENTS_URL, timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                if resp.status != 200:
+                    logger.warning("[okx] instrument list returned HTTP %d", resp.status)
+                    return
+                body = await resp.json()
+        except Exception as exc:
+            logger.warning("[okx] could not load contract sizes: %r", exc)
+            return
+        specs: dict[str, tuple[str, float]] = {}
+        data = body.get("data") if isinstance(body, dict) else None
+        for inst in data if isinstance(data, list) else []:
+            try:
+                value = float(inst["ctVal"]) * float(inst.get("ctMult") or 1)
+                if value > 0:
+                    specs[str(inst["instId"])] = (str(inst["ctType"]), value)
+            except (KeyError, TypeError, ValueError, AttributeError):
+                continue
+        if specs:
+            self._contracts = specs
+            logger.info("[okx] contract sizes loaded for %d swaps", len(specs))
+
+    def _maybe_reload_contracts(self) -> None:
+        wait = self.SPEC_REFRESH_SECONDS if self._contracts else self.SPEC_RETRY_SECONDS
+        if time.time() - self._specs_attempted_at < wait:
+            return
+        if self._spec_task is not None and not self._spec_task.done():
+            return
+        self._specs_attempted_at = time.time()
+        self._spec_task = asyncio.create_task(self._load_contracts(), name="okx-contracts")
+
+    def _size(self, inst_id: str, price: float, contracts: float) -> tuple[float, float] | None:
+        """(size_usd, coin quantity) for `contracts` of `inst_id`, or None if unknown."""
+        spec = self._contracts.get(inst_id)
+        if spec is None:
+            return None
+        ct_type, value = spec
+        if ct_type == "inverse":
+            size_usd = contracts * value
+            return size_usd, (size_usd / price if price > 0 else 0.0)
+        qty = contracts * value
+        return qty * price, qty
+
+    async def stop(self) -> None:
+        if self._spec_task is not None and not self._spec_task.done():
+            self._spec_task.cancel()
+        await super().stop()
 
     async def _on_connected(self, ws: aiohttp.ClientWebSocketResponse) -> None:
+        if not self._contracts:
+            await self._load_contracts()
         await ws.send_json({
             "op": "subscribe",
             "args": [{"channel": "liquidation-orders", "instType": "SWAP"}],
@@ -306,15 +381,20 @@ class OKXConnection(ExchangeConnection):
             for det in details:
                 try:
                     price = float(det.get("bkPx", 0) or 0)
-                    qty = float(det.get("sz", 0) or 0)
+                    contracts = float(det.get("sz", 0) or 0)
                     side_raw = str(det.get("side", "")).lower()
                     ts_raw = det.get("ts", "0") or "0"
+                    sized = self._size(str(inst_id), price, contracts)
+                    if sized is None:
+                        self._drop_unsized(str(inst_id))
+                        continue
+                    size_usd, qty = sized
                     event = LiquidationEvent(
                         timestamp=int(ts_raw) / 1000.0,
                         exchange="okx",
                         symbol=normalize_symbol(inst_id, "okx"),
                         side="long" if side_raw == "sell" else "short",
-                        size_usd=price * qty,
+                        size_usd=size_usd,
                         price=price,
                         quantity=qty,
                     )
@@ -322,6 +402,14 @@ class OKXConnection(ExchangeConnection):
                     self.feed.record_parse_error("okx", det)
                     continue
                 await self.feed.emit(event)
+
+    def _drop_unsized(self, inst_id: str) -> None:
+        self.unsized_drops += 1
+        if inst_id not in self._unsized_logged:
+            self._unsized_logged.add(inst_id)
+            logger.warning("[okx] no contract size for %s; its liquidations are dropped "
+                           "until the instrument list has it", inst_id)
+        self._maybe_reload_contracts()
 
 
 class HyperliquidConnection:

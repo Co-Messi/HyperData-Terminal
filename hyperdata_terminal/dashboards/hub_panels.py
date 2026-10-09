@@ -495,11 +495,15 @@ class HubSmartMoney:
         stats_line.append(f" Tracked:{sm_stats['total_wallets']:,}", style="bright_white")
         stats_line.append(f"  Ranked:{sm_stats['ranked_wallets']:,}", style="bright_yellow")
         stats_line.append(f"  Signals:{sm_stats['total_signals']:,}\n", style="bright_cyan")
-        if not sm_stats["ranked_wallets"]:
-            # Wallets are ranked from their fill history, fetched as they show
-            # up on the tape: an empty table at start is warmup, not a fault.
-            stats_line.append(" Ranking wallets from their fill history (fills in over the first minutes)\n",
-                              style="dim yellow")
+        if not sm_stats["smart_wallets"]:
+            # Wallets are ranked from their fill history, fetched a few a minute
+            # to stay inside Hyperliquid's rate limit, and tiers need a minimum
+            # population: an empty table at start is warmup, not a fault.
+            need = self.hub.smart_money.MIN_TIERED_POPULATION
+            stats_line.append(
+                f" Warming up: tiers start at {need} ranked ({sm_stats['ranked_wallets']} so far)\n",
+                style="dim yellow",
+            )
 
         # ── Smart money table ──
         # CONF = sample-size confidence (0-100%). A tier label is a heuristic

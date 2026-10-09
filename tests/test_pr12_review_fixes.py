@@ -694,3 +694,150 @@ def test_mcp_hlp_vault_reports_aum_source_and_pnl_validity(tmp_path, monkeypatch
     out = HubTools(hub).hlp_vault()
     assert out["aum_source"] == "clearinghouseState" and out["aum_is_partial"] is True
     assert out["session_pnl_usd"] is None  # unknown, not a misleading 0
+
+
+def _okx_frame(inst_id: str, bk_px: str, sz: str, side: str = "buy") -> dict:
+    return {"arg": {"channel": "liquidation-orders"}, "data": [{
+        "instId": inst_id,
+        "details": [{"bkPx": bk_px, "sz": sz, "side": side, "ts": "1791531267237"}],
+    }]}
+
+
+@pytest.mark.parametrize("inst_id,spec,bk_px,sz,usd,qty", [
+    # live sample: 7.31 contracts of 0.01 BTC, was reported as $603K
+    ("BTC-USDT-SWAP", ("linear", 0.01), "82561.5", "7.31", 6035.25, 0.0731),
+    ("DOGE-USDT-SWAP", ("linear", 1000.0), "0.25", "2", 500.0, 2000.0),  # was $0.50
+    ("BTC-USD-SWAP", ("inverse", 100.0), "80000", "3", 300.0, 0.00375),  # $100 a contract
+])
+async def test_okx_liquidation_size_uses_contract_value(inst_id, spec, bk_px, sz, usd, qty):
+    """OKX reports liquidation size in contracts; contracts x price was off by 100x for BTC."""
+    from hyperdata_terminal.data_layer.liquidation_feed import OKXConnection
+
+    feed = LiquidationFeed()
+    got = []
+    feed.on_liquidation(got.append)
+    conn = OKXConnection(feed)
+    conn._contracts = {inst_id: spec}
+    await conn._on_message(_okx_frame(inst_id, bk_px, sz))
+    assert len(got) == 1
+    assert got[0].size_usd == pytest.approx(usd)
+    assert got[0].quantity == pytest.approx(qty)
+    assert got[0].symbol == "BTC" if inst_id.startswith("BTC") else "DOGE"
+
+
+async def test_okx_unknown_swap_is_dropped_not_guessed():
+    from hyperdata_terminal.data_layer.liquidation_feed import OKXConnection
+
+    feed = LiquidationFeed()
+    got = []
+    feed.on_liquidation(got.append)
+    conn = OKXConnection(feed)
+    conn._contracts = {"BTC-USDT-SWAP": ("linear", 0.01)}
+    await conn._on_message(_okx_frame("NEWCOIN-USDT-SWAP", "1.0", "500"))
+    await conn._on_message(_okx_frame("NEWCOIN-USDT-SWAP", "1.0", "500"))
+    assert got == [] and conn.unsized_drops == 2
+    assert feed.parse_errors.get("okx", 0) == 0  # well formed, just not sizable yet
+
+
+async def test_okx_loads_contract_values_from_instrument_list():
+    from hyperdata_terminal.data_layer.liquidation_feed import OKXConnection
+
+    body = {"code": "0", "data": [
+        {"instId": "BTC-USDT-SWAP", "ctType": "linear", "ctVal": "0.01", "ctMult": "1"},
+        {"instId": "BTC-USD-SWAP", "ctType": "inverse", "ctVal": "100", "ctMult": "1"},
+        {"instId": "BAD-USDT-SWAP", "ctType": "linear", "ctVal": ""},
+        "garbage",
+    ]}
+
+    class _Resp:
+        status = 200
+
+        async def json(self):
+            return body
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class _Session:
+        closed = False
+
+        def get(self, url, **kw):
+            assert "instType=SWAP" in url
+            return _Resp()
+
+    conn = OKXConnection(LiquidationFeed())
+    conn._session = _Session()
+    await conn._load_contracts()
+    assert conn._contracts == {"BTC-USDT-SWAP": ("linear", 0.01), "BTC-USD-SWAP": ("inverse", 100.0)}
+
+
+def test_smart_money_ranked_count_matches_tiers():
+    """'Ranked:10' with '0 smart / 0 dumb': the count was live, the tiers only set by rank_all."""
+    from hyperdata_terminal.data_layer.smart_money import SmartMoneyEngine, WalletProfile
+
+    engine = SmartMoneyEngine()
+    for i in range(10):
+        addr = f"0x{i:040x}"
+        engine.wallets[addr] = WalletProfile(
+            address=addr, discovered_at=0, last_seen=0, last_analyzed=0,
+            total_trades=20, total_volume_usd=1e6, composite_score=1.0 - i / 10,
+        )
+    assert engine.get_stats()["ranked_wallets"] == 0  # qualified, not ranked yet
+    engine.rank_all()
+    stats = engine.get_stats()
+    assert stats["ranked_wallets"] == 10 and stats["smart_wallets"] == 1 and stats["dumb_wallets"] == 1
+
+
+async def test_smart_money_ranks_after_every_wallet(monkeypatch):
+    import asyncio
+
+    from hyperdata_terminal.data_layer.smart_money import SmartMoneyEngine, WalletProfile
+
+    engine = SmartMoneyEngine()
+    for i in range(12):
+        addr = f"0x{i:040x}"
+        engine.wallets[addr] = WalletProfile(address=addr, discovered_at=0, last_seen=i, last_analyzed=0)
+    seen = []
+
+    async def fake_analyze(address):
+        seen.append(engine.get_stats()["ranked_wallets"])
+        w = engine.wallets[address]
+        w.total_trades, w.total_volume_usd = 20, 1e6
+        w.composite_score = w.last_seen
+        w.last_analyzed = time.time()
+        return w
+
+    async def stop_sleep(seconds):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(engine, "analyze_wallet", fake_analyze)
+    monkeypatch.setattr(asyncio, "sleep", stop_sleep)
+    engine._running = True
+    with pytest.raises(asyncio.CancelledError):  # the sleep after the batch ends the test
+        await engine._analysis_loop()
+    assert seen == list(range(12))  # each wallet sees every earlier one ranked
+
+
+@pytest.mark.parametrize("n,warming", [(0, True), (4, True), (50, False)])
+def test_smart_money_panel_explains_warmup_until_tiers_exist(n, warming):
+    """Under the weight budget tiers take minutes; 1 to 9 ranked showed bare '---' rows."""
+    from unittest.mock import MagicMock
+
+    from rich.console import Console
+
+    from hyperdata_terminal.dashboards.hub_panels import HubSmartMoney
+    from tests.test_review_fixes import TestC1Tiers
+
+    engine = TestC1Tiers._engine_with(n)
+    hub = MagicMock()
+    hub.smart_money = engine
+    hub.get_smart_money = engine.get_smart_money
+    hub.get_dumb_money = engine.get_dumb_money
+    hub.get_smart_money_signals = lambda n=50: []
+    console = Console(record=True, width=160, force_terminal=False)
+    console.print(HubSmartMoney(hub).build_compact())
+    text = console.export_text()
+    assert (f"tiers start at 10 ranked ({n} so far)" in text) is warming

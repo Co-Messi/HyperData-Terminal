@@ -1,6 +1,7 @@
 # README demo. Regenerate with:  vhs assets/demo.tape   (https://github.com/charmbracelet/vhs)
-# Needs `hyperdata` on PATH. The hub warms up off camera (positions take ~30s),
-# so the recording shows the typed command and then the live combined view.
+# Needs `hyperdata` on PATH. The hub warms up off camera (positions take ~30s,
+# smart money tiers a few minutes), so the recording shows the typed command
+# and then the live combined view.
 
 Output assets/demo.gif
 
@@ -21,6 +22,6 @@ Type "hyperdata all --no-boot"
 Sleep 600ms
 Enter
 Hide
-Sleep 50s
+Sleep 240s
 Show
 Sleep 9s
