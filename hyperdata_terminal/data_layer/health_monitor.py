@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 # External reference endpoints (public, no key).
 BINANCE_PREMIUM_INDEX = "https://fapi.binance.com/fapi/v1/premiumIndex"
 BINANCE_LSR = "https://fapi.binance.com/futures/data/globalLongShortAccountRatio"
+OKX_MARK_PRICE = "https://www.okx.com/api/v5/public/mark-price"
 
 # Tolerances for cross-reference checks. We compare the hub's perp price against
 # Binance's perp MARK price (apples-to-apples — not spot, which carries a basis),
@@ -120,10 +121,20 @@ class DataHealthMonitor:
         hub_btc = hub.market.assets.get("BTC")
         hub_price = hub_btc.price if hub_btc else 0.0
         ext = await _fetch_json(session, BINANCE_PREMIUM_INDEX, {"symbol": "BTCUSDT"})
+        ref_name = "binance_perp"
         try:
             ext_price = float(ext["markPrice"]) if ext else 0.0
         except (KeyError, TypeError, ValueError):
             ext_price = 0.0
+        if ext_price <= 0:
+            # Binance futures answers 451 in several regions; OKX's perp mark
+            # is the same kind of reference (a USDT perp mark, not spot).
+            okx = await _fetch_json(session, OKX_MARK_PRICE, {"instType": "SWAP", "instId": "BTC-USDT-SWAP"})
+            try:
+                ext_price = float(okx["data"][0]["markPx"]) if okx else 0.0
+                ref_name = "okx_perp"
+            except (KeyError, IndexError, TypeError, ValueError):
+                ext_price = 0.0
         if hub_price > 0 and ext_price > 0:
             diff = _pct_diff(hub_price, ext_price)
             if diff < PRICE_WARN_PCT:
@@ -134,7 +145,7 @@ class DataHealthMonitor:
                 status = "fail"
             out.append(HealthCheck(
                 "xref", "btc_price", status,
-                f"hub=${hub_price:,.2f} binance_perp=${ext_price:,.2f} diff={diff:.3f}%",
+                f"hub=${hub_price:,.2f} {ref_name}=${ext_price:,.2f} diff={diff:.3f}%",
             ))
         else:
             out.append(HealthCheck("xref", "btc_price", "warn", "price unavailable"))

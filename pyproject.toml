@@ -43,6 +43,10 @@ dependencies = [
     "python-dotenv>=1.0.0,<2.0",
 ]
 
+[project.optional-dependencies]
+# `hyperdata mcp`: serve the live data to AI agents over the Model Context Protocol.
+mcp = ["mcp>=2.2,<3"]
+
 [project.urls]
 Homepage = "https://hyperdata.vercel.app"
 Source = "https://github.com/Co-Messi/HyperData-Terminal"
