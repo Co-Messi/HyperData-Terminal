@@ -120,9 +120,12 @@ several Liquidators) that hold the positions.
 - **Absorptions** come from the `liquidation` object on child vault fills.
   Fills are read with `userFillsByTime` from a per vault watermark (about 80
   of Hyperliquid's 1200 per minute weight budget), so an empty or lagging
-  response can never replay old fills; the first poll seeds 24 hours of
-  absorptions as history without emitting them. Only absorptions are
-  persisted, not the ~220 ordinary market making fills a minute.
+  response can never replay old fills. The first poll seeds 24 hours of
+  absorptions from the quiet Liquidator vaults as history without emitting
+  them; the busy strategy vaults start at session start, because a day of
+  their fills is far more than one 2000 fill page. Only absorptions are
+  persisted, not the ~220 ordinary market making fills a minute (a 2 x 250s
+  soak with a restart stored 2 rows, both live, none duplicated).
 
 ## Staleness watchdog (frozen feeds never read as live)
 
