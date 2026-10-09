@@ -94,8 +94,11 @@ order, and every value says which venue it came from:
 | Long/short account ratio | Binance → Bybit → OKX | `LongShortSnapshot.source`, `hub.lsr.active_source` |
 | BTC price cross-check | Binance perp mark → OKX perp mark | named in the health check detail |
 
-A source that fails is skipped for 10 minutes instead of being retried on
-every poll. A fallback L/S ratio counts a different venue's accounts, so the
+A source that answers 401, 403 or 451 (forbidden or geoblocked) is skipped
+for 10 minutes; any other failure (timeout, reset, 5xx) for 30 seconds, so a
+network blip that hits every venue at once cannot freeze the chain. Values
+that stop updating are marked: basis reads `stale` after 60 seconds, L/S
+after 20 minutes. A fallback L/S ratio counts a different venue's accounts, so the
 health monitor does not cross-check it against Binance, and the
 consistency check of funding against L/S (Binance funding against Binance accounts)
 is skipped. Binance trade data for CVD has no substitute: it shows
@@ -117,8 +120,9 @@ several Liquidators) that hold the positions.
 - **Session PnL** is the change in Hyperliquid's own cumulative PnL series
   (`allTime.pnlHistory`) since the first reading this session. It is never
   the change in AUM: deposits and withdrawals move AUM by hundreds of
-  thousands of dollars in minutes while PnL moves by hundreds. Until a
-  reading exists the panel shows `--` and MCP returns `null`.
+  thousands of dollars in minutes while PnL moves by hundreds. Without a
+  fresh reading (none yet, or none in 15 minutes) the panel shows `--`, MCP
+  returns `null`, alerts say `unknown`, and `hlp_snapshots.pnl_known` is 0.
 - **Positions** are netted per coin across vaults, because Strategy A and B
   usually hold opposite sides of the same coin. **Gross exposure** is summed
   per vault before netting, so the netting never hides how much is on.
@@ -128,16 +132,21 @@ several Liquidators) that hold the positions.
 - **Absorptions** come from the `liquidation` object on child vault fills,
   read with `userFillsByTime` from a per vault watermark, so an empty or
   lagging response can never replay old fills. A full 2000 fill page means a
-  backlog: the tracker pages forward (up to 6 pages per vault per poll) and
-  logs a warning if it still cannot catch up. One liquidation is often
-  filled by both Strategy A and B: fills are grouped by transaction hash
-  into one absorption with the sizes summed, emitted once as a confirmed
-  Hyperliquid liquidation, and stored as one `hlp_trades` row (upserted by
-  hash, so a restart or a later share of the same liquidation never adds a
-  row). The first poll seeds 24 hours of absorptions from the quiet
-  Liquidator vaults as history, which is stored but never emitted as a live
-  liquidation; the busy strategy vaults start at session start. Ordinary
-  market making fills (~300 a minute) are not stored.
+  backlog: the tracker pages forward (up to 3 pages per vault per poll,
+  about 20 times the normal rate). Hyperliquid only serves roughly the last
+  10,000 fills per vault, so after a long gap (a laptop asleep) the oldest
+  missed fills can be gone; the tracker logs a warning naming the lost
+  span. One liquidation is often filled by both Strategy A and B: fills are
+  grouped by transaction hash (all zero hashes are ignored) into one
+  absorption with the sizes summed, emitted once as a confirmed Hyperliquid
+  liquidation, and stored as one `hlp_trades` row, upserted by hash and only
+  ever grown, so a restart or a later share of the same liquidation never
+  adds a row or shrinks one. The first poll seeds 24 hours of absorptions
+  from the quiet Liquidator vaults; the busy strategy vaults resume one poll
+  interval before session start, which covers the end of a previous run.
+  Pre-start fills are stored but never emitted as live liquidations, and
+  absorptions read when the app stops are still stored. Ordinary market
+  making fills (~300 a minute) are not stored.
 
 ## Staleness watchdog (frozen feeds never read as live)
 

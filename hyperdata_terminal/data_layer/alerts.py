@@ -340,9 +340,14 @@ class AlertManager:
             delta = hlp_stats["net_delta"]
             zscore = hlp_stats["delta_zscore"]
             session_pnl = hlp_stats["session_pnl"]
+            partial = " (partial)" if hlp_stats.get("aum_source") != "vaultDetails" else ""
 
-            lines.append(f"AUM: {self._fmt_usd(aum)} | Delta: {self._fmt_usd_signed(delta)} | Z: {zscore:+.1f}")
-            lines.append(f"Session PnL: {self._fmt_usd_signed(session_pnl)}")
+            lines.append(
+                f"AUM: {self._fmt_usd(aum)}{partial} | Delta: {self._fmt_usd_signed(delta)} | Z: {zscore:+.1f}"
+            )
+            # Unknown is not zero: say so rather than report "+$0".
+            pnl_text = self._fmt_usd_signed(session_pnl) if hlp_stats.get("pnl_known") else "unknown"
+            lines.append(f"Session PnL: {pnl_text}")
 
             # Count absorptions in the 4h window
             recent_absorptions = hub.hlp.get_liquidation_absorptions(minutes=240)

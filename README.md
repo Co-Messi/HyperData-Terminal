@@ -164,7 +164,7 @@ class CvdBreakout(Strategy):
 hyperdata paper -s ./my_strategy.py -s funding_rate_arb --interval 30
 ```
 
-Trades print as they happen and are logged to SQLite; `Ctrl+C` prints the portfolio. Built in strategies: `cvd_momentum`, `funding_rate_arb`, `liquidation_cascade`, `whale_follow`, and `llm_agent`, which asks any OpenAI compatible model (OpenAI, Ollama, LM Studio, Groq, Together) for a decision. The full list of what `hub` exposes is in [`strategies/base.py`](hyperdata_terminal/strategies/base.py).
+Helper modules next to your strategy file can be imported, at the top of the file. Trades print as they happen and are logged to SQLite; `Ctrl+C` prints the portfolio. Built in strategies: `cvd_momentum`, `funding_rate_arb`, `liquidation_cascade`, `whale_follow`, and `llm_agent`, which asks any OpenAI compatible model (OpenAI, Ollama, LM Studio, Groq, Together) for a decision. The full list of what `hub` exposes is in [`strategies/base.py`](hyperdata_terminal/strategies/base.py).
 
 ## Data sources
 

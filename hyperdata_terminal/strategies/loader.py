@@ -77,6 +77,13 @@ def _strategy_classes_in_file(path: Path) -> list[type[Strategy]]:
         # strategy the first folder's helpers). Helpers stay bound in the
         # strategy's globals; import them at module top level.
         folder = resolved.parent
+        # Only the folder's own top level modules and packages are helpers. A
+        # project's .venv (or any install under the same folder tree) also
+        # lives "under the folder", and evicting pandas & co. after load split
+        # them into two copies (pandas raised on the first DataFrame).
+        own = {p.stem for p in folder.glob("*.py")} | {
+            d.name for d in folder.iterdir() if d.is_dir() and (d / "__init__.py").is_file()
+        }
         before = set(sys.modules)
         sys.path.insert(0, str(folder))
         try:
@@ -90,6 +97,8 @@ def _strategy_classes_in_file(path: Path) -> list[type[Strategy]]:
             except ValueError:
                 pass
             for name in set(sys.modules) - before - {module_name}:
+                if name.split(".")[0] not in own:
+                    continue
                 origin = getattr(sys.modules.get(name), "__file__", None)
                 if origin and Path(origin).resolve().is_relative_to(folder):
                     del sys.modules[name]

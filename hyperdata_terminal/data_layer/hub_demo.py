@@ -308,12 +308,11 @@ async def demo_hlp(hub) -> None:
                 num_positions=num_positions,
                 total_unrealized_pnl=total_unrealized_pnl,
                 session_pnl=base_account_value - session_start_value,
+                pnl_known=True,
+                aum_source="vaultDetails",  # synthetic, but shaped like a real reading
             )
             snapshot.delta_zscore = hub.hlp._compute_delta_zscore(net_delta_usd)
             hub.hlp.snapshots.append(snapshot)
-
-            if hub.hlp._session_start_value == 0:
-                hub.hlp._session_start_value = base_account_value
 
             # Generate a few mock fills per cycle
             num_fills = random.randint(1, 5)
@@ -341,13 +340,19 @@ async def demo_hlp(hub) -> None:
                     direction=direction,
                     closed_pnl=closed_pnl,
                     is_liquidation=is_liq,
+                    liquidation_method="market" if is_liq else "",
+                    fill_hash=f"0xdemo{random.getrandbits(64):016x}",
                 )
                 hub.hlp.trades.append(trade)
+                if is_liq:
+                    # Same path as live data: grouped by hash, reported by flush.
+                    hub.hlp._add_absorption(trade)
                 for cb in hub.hlp._callbacks:
                     try:
                         cb(trade)
                     except Exception:
                         logger.exception("Demo HLP trade callback error")
+            hub.hlp.flush_absorptions()
 
         except asyncio.CancelledError:
             return

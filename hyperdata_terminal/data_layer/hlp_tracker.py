@@ -77,7 +77,7 @@ class HLPSnapshot:
     # series (vaultDetails allTime.pnlHistory). NOT the change in AUM, which
     # moves by hundreds of thousands with every deposit and withdrawal.
     session_pnl: float = 0.0
-    pnl_known: bool = False     # False until two vaultDetails readings exist
+    pnl_known: bool = False     # False until a fresh vaultDetails reading exists
     # Where account_value came from: "vaultDetails" (what Hyperliquid reports)
     # or "clearinghouseState" (summed fallback, misses Strategy X).
     aum_source: str = "clearinghouseState"
@@ -150,8 +150,13 @@ class HLPTracker:
     FILLS_INTERVAL = 120
     FILLS_PAGE_LIMIT = 2000       # userFillsByTime returns at most this many, oldest first
     # A full page means more fills are waiting (a volume spike): keep paging
-    # forward, up to this many pages per vault per poll, then warn.
-    MAX_PAGES_PER_POLL = 6
+    # forward, up to this many pages per vault per poll (6000 fills, ~20x the
+    # normal rate; each full page costs ~120 weight, so the cap also bounds
+    # the burst against the 1200 per minute limit).
+    MAX_PAGES_PER_POLL = 3
+    # Hyperliquid keeps roughly the last 10,000 fills per user. If a page
+    # starts this far past the watermark, the fills in between are gone.
+    GAP_WARN_SECONDS = 2 * FILLS_INTERVAL
     FIRST_POLL_LOOKBACK = 86_400  # seed 24h of absorptions from the quiet Liquidator vaults
     ZSCORE_WINDOW = 100         # Use last 100 snapshots for Z-score
     MAX_ABSORPTIONS = 2000
@@ -205,6 +210,9 @@ class HLPTracker:
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
+        # A stop mid pass has already advanced watermarks past absorptions that
+        # were never reported; report them now (the hub closes the store after).
+        self.flush_absorptions()
         if self._session and not self._session.closed:
             await self._session.close()
             self._session = None
@@ -321,7 +329,8 @@ class HLPTracker:
     def record_snapshot(self, snapshot: HLPSnapshot) -> None:
         """Append a snapshot, filling in its z score and session PnL."""
         snapshot.delta_zscore = self._compute_delta_zscore(snapshot.net_delta_usd)
-        if self.reported_cum_pnl is not None and self._pnl_baseline is not None:
+        # A stale reading would freeze PnL while AUM is already marked partial.
+        if self.reported_cum_pnl is not None and self._pnl_baseline is not None and self._details_fresh():
             snapshot.session_pnl = self.reported_cum_pnl - self._pnl_baseline
             snapshot.pnl_known = True
         self.snapshots.append(snapshot)
@@ -468,17 +477,28 @@ class HLPTracker:
             # A busy strategy vault: a full page from 24h ago does not reach
             # the present, and paging through a day of market making fills
             # would burn the rate budget. Keep the page's flagged absorptions
-            # as history and resume from session start.
+            # as history and resume one poll interval before session start:
+            # that covers the last moments of a previous run (stored by hash,
+            # so re-reading them never duplicates) without a large backfill.
             self.process_fills(address, [f for f in fills if isinstance(f, dict) and f.get("liquidation")])
-            resume_ms = int((self._started_at or now) * 1000)
+            resume_ms = int(((self._started_at or now) - self.FILLS_INTERVAL) * 1000)
             if resume_ms > self._fill_watermark.get(address, 0):
                 self._fill_watermark[address] = resume_ms
                 self._tids_at_watermark[address] = set()
 
         for _ in range(self.MAX_PAGES_PER_POLL):
-            fills = await self._fetch_page(address, self._fill_watermark[address])
+            requested_ms = self._fill_watermark[address]
+            fills = await self._fetch_page(address, requested_ms)
             if fills is None:
                 return
+            if len(fills) >= self.FILLS_PAGE_LIMIT:
+                first_ms = min((f.get("time", 0) for f in fills if isinstance(f, dict)), default=0)
+                if first_ms - requested_ms > self.GAP_WARN_SECONDS * 1000:
+                    logger.warning(
+                        "[hlp] %s: fills from %.0fs before this page are no longer available from "
+                        "Hyperliquid (the tracker fell behind, e.g. after a sleep); absorptions in "
+                        "that gap are lost", address, (first_ms - requested_ms) / 1000,
+                    )
             new = self.process_fills(address, fills)
             if len(fills) < self.FILLS_PAGE_LIMIT or not new:
                 return  # caught up (or a page of nothing but already seen fills)
@@ -564,6 +584,19 @@ class HLPTracker:
                     logger.exception("[hlp] absorption callback error")
 
     @staticmethod
+    def _usable_hash(raw) -> str:
+        """The fill's transaction hash, or "" when there is none.
+
+        Some maker fills carry an all zero hash (62 of 2000 in a live check).
+        Grouping by it would merge unrelated fills into one absorption, so it
+        is treated as missing (the vault:tid fallback key is used instead).
+        """
+        h = str(raw or "")
+        if not h or not h.removeprefix("0x").strip("0"):
+            return ""
+        return h
+
+    @staticmethod
     def _parse_fill(fill: dict, address: str) -> HLPTrade:
         side = str(fill.get("side", "")).lower()  # 'A' (ask/sell) or 'B' (bid/buy)
         if side in ("a", "sell"):
@@ -600,7 +633,7 @@ class HLPTracker:
             is_liquidation=is_liquidation,
             liquidation_method=method,
             vault=address,
-            fill_hash=str(fill.get("hash") or ""),
+            fill_hash=HLPTracker._usable_hash(fill.get("hash")),
         )
 
     # ── Z-Score ──────────────────────────────────────────────

@@ -355,7 +355,8 @@ class DataStore:
                     session_pnl REAL NOT NULL,
                     total_unrealized_pnl REAL NOT NULL,
                     created_at REAL NOT NULL,
-                    aum_source TEXT NOT NULL DEFAULT 'clearinghouseState'
+                    aum_source TEXT NOT NULL DEFAULT 'clearinghouseState',
+                    pnl_known INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE INDEX IF NOT EXISTS idx_hlp_snap_ts ON hlp_snapshots(timestamp);
 
@@ -445,7 +446,10 @@ class DataStore:
     #       filled it or how often the tracker restarts. (A separate version
     #       because DBs created by an early build of this branch already
     #       recorded v5 without these columns.)
-    SCHEMA_VERSION = 6
+    #   v7  hlp_snapshots.pnl_known: session_pnl is 0 both when PnL is truly
+    #       flat and when it is unknown (no fresh vaultDetails reading); the
+    #       flag tells them apart.
+    SCHEMA_VERSION = 7
 
     # Tables that no code path has ever written to, by the version that
     # drops them. A dead table is dropped only when EMPTY; a populated one
@@ -503,7 +507,10 @@ class DataStore:
 
     # version -> migration step. Steps run in order for every version above
     # the DB's recorded one, each followed by a schema_version row.
-    _MIGRATIONS = {3: _migrate_v3, 4: _migrate_v4, 5: _migrate_v5, 6: _migrate_v6}
+    def _migrate_v7(self) -> None:
+        self._add_column("hlp_snapshots", "pnl_known", "INTEGER NOT NULL DEFAULT 0")
+
+    _MIGRATIONS = {3: _migrate_v3, 4: _migrate_v4, 5: _migrate_v5, 6: _migrate_v6, 7: _migrate_v7}
 
     def _run_migrations(self) -> None:
         """Versioned migrations. Caller holds the lock.
@@ -798,7 +805,9 @@ class DataStore:
         market making fills a minute (~400k rows a day), which would swamp the
         table without saying anything the snapshots don't. The upsert keeps
         one row per liquidation when several vaults fill it, when a later poll
-        adds a vault's share (size grows), and across restarts.
+        adds a vault's share (size grows), and across restarts. It only ever
+        grows a row: after a restart a busy vault's first page can hold just
+        one vault's share, which must not overwrite the full size stored before.
         """
         if not getattr(absorption, "is_liquidation", False):
             return
@@ -809,8 +818,12 @@ class DataStore:
                 closed_pnl, is_liquidation, created_at, fill_hash, vault)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(fill_hash) DO UPDATE SET
-                 price = excluded.price, size = excluded.size,
-                 size_usd = excluded.size_usd, vault = excluded.vault""",
+                 price = CASE WHEN excluded.size > hlp_trades.size
+                              THEN excluded.price ELSE hlp_trades.price END,
+                 vault = CASE WHEN excluded.size > hlp_trades.size
+                              THEN excluded.vault ELSE hlp_trades.vault END,
+                 size = MAX(hlp_trades.size, excluded.size),
+                 size_usd = MAX(hlp_trades.size_usd, excluded.size_usd)""",
             (absorption.timestamp, absorption.symbol, absorption.side, absorption.price,
              absorption.size, absorption.size_usd, absorption.direction,
              absorption.closed_pnl, 1, time.time(), fill_hash, getattr(absorption, "vault", "")),
@@ -825,13 +838,14 @@ class DataStore:
             """INSERT INTO hlp_snapshots
                (timestamp, account_value, net_delta, delta_zscore,
                 total_exposure, num_positions, session_pnl,
-                total_unrealized_pnl, created_at, aum_source)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                total_unrealized_pnl, created_at, aum_source, pnl_known)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (snapshot.timestamp, snapshot.account_value,
              snapshot.net_delta_usd, snapshot.delta_zscore,
              snapshot.total_exposure_usd, snapshot.num_positions,
              snapshot.session_pnl, snapshot.total_unrealized_pnl,
-             time.time(), getattr(snapshot, "aum_source", "clearinghouseState")),
+             time.time(), getattr(snapshot, "aum_source", "clearinghouseState"),
+             1 if getattr(snapshot, "pnl_known", False) else 0),
         )
 
     def maybe_save_hlp_snapshot(self) -> None:

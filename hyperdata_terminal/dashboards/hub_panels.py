@@ -693,7 +693,9 @@ class HubHLP:
             )
 
         # ── Recent liquidation absorptions ──
-        liqs = self.hub.hlp.get_liquidation_absorptions(60)[-5:]
+        # Three rows: the panel gets ~19 rows at 160x50, and absorptions come
+        # several an hour. The footer's 24h count says how many there were.
+        liqs = self.hub.hlp.get_liquidation_absorptions(60)[-3:]
         liq_lines = Text()
         if liqs:
             liq_lines.append(" LIQ ABSORPTIONS:\n", style="bold bright_yellow")

@@ -258,7 +258,8 @@ class TestHlp:
         assert requests[0]["type"] == "userFillsByTime"
         assert len(tracker.trades) == 1 and len(tracker.absorptions) == 1  # only the flagged fill kept
         resume = tracker._fill_watermark["0xbusy"]
-        assert resume == int(tracker._started_at * 1000)
+        # One poll interval before start: covers the end of a previous run (upserted by hash).
+        assert resume == int((tracker._started_at - HLPTracker.FILLS_INTERVAL) * 1000)
         await tracker._fetch_fills("0xbusy")
         assert requests[1]["startTime"] == resume  # no paging through a day of fills
 
@@ -529,6 +530,134 @@ def test_source_cooldown_separates_geoblocks_from_blips():
     assert source_cooldown_seconds(http(502)) == TRANSIENT_SOURCE_COOLDOWN
     assert source_cooldown_seconds(TimeoutError()) == TRANSIENT_SOURCE_COOLDOWN
     assert TRANSIENT_SOURCE_COOLDOWN < 60
+
+
+# ── third review round ───────────────────────────────────────────────────
+
+
+def test_loader_does_not_evict_libraries_installed_under_the_strategy_folder(tmp_path):
+    """A project .venv under the strategy's folder: its libraries must survive the load."""
+    from hyperdata_terminal.strategies.loader import load_strategies
+
+    site = tmp_path / ".venv" / "lib" / "site-packages"
+    (site / "pr12_fakelib").mkdir(parents=True)
+    (site / "pr12_fakelib" / "__init__.py").write_text("class Frame:\n    pass\n")
+    sys.path.insert(0, str(site))
+    try:
+        f = tmp_path / "lib_strategy.py"
+        f.write_text(
+            "import pr12_fakelib\n"
+            "from hyperdata_terminal.strategies import Strategy\n"
+            "class L(Strategy):\n"
+            "    name = 'lib_strategy'\n"
+            "    def evaluate(self, hub):\n"
+            "        return None\n"
+        )
+        load_strategies([str(f)])
+        assert "pr12_fakelib" in sys.modules  # not evicted: it is not one of the folder's own modules
+    finally:
+        sys.path.remove(str(site))
+        sys.modules.pop("pr12_fakelib", None)
+
+
+def test_restart_reread_never_shrinks_a_stored_absorption(tmp_path):
+    from hyperdata_terminal.data_layer.hlp_tracker import HLPTrade
+    from hyperdata_terminal.data_layer.persistence import DataStore
+
+    def absorption(size, vault):
+        return HLPTrade(1.0, "JUP", "sell", 0.36, size, size * 0.36, "Open Short", 0, True, "market", vault, "0xjup")
+
+    store = DataStore(tmp_path / "s.db")
+    try:
+        store._save_hlp_absorption(absorption(582, "A,B"), True)  # session 1: both vaults
+        store._save_hlp_absorption(absorption(310, "A"), True)    # session 2 re-read: one vault's share
+        store.flush()
+        row = store._conn.execute("SELECT size, vault FROM hlp_trades").fetchone()
+    finally:
+        store.close()
+    assert row == (582, "A,B")
+
+
+def test_stale_details_make_pnl_unknown_not_frozen():
+    from hyperdata_terminal.data_layer.hlp_tracker import HLPTracker
+
+    tracker = HLPTracker()
+    details = TestHlp._details(179_900_000, 100.0)
+    tracker.apply_vault_details(details, now=time.time())
+    tracker.record_snapshot(HLPTracker.build_snapshot([_state(1, [])], reported_aum=tracker.reported_aum))
+    tracker._vault_details_at = time.time() - 3300  # 55 minutes without a fresh reading
+    tracker.record_snapshot(HLPTracker.build_snapshot([_state(1, [])]))
+    assert [s.pnl_known for s in tracker.snapshots] == [True, False]
+
+
+async def test_stop_flushes_absorptions_read_mid_pass():
+    from hyperdata_terminal.data_layer.hlp_tracker import HLPTracker
+
+    tracker = HLPTracker()
+    got = []
+    tracker.on_hlp_absorption(lambda a, first: got.append(a.fill_hash))
+    tracker.process_fills("0xA", [{"coin": "X", "px": "1", "sz": "1", "side": "A", "dir": "Open Short",
+                                   "time": 5, "tid": 1, "hash": "0xabc", "liquidation": {"method": "market"}}])
+    await tracker.stop()
+    assert got == ["0xabc"]
+
+
+def test_zero_hash_is_not_used_for_grouping():
+    from hyperdata_terminal.data_layer.hlp_tracker import HLPTracker
+
+    tracker = HLPTracker()
+    base = {"coin": "X", "px": "1", "sz": "1", "side": "A", "dir": "Open Short", "time": 5,
+            "hash": "0x" + "0" * 64, "liquidation": {"method": "market"}}
+    tracker.process_fills("0xA", [dict(base, tid=1), dict(base, tid=2)])
+    assert len(tracker.absorptions) == 2  # not merged into one
+
+
+async def test_gap_beyond_retention_is_warned(caplog):
+    from hyperdata_terminal.data_layer.hlp_tracker import HLPTracker
+
+    tracker = HLPTracker()
+    tracker._fill_watermark["0xbusy"] = 0
+    start_after_gap = 10 * 60 * 1000  # the oldest retrievable fill is 10 minutes past the watermark
+
+    async def fake_post(payload):
+        return [{"coin": "X", "px": "1", "sz": "1", "side": "B", "dir": "Open Long", "tid": i,
+                 "time": start_after_gap + i} for i in range(HLPTracker.FILLS_PAGE_LIMIT)]
+
+    tracker._post = fake_post
+    with caplog.at_level("WARNING"):
+        await tracker._fetch_fills("0xbusy")
+    assert "no longer available" in caplog.text
+
+
+def test_demo_hlp_runs_without_errors(caplog):
+    import asyncio
+
+    from hyperdata_terminal.data_layer import hub_demo
+
+    class FakeHub:
+        def __init__(self):
+            from hyperdata_terminal.data_layer.hlp_tracker import HLPTracker
+
+            self.hlp = HLPTracker()
+            self._running = True
+
+    hub = FakeHub()
+
+    async def run_briefly():
+        task = asyncio.create_task(hub_demo.demo_hlp(hub))
+        await asyncio.sleep(0.3)
+        hub._running = False
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    with caplog.at_level("ERROR"):
+        asyncio.run(run_briefly())
+    assert "Demo HLP error" not in caplog.text
+    snap = hub.hlp.get_latest_snapshot()
+    assert snap is not None and snap.pnl_known and snap.aum_source == "vaultDetails"
 
 
 def test_mcp_hlp_vault_reports_aum_source_and_pnl_validity(tmp_path, monkeypatch):
