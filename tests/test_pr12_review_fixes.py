@@ -660,6 +660,30 @@ def test_demo_hlp_runs_without_errors(caplog):
     assert snap is not None and snap.pnl_known and snap.aum_source == "vaultDetails"
 
 
+async def test_smart_money_keeps_to_its_weight_budget(monkeypatch):
+    """A batch of active wallets' userFills (~120 weight each) drew HTTP 429s."""
+    import asyncio
+
+    from hyperdata_terminal.data_layer.smart_money import SmartMoneyEngine
+
+    engine = SmartMoneyEngine()
+    engine._record_weight("userFills", [{}] * 2000)
+    assert engine._weight_log[-1][1] == 120
+    engine._record_weight("clearinghouseState", {})
+    assert engine._weight_log[-1][1] == 2
+    for _ in range(3):
+        engine._record_weight("userFills", [{}] * 2000)  # now 482 weight in the last minute
+    slept = []
+
+    async def fake_sleep(seconds):
+        slept.append(seconds)
+        engine._weight_log.clear()  # time passes; the window empties
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    await engine._rate_limit()
+    assert slept and slept[-1] >= 0.5  # waited instead of firing over budget
+
+
 def test_mcp_hlp_vault_reports_aum_source_and_pnl_validity(tmp_path, monkeypatch):
     from hyperdata_terminal.data_layer.hlp_tracker import HLPTracker
     from hyperdata_terminal.mcp_server import HubTools
