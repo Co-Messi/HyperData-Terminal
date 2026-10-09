@@ -32,6 +32,8 @@ class CVDMomentum(Strategy):
         snap = hub.orderflow.get_snapshot(self.symbol, "5m")
         if snap is None:
             return None  # no data yet
+        if getattr(snap, "warming_up", False) is True:
+            return None  # the 5m window does not hold 5 minutes of trades yet
 
         # Net delta = buy volume minus sell volume
         delta = snap.buy_volume - snap.sell_volume

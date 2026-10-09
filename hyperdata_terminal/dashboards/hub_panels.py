@@ -262,8 +262,6 @@ class HubMarket:
         self.cycle = 0
 
     def build_compact(self) -> Panel:
-        from hyperdata_terminal.dashboards.market_overview import fmt_funding
-
         assets = self.hub.get_all_assets()[:20]
         if not assets:
             return Panel(
@@ -288,15 +286,16 @@ class HubMarket:
             box=box.SIMPLE_HEAVY, border_style="bright_magenta",
             header_style="bold bright_white", expand=True, padding=(0, 0),
         )
-        table.add_column("#", style="dim", width=2)
+        # Compact: funding as an annualized %, no rank column; the hourly rate
+        # ("+0.0013%") overflowed the panel and truncated PREM and OI.
         table.add_column("SYM", style="bold bright_white", justify="center", width=5)
-        table.add_column("PRICE", justify="right", min_width=9)
+        table.add_column("PRICE", justify="right", min_width=8)
         table.add_column("CHG", justify="right", min_width=6)
-        table.add_column("FUND", justify="right", min_width=7)
+        table.add_column("FUND/Y", justify="right", min_width=6)
         table.add_column("PREM", justify="right", min_width=6)
         table.add_column("OI", justify="right", min_width=6)
 
-        for i, a in enumerate(assets, 1):
+        for a in assets:
             chg_style = "bright_green" if a.price_change_24h_pct >= 0 else "bright_red"
             fund_style = "bright_green" if a.funding_rate >= 0 else "bright_red"
             prem = getattr(a, "premium_pct", 0.0)
@@ -310,9 +309,9 @@ class HubMarket:
             # Whole dollars above $1K: "$82,217.00" overflowed the column at 160 cols.
             price_str = f"${a.price:,.0f}" if a.price >= 1000 else fmt_price(a.price)
             table.add_row(
-                str(i), Text(a.symbol), price_str,
+                Text(a.symbol), price_str,
                 Text(fmt_pct(a.price_change_24h_pct), style=chg_style),
-                Text(fmt_funding(a.funding_rate), style=fund_style),
+                Text(f"{a.funding_rate * 8760 * 100:+.0f}%", style=fund_style),
                 Text(prem_str, style=prem_style),
                 fmt_usd(a.open_interest),
             )
@@ -699,9 +698,12 @@ class HubHLP:
 
         # ── Footer stats ──
         footer = Text()
+        # The first fills poll returns days of history; count the last 24h so
+        # this never contradicts "No liquidation absorptions yet" above.
+        absorbed_24h = len(self.hub.hlp.get_liquidation_absorptions(1440))
         footer.append(f" Snaps:{stats['total_snapshots']}", style="dim")
-        footer.append(f"  Trades:{stats['total_trades']}", style="dim")
-        footer.append(f"  LiqAbsorb:{stats['liquidation_absorptions']}", style="bright_yellow")
+        footer.append(f"  Fills:{stats['total_trades']}", style="dim")
+        footer.append(f"  Absorbed 24h:{absorbed_24h}", style="bright_yellow")
 
         now_str = datetime.now(timezone.utc).strftime("%H:%M:%S")
 

@@ -5,70 +5,90 @@ This file provides guidance to Claude Code when working with this repository.
 ## Commands
 
 ```bash
-# Run tests
-python -m pytest tests/ -v --ignore=tests/test_position_scanner.py
+# Dev install (editable, with the MCP extra)
+pip install -e ".[mcp]" pytest pytest-asyncio ruff
 
-# Run with live exchange connections
+# Run tests (network calls are mocked; tests marked `live` need --live)
+python -m pytest tests/ -q
 python -m pytest tests/ -v --live
 
 # Lint
-ruff check src/
+ruff check hyperdata_terminal tests
 
-# Start terminal dashboard (live data from 5 exchanges)
-python3 run_dashboard.py
+# Terminal dashboards (live data from 5 exchanges)
+hyperdata                      # menu
+hyperdata all --no-boot        # one dashboard directly: liq, stream, heatmap, cvd, market, whales, all
 
-# Start headless API server
-python3 run_api.py --port 8420
+# Headless API server
+hyperdata api --port 8420
 
-# Run the data-integrity verification (cross-checks live data vs Binance/Deribit)
-python3 src/verify_data.py --wait 30
+# Paper trading, MCP server, data-integrity report
+hyperdata paper -s cvd_momentum -s ./my_strategy.py
+hyperdata mcp
+hyperdata verify --wait 30
+
+# Regenerate the README demo GIF (needs vhs)
+vhs assets/demo.tape
 ```
 
-See `docs/DATA_INTEGRITY.md` for coverage caveats (sampled vs confirmed vs
-heuristic liquidations), the staleness watchdog, and the health checks.
+`run_dashboard.py` and `run_api.py` at the repo root are thin shims over the CLI for old clones.
+
+See `docs/DATA_INTEGRITY.md` for coverage caveats (confirmed vs sampled
+liquidations, Hyperliquid large prints, regional fallbacks, CVD warmup), the
+staleness watchdog, and the health checks.
 
 ## Architecture
 
-**HyperDataHub** (`src/data_layer/hub.py`) is the central orchestrator. It owns all data components and manages their async lifecycles via `start()`/`stop()`.
+The package is `hyperdata_terminal/` (PyPI: `hyperdata-terminal`; the PyPI name
+`hyperdata` belongs to someone else). Entry point: `hyperdata_terminal/cli.py`.
+
+**HyperDataHub** (`hyperdata_terminal/data_layer/hub.py`) is the central orchestrator. It owns all data components and manages their async lifecycles via `start()`/`stop()`.
 
 ```
-Exchanges (Hyperliquid, Binance, Bybit, OKX, Deribit)
+Exchanges (Hyperliquid, Binance, Bybit, OKX, Coinbase, Deribit)
     |  WebSocket + REST
     v
 HyperDataHub (14 data components)
     |
-    +---> Terminal Dashboards (Rich TUI)
-    +---> REST API + WebSocket (/v1/*)
-    +---> Paper Trading Engine (pluggable strategies)
+    +---> Terminal dashboards (Rich TUI)          terminal.py, dashboards/
+    +---> REST API + WebSocket (/v1/*)            api_server.py
+    +---> MCP server (stdio)                      mcp_server.py
+    +---> Paper trading (pluggable strategies)    strategies/
 ```
 
-**Data components** (all in `src/data_layer/`): Each follows the same pattern — a dataclass for the data model, a collector/engine class with `start()`/`stop()`, and the hub wires them together.
+**Data components** (all in `hyperdata_terminal/data_layer/`): each is a dataclass for the data model plus a collector/engine class with `start()`/`stop()`; the hub wires them together.
 
 Components: liquidation_feed (4 exchanges), orderflow_engine (CVD), position_scanner, market_data, funding_rates, long_short_ratio, orderbook, spot_prices, deribit (DVOL), smart_money, hlp_tracker, alerts, persistence (SQLite), address_store.
 
-**API Server** (`src/api_server.py`): aiohttp.web embedded in the hub's event loop. All endpoints under `/v1/`. WebSocket at `/v1/ws` streams events. CORS enabled.
+**API Server** (`api_server.py`): aiohttp.web embedded in the hub's event loop. All endpoints under `/v1/`. WebSocket at `/v1/ws` streams events. Loopback by default; no cross-origin access unless `HYPERDATA_CORS_ORIGINS` lists the origin.
 
-**Paper Trading** (`src/strategies/`): Pluggable strategy engine. Subclass `Strategy`, implement `evaluate(hub)`, return a `Signal`. The `PaperTrader` runs strategies on real market data with fake money.
+**MCP Server** (`mcp_server.py`): `HubTools` holds the tool logic as plain methods over a hub (unit-tested with a fake hub); `build_server()` wires them into `mcp.server.mcpserver.MCPServer` (mcp 2.x) with the hub started in the lifespan. stdout is the protocol: nothing in the data layer may print.
 
-**Persistence** (`src/data_layer/persistence.py`): SQLite in WAL mode at `data/hyperdata.db`. Batch commits every 50 events. Thread-safe via `threading.Lock`.
+**Paper Trading** (`strategies/`): subclass `Strategy`, implement `evaluate(hub)`, return a `Signal`. `strategies/loader.py` resolves `--strategy` specs (built-in name, `.py` path, `module:Class`).
+
+**Persistence** (`data_layer/persistence.py`): SQLite in WAL mode at `<data dir>/hyperdata.db`, written by a dedicated writer thread.
+
+**Data dir** (`paths.py`): `HYPERDATA_DATA_DIR`, else an existing `<checkout>/data`, else the per-user data dir. Never site-packages. Resolved once at import; tests set the env var in `conftest.py` before importing the package.
 
 ## Import Conventions
 
-- Hub imports: `from src.data_layer.X import Y`
-- Test imports: `from data_layer.X import Y` (conftest.py adds `src/` to sys.path)
-- API server: `from src.X import Y`
+- Everything, including tests: `from hyperdata_terminal.data_layer.X import Y`
+- No `sys.path` manipulation anywhere.
 
 ## Key Patterns
 
 - **Persistent aiohttp sessions**: Components create `aiohttp.ClientSession()` in `start()`, close in `stop()`. Never create sessions per-request.
-- **WebSocket broadcast**: `_broadcast()` iterates client list copy, uses `_safe_send()` with 2-second timeout. Dead clients removed immediately.
-- **Live by default**: Both product entry points (`run_dashboard.py`, `run_api.py`) run `HyperDataHub(demo=False)` — all data comes from real exchange feeds. A `demo=True` path (synthetic generators in `hub.py`) and the standalone dashboard scripts' `--live`-off mock mode exist only as offline dev/preview tools; they are not part of the shipped product and the health monitor is disabled under demo.
+- **WebSocket broadcast**: `_broadcast()` enqueues per client; each client has a bounded queue drained by its own writer task.
+- **Live by default**: every CLI entry point runs `HyperDataHub(demo=False)`. A `demo=True` path (synthetic generators in `hub_demo.py`) exists only as an offline dev tool; the health monitor is disabled under demo.
+- **Confirmed vs estimated**: Hyperliquid large prints are `LiquidationEvent(confirmed=False)`. Anything that totals liquidations for display, alerts or strategies uses `get_stats(include_estimated=False)`.
+- **Source fallbacks**: spot (Binance, Coinbase, OKX) and L/S (Binance, Bybit, OKX) record `source` on every snapshot and skip a failing source for 10 minutes.
 - **Symbol normalization**: `normalize_symbol()` strips USDT/USD/PERP suffixes.
 
 ## External Data Sources
 
-- **Hyperliquid**: Positions, liquidations, funding. WebSocket + REST. No key.
-- **Binance**: Trades, liquidations, orderbook. WebSocket. No key.
-- **Bybit**: Liquidations. WebSocket. No key.
-- **OKX**: Liquidations. WebSocket. No key.
+- **Hyperliquid**: Positions, trades, funding, OI, HLP vault (parent + child vaults). WebSocket + REST. No key.
+- **Binance**: Futures trades, liquidations, orderbook, spot, L/S. WebSocket + REST. No key. Returns 451 in some regions.
+- **Bybit**: Liquidations; L/S fallback. WebSocket + REST. No key. Returns 403 in some regions.
+- **OKX**: Liquidations; spot, L/S and price cross-check fallback. WebSocket + REST. No key.
+- **Coinbase**: Spot fallback for basis. REST. No key.
 - **Deribit**: DVOL implied volatility. REST. No key.

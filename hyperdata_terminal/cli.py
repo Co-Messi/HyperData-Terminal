@@ -202,8 +202,15 @@ def main(argv: list[str] | None = None) -> None:
         elif getattr(args, "dashboard", None):
             from hyperdata_terminal.terminal import run_single
 
-            asyncio.run(run_single(args.dashboard, symbol=getattr(args, "symbol", None),
-                                   api_port=_api_port(args), boot=boot))
+            symbol = (getattr(args, "symbol", None) or "").strip().upper() or None
+            if symbol and args.dashboard == "cvd":
+                from hyperdata_terminal.config.settings import DEFAULT_SYMBOLS
+
+                if symbol not in DEFAULT_SYMBOLS:
+                    print(f"hyperdata: order flow is streamed for {', '.join(DEFAULT_SYMBOLS)}; "
+                          f"{symbol} is not one of them", file=sys.stderr)
+                    sys.exit(2)
+            asyncio.run(run_single(args.dashboard, symbol=symbol, api_port=_api_port(args), boot=boot))
         elif command == "api":
             asyncio.run(_run_api(args.port))
         elif command == "paper":

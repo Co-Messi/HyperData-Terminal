@@ -69,7 +69,7 @@
             <h1 id="hero-title" class="rv">Real-time crypto market intelligence, right in your terminal.</h1>
             <p class="lede rv" style="--i:1">HyperData Terminal streams public WebSocket feeds from Hyperliquid, Binance, Bybit, OKX and Deribit into six live dashboards, a local REST API and a paper-trading engine. Open source under Apache-2.0. No API keys to get started.</p>
             <div class="hero-actions rv" style="--i:2">
-              <a class="btn btn-primary" href="#install">Install in four commands</a>
+              <a class="btn btn-primary" href="#install">Install in one command</a>
               <a class="btn" href="https://github.com/Co-Messi/HyperData-Terminal">Read the source</a>
             </div>
           </div>
@@ -198,7 +198,7 @@
             <p>Start the server alongside or instead of the terminal. It binds to <code>127.0.0.1</code> by default and refuses a public bind unless you set an API key or explicitly accept the risk.</p>
             <figure class="code shell">
               <div class="code-bar" aria-hidden="true"><span>shell</span><span>port 8420</span></div>
-<pre><code><span class="p">$</span> python run_api.py --port 8420
+<pre><code><span class="p">$</span> hyperdata api --port 8420
 
 <span class="p">$</span> curl http://localhost:8420/v1/market/BTC | python -m json.tool
 <span class="p">$</span> curl http://localhost:8420/v1/orderflow/BTC
@@ -237,16 +237,24 @@
 
             <details>
               <summary>Optional LLM agent</summary>
-              <p>The agent sends a market summary to any OpenAI-compatible API and asks for a trading decision. Point it at OpenAI, Ollama, LM Studio, Groq, Together or your own endpoint with three variables in <code class="inline-code">.env</code>: <code class="inline-code">LLM_BASE_URL</code>, <code class="inline-code">LLM_MODEL</code> and <code class="inline-code">LLM_API_KEY</code>. The prompt lives in <code class="inline-code">src/strategies/llm_agent.py</code>.</p>
+              <p>The agent sends a market summary to any OpenAI-compatible API and asks for a trading decision. Point it at OpenAI, Ollama, LM Studio, Groq, Together or your own endpoint with three variables in <code class="inline-code">.env</code>: <code class="inline-code">LLM_BASE_URL</code>, <code class="inline-code">LLM_MODEL</code> and <code class="inline-code">LLM_API_KEY</code>. Run it with <code class="inline-code">hyperdata paper -s llm_agent</code>; the prompt lives in <code class="inline-code">hyperdata_terminal/strategies/llm_agent.py</code>.</p>
             </details>
+
+            <h3 style="margin-top: 40px;">MCP server for AI agents</h3>
+            <p>Give Claude, Cursor or any MCP client live liquidations, whale positions, heatmaps, order flow and funding as tools. Read only: no keys, no trading.</p>
+            <figure class="code shell">
+              <div class="code-bar" aria-hidden="true"><span>shell</span><span>10 tools</span></div>
+<pre><code><span class="p">$</span> pipx install "hyperdata-terminal[mcp]"
+<span class="p">$</span> claude mcp add hyperdata -- hyperdata mcp</code></pre>
+            </figure>
           </div>
 
           <div class="rv" style="--i:3">
             <h3>Paper trading, your strategy</h3>
-            <p>Real market data, fake money. A strategy is one class with one method that returns a signal or nothing. The whole interface fits in about 30 lines.</p>
+            <p>Real market data, fake money. A strategy is one class with one method that returns a signal or nothing, in a file anywhere on disk. Run it with <code class="inline-code">hyperdata paper -s my_strategy.py</code>.</p>
             <figure class="code">
-              <div class="code-bar" aria-hidden="true"><span>src/strategies/examples/my_strategy.py</span><span>python</span></div>
-<pre><code><span class="kw">from</span> src.strategies.base <span class="kw">import</span> Strategy, Signal
+              <div class="code-bar" aria-hidden="true"><span>my_strategy.py</span><span>python</span></div>
+<pre><code><span class="kw">from</span> hyperdata_terminal.strategies <span class="kw">import</span> Strategy, Signal
 
 <span class="kw">class</span> <span class="fn">MyStrategy</span>(Strategy):
     name = <span class="st">"my_strategy"</span>
@@ -298,7 +306,7 @@
             <h2 id="integrity-title" class="rv">Data that checks itself.</h2>
             <p class="rv" style="--i:1; margin-top: 28px;">The hub continuously cross-checks its live feeds against Binance and Deribit and flags anything stale or drifting. The state is printed on the dashboard and exposed at <code>/v1/health</code>, so your own tools can read it too.</p>
             <div class="note rv" style="--i:2">
-              <p><strong>Coverage is honest, not a complete census.</strong> OKX and Bybit liquidations are real feeds, with Bybit covering its top 15 symbols. Binance's stream is throttled at the source to about one liquidation per symbol per second. Hyperliquid liquidations are inferred from large trades and flagged as estimated. Details are in <a class="text-link" href="https://github.com/Co-Messi/HyperData-Terminal/blob/main/docs/DATA_INTEGRITY.md">docs/DATA_INTEGRITY.md</a>.</p>
+              <p><strong>Coverage is honest, not a complete census.</strong> OKX and Bybit liquidations are real feeds, Bybit across the tracked symbols. Binance's stream is throttled at the source to about one liquidation per symbol per second. Hyperliquid publishes no liquidation feed, so its confirmed liquidations are the ones an HLP vault absorbed; large trades are shown apart as estimated large prints and never counted as liquidations. Details are in <a class="text-link" href="https://github.com/Co-Messi/HyperData-Terminal/blob/main/docs/DATA_INTEGRITY.md">docs/DATA_INTEGRITY.md</a>.</p>
             </div>
           </div>
 
@@ -321,10 +329,10 @@
       <div class="wrap">
         <div class="split">
           <div class="prose">
-            <h2 id="install-title" class="rv">Four commands to live data.</h2>
-            <p class="rv" style="--i:1; margin-top: 28px;">Clone, install, run. The first launch opens the dashboard menu with data streaming from all five exchanges.</p>
+            <h2 id="install-title" class="rv">One command to live data.</h2>
+            <p class="rv" style="--i:1; margin-top: 28px;">Install it, run it. The first launch opens the dashboard menu with data streaming from all five exchanges. Skip the menu with <code class="inline-code">hyperdata heatmap</code>, <code class="inline-code">hyperdata whales</code> or <code class="inline-code">hyperdata all</code>.</p>
             <dl class="reqs rv" style="--i:2">
-              <div><dt>Requires</dt><dd>Python 3.12 or newer, pip, git</dd></div>
+              <div><dt>Requires</dt><dd>Python 3.12 or newer, with pipx or uv</dd></div>
               <div><dt>API keys</dt><dd>None for the dashboards or the API. Only the optional LLM agent needs one.</dd></div>
               <div><dt>License</dt><dd>Apache-2.0</dd></div>
             </dl>
@@ -333,10 +341,9 @@
           <figure class="code shell install-box rv" style="--i:2">
             <div class="code-bar" aria-hidden="true"><span>shell</span></div>
             <button class="copy" type="button" data-copy="install-commands" aria-label="Copy install commands">Copy</button>
-<pre id="install-commands"><code><span class="p">$ </span><span data-cmd>git clone https://github.com/Co-Messi/HyperData-Terminal.git</span>
-<span class="p">$ </span><span data-cmd>cd HyperData-Terminal</span>
-<span class="p">$ </span><span data-cmd>pip install -e .</span>
-<span class="p">$ </span><span data-cmd>hyperdata</span></code></pre>
+<pre id="install-commands"><code><span class="p">$ </span><span data-cmd>pipx install hyperdata-terminal</span>
+<span class="p">$ </span><span data-cmd>hyperdata</span>
+<span class="p"># </span>or run it once without installing: uvx hyperdata-terminal</code></pre>
           </figure>
         </div>
       </div>

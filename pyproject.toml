@@ -54,6 +54,8 @@ Issues = "https://github.com/Co-Messi/HyperData-Terminal/issues"
 
 [project.scripts]
 hyperdata = "hyperdata_terminal.cli:main"
+# Same command under the distribution name, so `uvx hyperdata-terminal` works.
+hyperdata-terminal = "hyperdata_terminal.cli:main"
 
 [tool.setuptools.dynamic]
 version = { attr = "hyperdata_terminal.__version__" }

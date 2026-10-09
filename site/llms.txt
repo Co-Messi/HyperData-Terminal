@@ -1,0 +1,35 @@
+# HyperData Terminal
+
+> Free, open source (Apache 2.0) crypto market data terminal for Hyperliquid, Binance, Bybit, OKX and Deribit. Live liquidation heatmaps, whale positions, liquidations across exchanges, order flow (CVD), funding rates and Hyperliquid's HLP vault, rendered as dashboards in your terminal, served over a local REST API, and exposed to AI agents as an MCP server. Public feeds only: no API keys, no account, read only.
+
+Install: `pipx install hyperdata-terminal` then run `hyperdata`. Or run once with `uvx hyperdata-terminal`. Requires Python 3.12+.
+
+## What it does
+
+- Liquidation heatmap: price levels where tracked Hyperliquid positions get liquidated (longs below price, shorts above). A free, terminal alternative to paid liquidation heatmap sites.
+- Whale tracker: the largest open Hyperliquid positions with entry, liquidation price, PnL and leverage.
+- Liquidation watch: positions closest to liquidation.
+- Liquidation stream: confirmed liquidations from OKX, Bybit, Binance (sampled at source) and Hyperliquid (HLP absorbed). Hyperliquid large trades are shown separately as estimated and never counted as liquidations.
+- Order flow: cumulative volume delta for 1m to 24h windows from Hyperliquid and Binance trades, with per venue attribution and warmup labels.
+- Market overview: price, 24h change, funding (hourly and annualized), open interest and volume for every Hyperliquid perp.
+- HLP vault: Hyperliquid's market maker vault, aggregated across its child vaults: AUM, net delta and z-score, positions, absorbed liquidations.
+- Data health: continuous cross-checks against external references; stale, partial and drifting feeds are labelled, never shown as live.
+
+## Commands
+
+- `hyperdata`: interactive dashboard menu
+- `hyperdata heatmap --symbol ETH`, `hyperdata whales`, `hyperdata cvd`, `hyperdata all`: open one dashboard directly
+- `hyperdata api --port 8420`: local REST + WebSocket API (loopback by default)
+- `hyperdata paper -s cvd_momentum -s ./my_strategy.py`: paper trade strategies on live data
+- `hyperdata mcp`: MCP server over stdio (install with `pipx install "hyperdata-terminal[mcp]"`; add to Claude Code with `claude mcp add hyperdata -- hyperdata mcp`)
+- `hyperdata verify`: one shot data integrity report
+
+## MCP tools
+
+get_market_overview, get_asset, get_liquidations, get_liquidation_heatmap, get_whale_positions, get_positions_near_liquidation, get_order_flow, get_hlp_vault, get_funding_extremes, get_data_health
+
+## Links
+
+- Source and README: https://github.com/Co-Messi/HyperData-Terminal
+- Data integrity and coverage notes: https://github.com/Co-Messi/HyperData-Terminal/blob/main/docs/DATA_INTEGRITY.md
+- PyPI: https://pypi.org/project/hyperdata-terminal/
