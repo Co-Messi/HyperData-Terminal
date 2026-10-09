@@ -5,7 +5,7 @@ import time
 
 import pytest
 
-from data_layer.long_short_ratio import LongShortCollector, LongShortSnapshot
+from hyperdata_terminal.data_layer.long_short_ratio import LongShortCollector, LongShortSnapshot
 
 
 def test_snapshot_fields():

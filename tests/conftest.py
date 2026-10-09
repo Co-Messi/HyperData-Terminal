@@ -2,12 +2,12 @@
 from __future__ import annotations
 
 import os
-import sys
+import tempfile
 
-# Ensure project root and src/ are importable
-_PROJECT_ROOT = os.path.join(os.path.dirname(__file__), "..")
-sys.path.insert(0, _PROJECT_ROOT)
-sys.path.insert(0, os.path.join(_PROJECT_ROOT, "src"))
+# Point every on-disk store at a throwaway directory BEFORE the package is
+# imported: hyperdata_terminal.paths resolves the data dir once, at import,
+# and the suite must never touch a developer's real wallet history.
+os.environ["HYPERDATA_DATA_DIR"] = tempfile.mkdtemp(prefix="hyperdata-tests-")
 
 
 def pytest_addoption(parser):

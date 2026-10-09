@@ -5,7 +5,7 @@ import time
 
 import pytest
 
-from data_layer.spot_prices import SpotPriceCollector, SpotPriceSnapshot
+from hyperdata_terminal.data_layer.spot_prices import SpotPriceCollector, SpotPriceSnapshot
 
 
 def test_snapshot_fields():
@@ -69,7 +69,7 @@ def test_collector_default_symbols():
 
 def test_collector_symbol_map():
     """Default symbols map to correct Binance ticker symbols."""
-    from data_layer.spot_prices import SYMBOL_TO_BINANCE
+    from hyperdata_terminal.data_layer.spot_prices import SYMBOL_TO_BINANCE
     assert SYMBOL_TO_BINANCE["BTC"] == "BTCUSDT"
     assert SYMBOL_TO_BINANCE["ETH"] == "ETHUSDT"
     assert SYMBOL_TO_BINANCE["SOL"] == "SOLUSDT"

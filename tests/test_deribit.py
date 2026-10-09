@@ -5,7 +5,7 @@ import time
 
 import pytest
 
-from data_layer.deribit import DeribitFeed, DeribitIVSnapshot
+from hyperdata_terminal.data_layer.deribit import DeribitFeed, DeribitIVSnapshot
 
 
 def test_snapshot_fields():

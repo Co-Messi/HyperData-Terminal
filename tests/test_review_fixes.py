@@ -14,8 +14,8 @@ import sqlite3
 
 import pytest
 
-from src.data_layer import address_store
-from src.data_layer.persistence import DataStore
+from hyperdata_terminal.data_layer import address_store
+from hyperdata_terminal.data_layer.persistence import DataStore
 
 
 @pytest.fixture
@@ -34,7 +34,7 @@ def _addr(seed: str) -> str:
 def _scanner(monkeypatch, n_addresses: int = 0):
     """A real PositionScanner that never touches the repo's SQLite file."""
     monkeypatch.setattr(address_store, "get_all_addresses", lambda: set())
-    from src.data_layer.position_scanner import PositionScanner
+    from hyperdata_terminal.data_layer.position_scanner import PositionScanner
     s = PositionScanner()
     s.discovered_addresses = {f"0x{i:040x}" for i in range(n_addresses)}
     return s
@@ -152,7 +152,7 @@ class TestM10AddressStore:
             raise sqlite3.OperationalError("database is locked")
 
         monkeypatch.setattr(address_store, "_get_conn", boom)
-        with caplog.at_level("WARNING", logger="src.data_layer.address_store"):
+        with caplog.at_level("WARNING", logger="hyperdata_terminal.data_layer.address_store"):
             assert address_store.add_addresses([_addr("b")], source="t") == 0
         assert "NOT persisted" in caplog.text
 
@@ -160,7 +160,7 @@ class TestM10AddressStore:
         """L2: `dropped` was computed after the comprehension consumed the
         iterable, going negative for generators."""
         gen = (a for a in [_addr("c"), "junk", "0xshort"])
-        with caplog.at_level("WARNING", logger="src.data_layer.address_store"):
+        with caplog.at_level("WARNING", logger="hyperdata_terminal.data_layer.address_store"):
             assert address_store.add_addresses(gen, source="t") == 1
         assert "dropped 2 invalid" in caplog.text
 
@@ -169,7 +169,7 @@ class TestM10AddressStore:
         so a corrupted DB is quarantined before address_store touches it."""
         import inspect
 
-        from src.data_layer.hub import HyperDataHub
+        from hyperdata_terminal.data_layer.hub import HyperDataHub
         src = inspect.getsource(HyperDataHub.__init__)
         assert src.index("self.store = DataStore()") < src.index("self.positions = PositionScanner()")
 
@@ -179,7 +179,7 @@ class TestM10AddressStore:
 class TestC1Tiers:
     @staticmethod
     def _engine_with(n: int):
-        from data_layer.smart_money import SmartMoneyEngine, WalletProfile
+        from hyperdata_terminal.data_layer.smart_money import SmartMoneyEngine, WalletProfile
         engine = SmartMoneyEngine()
         for i in range(n):
             addr = f"0x{i:040x}"
@@ -240,7 +240,7 @@ class TestC1Tiers:
         nothing — no signal field, no DB column, no panel."""
         import time as _t
 
-        from data_layer.smart_money import SmartMoneySignal
+        from hyperdata_terminal.data_layer.smart_money import SmartMoneySignal
         engine = self._engine_with(50)
         top = next(w for w in engine.wallets.values() if w.rank == 1)
         top.confidence = 0.4
@@ -290,8 +290,8 @@ class TestC1Tiers:
 
         from rich.console import Console
 
-        from data_layer.smart_money import SmartMoneySignal
-        from src.dashboards.hub_panels import HubSmartMoney
+        from hyperdata_terminal.dashboards.hub_panels import HubSmartMoney
+        from hyperdata_terminal.data_layer.smart_money import SmartMoneySignal
         engine = self._engine_with(50)
         for w in engine.wallets.values():
             w.confidence = 0.42
@@ -360,7 +360,7 @@ class TestS2NoDeadWalletTable:
     def test_no_wallet_persistence_surface_remains(self):
         import inspect
 
-        from src.data_layer import persistence, smart_money
+        from hyperdata_terminal.data_layer import persistence, smart_money
         assert "wallets" not in inspect.getsource(persistence.DataStore._init_tables).replace(
             "no `wallets` table", "")
         assert not hasattr(persistence.DataStore, "save_wallet")
@@ -376,7 +376,7 @@ async def _loopback_client(monkeypatch, cors_env: str = ""):
     from aiohttp import web
     from aiohttp.test_utils import TestClient, TestServer
 
-    from src.api_server import (
+    from hyperdata_terminal.api_server import (
         HyperDataAPI,
         _make_cors_middleware,
         _make_host_guard_middleware,
@@ -451,7 +451,7 @@ class TestC2LoopbackCORS:
             await client.close()
 
     def test_host_guard_only_on_loopback_bind(self):
-        from src.api_server import _host_header_is_loopback, _make_host_guard_middleware
+        from hyperdata_terminal.api_server import _host_header_is_loopback, _make_host_guard_middleware
         assert _make_host_guard_middleware("0.0.0.0") is None
         assert _make_host_guard_middleware("127.0.0.1") is not None
         assert _host_header_is_loopback("::1")
@@ -486,13 +486,13 @@ class TestC2LoopbackCORS:
 
 def _isolated_hub(tmp_path, monkeypatch):
     """A HyperDataHub whose SQLite files live in tmp_path (no network)."""
-    from src.data_layer import persistence
+    from hyperdata_terminal.data_layer import persistence
     monkeypatch.setattr(persistence, "DB_PATH", tmp_path / "hub.db")
     monkeypatch.setattr(address_store, "DATA_DIR", tmp_path)
     monkeypatch.setattr(address_store, "DB_PATH", tmp_path / "hub.db")
     monkeypatch.setattr(address_store, "LEGACY_JSON", tmp_path / "legacy.json")
     monkeypatch.setattr(address_store, "_initialized", False)
-    from src.data_layer.hub import HyperDataHub
+    from hyperdata_terminal.data_layer.hub import HyperDataHub
     return HyperDataHub()
 
 
@@ -504,7 +504,7 @@ def _hl_trade_frame(tid: int = 1) -> dict:
 
 def _silent_binance_engine(now: float):
     """HL flowing; Binance connected 120s ago with ZERO frames — the live case."""
-    from src.data_layer.orderflow_engine import OrderFlowEngine
+    from hyperdata_terminal.data_layer.orderflow_engine import OrderFlowEngine
     e = OrderFlowEngine(symbols=["BTC", "ETH", "SOL"])
     e._venue_connected("hyperliquid")
     e._handle_message(_hl_trade_frame())
@@ -517,7 +517,7 @@ class TestC3VenueTruth:
     def test_status_machine(self):
         import time as _t
 
-        from src.data_layer.orderflow_engine import OrderFlowEngine
+        from hyperdata_terminal.data_layer.orderflow_engine import OrderFlowEngine
         now = _t.time()
         e = OrderFlowEngine(symbols=["BTC"])
         assert e.venue_status("binance", now) == ("disconnected", "never connected")
@@ -568,7 +568,7 @@ class TestC3VenueTruth:
         from types import SimpleNamespace
         from unittest.mock import MagicMock
 
-        from src.data_layer.health_monitor import DataHealthMonitor
+        from hyperdata_terminal.data_layer.health_monitor import DataHealthMonitor
         now = _t.time()
         e = _silent_binance_engine(now)
         hub = SimpleNamespace(
@@ -601,7 +601,7 @@ class TestC3VenueTruth:
         from aiohttp import web
         from aiohttp.test_utils import TestClient, TestServer
 
-        from src.api_server import HyperDataAPI
+        from hyperdata_terminal.api_server import HyperDataAPI
         e = _silent_binance_engine(_t.time())
         hub = MagicMock()
         hub.orderflow = e
@@ -629,8 +629,8 @@ class TestC3VenueTruth:
         from aiohttp import web
         from aiohttp.test_utils import TestClient, TestServer
 
-        from src.api_server import HyperDataAPI
-        from src.data_layer.hub import HubStatus
+        from hyperdata_terminal.api_server import HyperDataAPI
+        from hyperdata_terminal.data_layer.hub import HubStatus
         hub = MagicMock()
         hub.status = HubStatus(mode="live")
         hub.orderflow = _silent_binance_engine(_t.time())
@@ -660,7 +660,7 @@ class TestC3VenueTruth:
 
         from rich.console import Console
 
-        from src.dashboards.cvd_dashboard import CVDDashboard
+        from hyperdata_terminal.dashboards.cvd_dashboard import CVDDashboard
         e = _silent_binance_engine(_t.time())
         dash = CVDDashboard(engine=e, symbol="BTC")
         console = Console(record=True, width=200, force_terminal=False)
@@ -676,7 +676,7 @@ class TestC3VenueTruth:
 
         from rich.console import Console
 
-        from src.dashboards.hub_panels import HubCVD
+        from hyperdata_terminal.dashboards.hub_panels import HubCVD
         e = _silent_binance_engine(_t.time())
         hub = MagicMock()
         hub.orderflow = e
@@ -691,7 +691,7 @@ class TestC3VenueTruth:
     def test_demo_engine_is_labelled_synthetic_not_attributed(self):
         from rich.console import Console
 
-        from src.dashboards.cvd_dashboard import CVDDashboard
+        from hyperdata_terminal.dashboards.cvd_dashboard import CVDDashboard
         dash = CVDDashboard(demo=True, symbol="BTC")
         assert dash.engine.synthetic is True
         console = Console(record=True, width=200, force_terminal=False)
@@ -701,7 +701,7 @@ class TestC3VenueTruth:
     def test_health_badge_warn_is_partial_not_live(self):
         from unittest.mock import MagicMock
 
-        from src.dashboards.combined_dashboard import CombinedDashboard
+        from hyperdata_terminal.dashboards.combined_dashboard import CombinedDashboard
         dash = CombinedDashboard.__new__(CombinedDashboard)
         dash.hub = MagicMock()
         for overall, expected in (("ok", "LIVE"), ("warn", "PARTIAL"), ("stale", "STALE")):
@@ -716,7 +716,7 @@ class TestC3VenueTruth:
         carried no exception type or message."""
         import asyncio
 
-        from src.data_layer import orderflow_engine as oe
+        from hyperdata_terminal.data_layer import orderflow_engine as oe
 
         class FakeSession:
             async def __aenter__(self):
@@ -740,7 +740,7 @@ class TestC3VenueTruth:
 
 class TestH2FrameAccounting:
     def _engine(self):
-        from src.data_layer.orderflow_engine import OrderFlowEngine
+        from hyperdata_terminal.data_layer.orderflow_engine import OrderFlowEngine
         e = OrderFlowEngine(symbols=["BTC"])
         e._venue_connected("binance")
         return e
@@ -862,9 +862,9 @@ class TestH7HealthStatus:
         from aiohttp import web
         from aiohttp.test_utils import TestClient, TestServer
 
-        from src.api_server import HyperDataAPI
-        from src.data_layer.hub import HubStatus
-        from src.data_layer.orderflow_engine import OrderFlowEngine
+        from hyperdata_terminal.api_server import HyperDataAPI
+        from hyperdata_terminal.data_layer.hub import HubStatus
+        from hyperdata_terminal.data_layer.orderflow_engine import OrderFlowEngine
         hub = MagicMock()
         hub.status = HubStatus(mode=mode, **(feed_overrides or {}))
         hub.status.failed_components = list(failed or [])
@@ -1003,7 +1003,7 @@ def _paper_trader(price=100.0, balance=10_000.0, with_db=True, **kw):
     from types import SimpleNamespace
     from unittest.mock import MagicMock
 
-    from src.strategies.paper_trader import CREATE_TABLE_SQL, PaperTrader
+    from hyperdata_terminal.strategies.paper_trader import CREATE_TABLE_SQL, PaperTrader
     hub = MagicMock()
     hub.market.assets = {"BTC": SimpleNamespace(price=price)}
     trader = PaperTrader(hub, [], starting_balance=balance, **kw)
@@ -1018,7 +1018,7 @@ class TestM2PersistFirst:
         """Pre-fix: `if self._db:` skipped the whole persistence block and
         apply_mutation() ran anyway — the one case the docstring's
         "a trade that cannot be logged is not executed" did not cover."""
-        from src.strategies.base import Signal
+        from hyperdata_terminal.strategies.base import Signal
         trader = _paper_trader(with_db=False)
         assert trader._db is None
         with caplog.at_level("ERROR"):
@@ -1031,7 +1031,7 @@ class TestM2PersistFirst:
     def test_with_db_the_same_trade_executes_and_is_logged(self):
         """Control: passed pre-fix too. The refusal in the test above must
         not have made the normal path (DB open) refuse as well."""
-        from src.strategies.base import Signal
+        from hyperdata_terminal.strategies.base import Signal
         trader = _paper_trader()
         trader._execute_trade("t", Signal("BTC", "BUY", size_usd=1_000.0))
         assert trader.positions["BTC"]["size_usd"] == 1_000.0
@@ -1042,7 +1042,7 @@ class TestM3ReverseSemantics:
     def test_default_close_only_flattens_and_warns(self, caplog):
         """Default behaviour is unchanged (test_close_realizes_pnl still holds)
         but is now explicit and logged instead of silent."""
-        from src.strategies.base import Signal
+        from hyperdata_terminal.strategies.base import Signal
         trader = _paper_trader(balance=1_000.0)
         trader._execute_trade("t", Signal("BTC", "BUY", size_usd=500.0))
         with caplog.at_level("WARNING"):
@@ -1054,7 +1054,7 @@ class TestM3ReverseSemantics:
     def test_reverse_flag_opens_opposite_side_as_second_logged_trade(self):
         """Pre-fix there was no way to get the strategy's directional intent
         honoured: a strong SELL left the book flat until the next tick."""
-        from src.strategies.base import Signal
+        from hyperdata_terminal.strategies.base import Signal
         trader = _paper_trader(balance=1_000.0, reverse_on_opposite_signal=True)
         trader._execute_trade("t", Signal("BTC", "BUY", size_usd=500.0))
         trader.hub.market.assets["BTC"].price = 110.0
@@ -1071,7 +1071,7 @@ class TestM3ReverseSemantics:
     def test_reverse_is_balance_checked(self):
         """If the reverse leg cannot be afforded the book is simply flat —
         never negative."""
-        from src.strategies.base import Signal
+        from hyperdata_terminal.strategies.base import Signal
         trader = _paper_trader(balance=500.0, reverse_on_opposite_signal=True)
         trader._execute_trade("t", Signal("BTC", "BUY", size_usd=500.0))
         trader.hub.market.assets["BTC"].price = 10.0     # -90%: close credits 50
@@ -1119,7 +1119,7 @@ class TestM5RateLimiterLRU:
     def test_tracked_keys_are_bounded_by_lru_eviction(self):
         """Pre-fix: above 10k ACTIVE keys nothing was ever removed and a
         full-dict comprehension ran on every request."""
-        from src.api_server import _RateLimiter
+        from hyperdata_terminal.api_server import _RateLimiter
         limiter = _RateLimiter(max_requests=100, window_s=60, max_tracked_keys=100)
         for i in range(150):
             assert limiter.allow(f"ip-{i}", now=1000.0)      # all active, none expired
@@ -1128,7 +1128,7 @@ class TestM5RateLimiterLRU:
         assert "ip-0" not in limiter._hits and "ip-149" in limiter._hits
 
     def test_hot_key_survives_eviction(self):
-        from src.api_server import _RateLimiter
+        from hyperdata_terminal.api_server import _RateLimiter
         limiter = _RateLimiter(max_requests=1000, window_s=60, max_tracked_keys=50)
         for i in range(200):
             limiter.allow("hot", now=1000.0)
@@ -1144,7 +1144,7 @@ class TestM6PerIPWebSocketCap:
         10 sockets locked everyone else out."""
         from unittest.mock import MagicMock
 
-        from src.api_server import MAX_WS_CONNECTIONS, MAX_WS_CONNECTIONS_PER_IP, HyperDataAPI
+        from hyperdata_terminal.api_server import MAX_WS_CONNECTIONS, MAX_WS_CONNECTIONS_PER_IP, HyperDataAPI
 
         def fake_client(remote):
             c = MagicMock()
@@ -1189,14 +1189,14 @@ def _render(renderable) -> str:
 
 
 def _position(symbol: str):
-    from src.data_layer.position_scanner import TrackedPosition
+    from hyperdata_terminal.data_layer.position_scanner import TrackedPosition
     return TrackedPosition(address="0x" + "a" * 40, symbol=symbol, side="long", size_usd=250_000.0,
                            entry_price=100.0, current_price=100.0, liq_price=99.0, distance_pct=1.0,
                            leverage=10.0, unrealized_pnl=5.0, margin_used=25_000.0)
 
 
 def _asset(symbol: str):
-    from src.data_layer.market_data import AssetInfo
+    from hyperdata_terminal.data_layer.market_data import AssetInfo
     return AssetInfo(symbol=symbol, price=1.0, funding_rate=0.001, open_interest=1e6, volume_24h=1e6,
                      price_change_24h_pct=0.01, mark_price=1.0, index_price=1.0)
 
@@ -1210,8 +1210,8 @@ class TestM9MarkupSafety:
     def test_hub_panels(self, symbol, monkeypatch):
         from unittest.mock import MagicMock
 
-        from src.dashboards.hub_panels import HubHLP, HubLiqWatch, HubMarket, HubWhales
-        from src.data_layer.hlp_tracker import HLPPosition
+        from hyperdata_terminal.dashboards.hub_panels import HubHLP, HubLiqWatch, HubMarket, HubWhales
+        from hyperdata_terminal.data_layer.hlp_tracker import HLPPosition
         hub = MagicMock()
         hub.positions = _scanner(monkeypatch)
         hub.status.mode = "live"
@@ -1241,10 +1241,10 @@ class TestM9MarkupSafety:
     def test_standalone_dashboards(self, symbol):
         import time as _t
 
-        from src.dashboards.liquidation_stream import LiquidationStreamDashboard
-        from src.dashboards.market_overview import MarketOverviewDashboard
-        from src.dashboards.whale_tracker import WhaleTrackerDashboard
-        from src.data_layer.liquidation_feed import LiquidationEvent, LiquidationFeed
+        from hyperdata_terminal.dashboards.liquidation_stream import LiquidationStreamDashboard
+        from hyperdata_terminal.dashboards.market_overview import MarketOverviewDashboard
+        from hyperdata_terminal.dashboards.whale_tracker import WhaleTrackerDashboard
+        from hyperdata_terminal.data_layer.liquidation_feed import LiquidationEvent, LiquidationFeed
 
         feed = LiquidationFeed()
         feed.events.append(LiquidationEvent(_t.time(), "binance", symbol, "long", 1000.0, 1.0, 1.0))
@@ -1268,8 +1268,8 @@ class TestM9MarkupSafety:
 
         from rich.console import Console
 
-        from src.strategies import paper_trader as pt
-        from src.strategies.base import Signal
+        from hyperdata_terminal.strategies import paper_trader as pt
+        from hyperdata_terminal.strategies.base import Signal
         recorder = Console(record=True, width=220, file=io.StringIO(), force_terminal=False)
         monkeypatch.setattr(pt, "console", recorder)
         trader = _paper_trader()
@@ -1287,7 +1287,7 @@ class TestM9MarkupSafety:
 class TestM8Scoring:
     @staticmethod
     def _engine():
-        from data_layer.smart_money import SmartMoneyEngine
+        from hyperdata_terminal.data_layer.smart_money import SmartMoneyEngine
         return SmartMoneyEngine()
 
     def test_pnl_score_is_monotonic_bounded_and_uses_its_weight(self):
@@ -1323,7 +1323,7 @@ class TestM8Scoring:
         """Guard: passed pre-fix too. Pins the composite's [-0.65, 1] range
         and that the documented weights still sum to 1 after the M8
         re-weighting; it does not by itself show M8 was a bug."""
-        from data_layer.smart_money import WalletProfile
+        from hyperdata_terminal.data_layer.smart_money import WalletProfile
         e = self._engine()
         best = WalletProfile(address="0x" + "1" * 40, discovered_at=0, last_seen=0, last_analyzed=0,
                              win_rate=1.0, total_realized_pnl=1e12, sharpe_ratio=1e6)
@@ -1367,7 +1367,7 @@ class TestM8Scoring:
 class TestH3LLMTransport:
     @staticmethod
     def _agent():
-        from src.strategies.llm_agent import LLMAgent
+        from hyperdata_terminal.strategies.llm_agent import LLMAgent
         agent = LLMAgent(symbol="BTC")
         agent.api_key = "k"
         agent.base_url = "https://llm.example/v1"
@@ -1377,7 +1377,7 @@ class TestH3LLMTransport:
         """Pre-fix: a single-worker ThreadPoolExecutor whose thread a wait_for
         timeout could not cancel — one trickling response wedged every later
         evaluation forever. _async_evaluate existed but was dead code."""
-        from src.strategies.llm_agent import LLMAgent
+        from hyperdata_terminal.strategies.llm_agent import LLMAgent
         agent = self._agent()
         assert not hasattr(agent, "_pool")
         assert not hasattr(LLMAgent, "_sync_evaluate")
@@ -1446,7 +1446,7 @@ class TestH3LLMTransport:
         assert agent._inflight is False
 
     def test_reason_is_bounded(self):
-        from src.strategies.llm_agent import LLMAgent
+        from hyperdata_terminal.strategies.llm_agent import LLMAgent
         agent = self._agent()
         sig = agent._parse_response("BUY\n" + "x" * 5000)
         assert sig is not None
@@ -1463,7 +1463,7 @@ class TestH4ScanBudget:
         import time as _t
         from unittest.mock import AsyncMock
 
-        from src.data_layer import position_scanner as ps
+        from hyperdata_terminal.data_layer import position_scanner as ps
         monkeypatch.setattr(s, "update_prices", AsyncMock())
         monkeypatch.setattr(s, "update_meta", AsyncMock())
         s._last_discovery = _t.time()
@@ -1545,7 +1545,7 @@ class TestH4ScanBudget:
         assert s.positions == [pos]                      # not silently "no positions"
 
     def test_staleness_semantics(self, monkeypatch):
-        from src.data_layer.position_scanner import POSITION_STALE_AFTER_SECONDS as STALE
+        from hyperdata_terminal.data_layer.position_scanner import POSITION_STALE_AFTER_SECONDS as STALE
         s = _scanner(monkeypatch)
         assert s.is_stale() is False                     # never scanned = starting, not stale
         now = 10_000.0
@@ -1569,9 +1569,9 @@ class TestH4ScanBudget:
         from aiohttp import web
         from aiohttp.test_utils import TestClient, TestServer
 
-        from src.api_server import HyperDataAPI
-        from src.data_layer.hub import HubStatus
-        from src.data_layer.orderflow_engine import OrderFlowEngine
+        from hyperdata_terminal.api_server import HyperDataAPI
+        from hyperdata_terminal.data_layer.hub import HubStatus
+        from hyperdata_terminal.data_layer.orderflow_engine import OrderFlowEngine
         s = _scanner(monkeypatch)
         p = _position("BTC")
         p.scanned_at = 123.0
@@ -1608,7 +1608,7 @@ class TestH4ScanBudget:
         'connected' stayed on a scanner whose last result was an hour old."""
         import time as _t
 
-        from src.data_layer.position_scanner import POSITION_STALE_AFTER_SECONDS as STALE
+        from hyperdata_terminal.data_layer.position_scanner import POSITION_STALE_AFTER_SECONDS as STALE
 
         hub = _isolated_hub(tmp_path, monkeypatch)
         try:
@@ -1627,9 +1627,9 @@ class TestH4ScanBudget:
         from types import SimpleNamespace
         from unittest.mock import MagicMock
 
-        from src.data_layer.health_monitor import DataHealthMonitor
-        from src.data_layer.orderflow_engine import OrderFlowEngine
-        from src.data_layer.position_scanner import POSITION_STALE_AFTER_SECONDS as STALE
+        from hyperdata_terminal.data_layer.health_monitor import DataHealthMonitor
+        from hyperdata_terminal.data_layer.orderflow_engine import OrderFlowEngine
+        from hyperdata_terminal.data_layer.position_scanner import POSITION_STALE_AFTER_SECONDS as STALE
         now = _t.time()
         s = _scanner(monkeypatch)
         hub = SimpleNamespace(
@@ -1651,7 +1651,7 @@ class TestH4ScanBudget:
         """The store cap must be coverable well inside the stale threshold
         (the old 50,000 cap implied an 83-minute cycle). The exact
         relationship is pinned by TestB1StalenessBudget."""
-        from src.data_layer.position_scanner import (
+        from hyperdata_terminal.data_layer.position_scanner import (
             POSITION_STALE_AFTER_SECONDS,
             full_pass_seconds_worst_case,
         )
@@ -1670,7 +1670,7 @@ class TestB1StalenessBudget:
     time was not even bounded by the cap."""
 
     def test_worst_case_full_pass_is_comfortably_under_the_stale_threshold(self):
-        from src.data_layer import position_scanner as ps
+        from hyperdata_terminal.data_layer import position_scanner as ps
         # The relationship the threshold is derived from...
         assert ps.full_pass_seconds_worst_case() * ps.STALE_MARGIN_FACTOR <= ps.POSITION_STALE_AFTER_SECONDS
         assert ps.STALE_MARGIN_FACTOR >= 1.5
@@ -1689,8 +1689,8 @@ class TestB1StalenessBudget:
     def test_hub_default_interval_and_prune_cadence_match_the_derivation(self):
         import inspect
 
-        from src.data_layer import hub as hub_mod
-        from src.data_layer import position_scanner as ps
+        from hyperdata_terminal.data_layer import hub as hub_mod
+        from hyperdata_terminal.data_layer import position_scanner as ps
         sig = inspect.signature(hub_mod.HyperDataHub.__init__)
         assert sig.parameters["scan_interval"].default == ps.SCAN_INTERVAL_SECONDS
         assert hub_mod.DB_PRUNE_INTERVAL_TICKS == ps.ADDRESS_PRUNE_INTERVAL_SECONDS
@@ -1698,7 +1698,7 @@ class TestB1StalenessBudget:
 
     @pytest.mark.asyncio
     async def test_resync_drops_pruned_addresses_and_keeps_new_discoveries(self, isolated_address_store, monkeypatch):
-        from src.data_layer.position_scanner import PositionScanner
+        from hyperdata_terminal.data_layer.position_scanner import PositionScanner
         addrs = [_addr(f"{i}{i}{i}") for i in range(5)]
         for a in addrs:
             address_store.add_addresses([a], source="test")
@@ -1730,7 +1730,7 @@ class TestB1StalenessBudget:
 
     @pytest.mark.asyncio
     async def test_hub_resyncs_the_scanner_after_the_hourly_prune(self, tmp_path, monkeypatch):
-        from src.data_layer import hub as hub_mod
+        from hyperdata_terminal.data_layer import hub as hub_mod
         addrs = [_addr(f"{i}{i}{i}") for i in range(5)]
         hub = _isolated_hub(tmp_path, monkeypatch)
         try:
@@ -1814,7 +1814,7 @@ class TestH6WriterThread:
         race under CI load (S5) and then asserted an exact count."""
         import threading
 
-        from src.data_layer import persistence
+        from hyperdata_terminal.data_layer import persistence
         monkeypatch.setattr(persistence, "WRITE_QUEUE_MAX", 5)
         store = DataStore(tmp_path / "q.db")
         taken, release = threading.Event(), threading.Event()
@@ -1848,7 +1848,7 @@ class TestH6WriterThread:
         the queue with one WARNING on a logger with no stdout handler."""
         import threading
 
-        from src.data_layer import persistence
+        from hyperdata_terminal.data_layer import persistence
         monkeypatch.setattr(persistence, "DRAIN_TIMEOUT_SECONDS", 0.05)
         store = DataStore(tmp_path / "wedged.db")
         release = threading.Event()
@@ -1910,7 +1910,7 @@ class TestH6WriterThread:
     def test_hub_runs_blocking_db_work_off_the_loop(self):
         import inspect
 
-        from src.data_layer.hub import HyperDataHub
+        from hyperdata_terminal.data_layer.hub import HyperDataHub
         src = inspect.getsource(HyperDataHub._status_update_tick)
         assert "asyncio.to_thread(self.store.get_db_stats)" in src
         assert 'self.status.dropped_writes = db_stats["dropped_writes"]' in src
@@ -1952,7 +1952,7 @@ class TestReconnectBackoff:
         reset the backoff to 1s and looped with NO sleep at all."""
         import asyncio
 
-        from src.data_layer.orderflow_engine import OrderFlowEngine
+        from hyperdata_terminal.data_layer.orderflow_engine import OrderFlowEngine
         e = OrderFlowEngine(symbols=["BTC"])
         calls = {"n": 0}
 
@@ -1984,7 +1984,7 @@ class TestHLSharding:
     venue."""
 
     def test_unlisted_symbols_are_skipped_and_named_once(self, caplog):
-        from src.data_layer.orderflow_engine import OrderFlowEngine
+        from hyperdata_terminal.data_layer.orderflow_engine import OrderFlowEngine
         e = OrderFlowEngine(symbols=["BTC", "PEPE", "ETH", "BONK"])
         universe = {"BTC", "ETH", "kPEPE", "SOL"}
         with caplog.at_level("WARNING"):
@@ -2001,7 +2001,7 @@ class TestHLSharding:
     async def test_universe_is_fetched_once_and_cached(self):
         from unittest.mock import AsyncMock, MagicMock
 
-        from src.data_layer.orderflow_engine import OrderFlowEngine
+        from hyperdata_terminal.data_layer.orderflow_engine import OrderFlowEngine
         e = OrderFlowEngine(symbols=["BTC"])
         resp = AsyncMock()
         resp.json = AsyncMock(return_value={"universe": [{"name": "BTC"}, {"name": "kPEPE"}, "junk"]})
@@ -2018,8 +2018,8 @@ class TestHLSharding:
         assert await e._fetch_hl_universe(session) == {"BTC", "kPEPE"}
 
     def test_shards_cover_all_symbols_within_the_cap(self):
-        from config.settings import DEFAULT_SYMBOLS
-        from src.data_layer.orderflow_engine import HL_SUBSCRIPTIONS_PER_SOCKET, OrderFlowEngine
+        from hyperdata_terminal.config.settings import DEFAULT_SYMBOLS
+        from hyperdata_terminal.data_layer.orderflow_engine import HL_SUBSCRIPTIONS_PER_SOCKET, OrderFlowEngine
         e = OrderFlowEngine()                       # all 50 defaults
         shards = e._hl_shards()
         assert all(0 < len(s) <= HL_SUBSCRIPTIONS_PER_SOCKET for s in shards)
@@ -2030,7 +2030,7 @@ class TestHLSharding:
     async def test_start_runs_one_socket_loop_per_shard(self, monkeypatch):
         import asyncio
 
-        from src.data_layer.orderflow_engine import OrderFlowEngine
+        from hyperdata_terminal.data_layer.orderflow_engine import OrderFlowEngine
         e = OrderFlowEngine()
         seen: list[int] = []
 
@@ -2057,7 +2057,7 @@ class TestHLSharding:
         reconnecting seven times, and one shard dropping is not 'disconnected'."""
         from unittest.mock import MagicMock
 
-        from src.data_layer.orderflow_engine import OrderFlowEngine
+        from hyperdata_terminal.data_layer.orderflow_engine import OrderFlowEngine
         e = OrderFlowEngine()
         st = e.venues["hyperliquid"]
         e._venue_connected("hyperliquid")
@@ -2074,7 +2074,7 @@ class TestHLSharding:
     async def test_force_reconnect_closes_every_open_shard(self):
         from unittest.mock import AsyncMock, MagicMock
 
-        from src.data_layer.orderflow_engine import OrderFlowEngine
+        from hyperdata_terminal.data_layer.orderflow_engine import OrderFlowEngine
         e = OrderFlowEngine()
         a, b, c = MagicMock(closed=False), MagicMock(closed=False), MagicMock(closed=True)
         for ws in (a, b, c):
@@ -2088,7 +2088,7 @@ class TestHLSharding:
     def test_hub_watchdog_uses_shard_aware_reconnect(self):
         import inspect
 
-        from src.data_layer.hub import HyperDataHub
+        from hyperdata_terminal.data_layer.hub import HyperDataHub
         src = inspect.getsource(HyperDataHub._update_feed_staleness)
         assert "orderflow.force_reconnect()" in src
         assert "orderflow._ws" not in src
@@ -2100,7 +2100,7 @@ class TestHLSharding:
         inside `await session.close()`. stop() must let the close finish."""
         import asyncio
 
-        from src.data_layer.orderflow_engine import OrderFlowEngine
+        from hyperdata_terminal.data_layer.orderflow_engine import OrderFlowEngine
         e = OrderFlowEngine(symbols=["BTC"])
 
         class FakeSession:
@@ -2148,7 +2148,7 @@ def _sharded_engine(now: float):
     left for the test to set. Mirrors what start() sets up, without sockets."""
     from unittest.mock import MagicMock
 
-    from src.data_layer.orderflow_engine import OrderFlowEngine, ShardState
+    from hyperdata_terminal.data_layer.orderflow_engine import OrderFlowEngine, ShardState
     e = OrderFlowEngine(symbols=[f"S{i}" for i in range(16)])
     e._hl_shard_plan = e._hl_shards()
     e._hl_shard_state = {0: ShardState(connected_at=now - 300), 1: ShardState(down_since=now - 300)}
@@ -2208,7 +2208,7 @@ class TestS1ShardLiveness:
         import time as _t
         from unittest.mock import MagicMock
 
-        from src.data_layer.orderflow_engine import HL_SHARD_FLAP_CLOSES
+        from hyperdata_terminal.data_layer.orderflow_engine import HL_SHARD_FLAP_CLOSES
         now = _t.time()
         e = _sharded_engine(now)
         st = e._hl_shard_state[1]
@@ -2226,8 +2226,8 @@ class TestS1ShardLiveness:
         from types import SimpleNamespace
         from unittest.mock import AsyncMock
 
-        from src.data_layer import orderflow_engine as of
-        from src.data_layer.orderflow_engine import HL_SHARD_FLAP_CLOSES, OrderFlowEngine
+        from hyperdata_terminal.data_layer import orderflow_engine as of
+        from hyperdata_terminal.data_layer.orderflow_engine import HL_SHARD_FLAP_CLOSES, OrderFlowEngine
         e = OrderFlowEngine(symbols=["BTC"])
         clock = {"t": 1_000_000.0}
         monkeypatch.setattr(of, "time", SimpleNamespace(time=lambda: clock["t"]))
@@ -2266,9 +2266,9 @@ class TestS1ShardLiveness:
         from aiohttp import web
         from aiohttp.test_utils import TestClient, TestServer
 
-        from src.api_server import HyperDataAPI
-        from src.data_layer.health_monitor import DataHealthMonitor
-        from src.data_layer.hub import HubStatus
+        from hyperdata_terminal.api_server import HyperDataAPI
+        from hyperdata_terminal.data_layer.health_monitor import DataHealthMonitor
+        from hyperdata_terminal.data_layer.hub import HubStatus
         now = _t.time()
         e = _sharded_engine(now)
         e._venue_connected("binance")
@@ -2330,7 +2330,7 @@ class TestS1ShardLiveness:
 
         from rich.console import Console
 
-        from src.dashboards.cvd_dashboard import venue_cvd_text
+        from hyperdata_terminal.dashboards.cvd_dashboard import venue_cvd_text
         e = _sharded_engine(_t.time())
         console = Console(record=True, width=120, force_terminal=False)
         console.print(venue_cvd_text(e, "S0"))
@@ -2345,7 +2345,7 @@ class TestS1ShardLiveness:
         import time as _t
         from unittest.mock import AsyncMock
 
-        from src.data_layer.orderflow_engine import OrderFlowEngine
+        from hyperdata_terminal.data_layer.orderflow_engine import OrderFlowEngine
         e = OrderFlowEngine(symbols=["PEPE"])                       # not listed -> idles
         monkeypatch.setattr(e, "_fetch_hl_universe", AsyncMock(return_value={"BTC"}))
         e._running = True
@@ -2378,7 +2378,7 @@ class TestS7ShardPlanFixed:
     async def test_add_symbol_while_running_does_not_repartition_shards(self, monkeypatch, caplog):
         import asyncio
 
-        from src.data_layer.orderflow_engine import OrderFlowEngine
+        from hyperdata_terminal.data_layer.orderflow_engine import OrderFlowEngine
         e = OrderFlowEngine(symbols=[f"S{i}" for i in range(8)])   # exactly one full shard
 
         async def park(*a, **k):
@@ -2401,7 +2401,7 @@ class TestS7ShardPlanFixed:
     def test_add_symbol_before_start_is_silent(self, caplog):
         """Control: adding a symbol BEFORE start() is the supported path and
         must stay quiet."""
-        from src.data_layer.orderflow_engine import OrderFlowEngine
+        from hyperdata_terminal.data_layer.orderflow_engine import OrderFlowEngine
         e = OrderFlowEngine(symbols=["BTC"])
         with caplog.at_level("WARNING"):
             e.add_symbol("ETH")
@@ -2415,8 +2415,8 @@ class TestM13Extraction:
     def test_hub_demo_bodies_moved_and_delegated(self):
         import inspect
 
-        from src.data_layer import hub_demo
-        from src.data_layer.hub import HyperDataHub
+        from hyperdata_terminal.data_layer import hub_demo
+        from hyperdata_terminal.data_layer.hub import HyperDataHub
         for name in ("liquidation_generator", "trade_generator", "position_scan", "smart_money",
                      "hlp", "market_refresh", "deribit", "basis", "lsr"):
             assert callable(getattr(hub_demo, f"demo_{name}"))
@@ -2459,13 +2459,13 @@ class TestM13Extraction:
         previously the orchestrator had no lifecycle test at all."""
         import asyncio
 
-        from src.data_layer import persistence
+        from hyperdata_terminal.data_layer import persistence
         monkeypatch.setattr(persistence, "DB_PATH", tmp_path / "hub.db")
         monkeypatch.setattr(address_store, "DATA_DIR", tmp_path)
         monkeypatch.setattr(address_store, "DB_PATH", tmp_path / "hub.db")
         monkeypatch.setattr(address_store, "LEGACY_JSON", tmp_path / "legacy.json")
         monkeypatch.setattr(address_store, "_initialized", False)
-        from src.data_layer.hub import HyperDataHub
+        from hyperdata_terminal.data_layer.hub import HyperDataHub
         hub = HyperDataHub(demo=True)
         await hub.start()
         try:
@@ -2489,8 +2489,8 @@ class TestM13Extraction:
         import inspect
         from unittest.mock import MagicMock
 
-        from src.api_server import HyperDataAPI
-        from src.data_layer.liquidation_processing import LiquidationProcessor
+        from hyperdata_terminal.api_server import HyperDataAPI
+        from hyperdata_terminal.data_layer.liquidation_processing import LiquidationProcessor
         api = HyperDataAPI(hub=MagicMock())
         assert isinstance(api._liq, LiquidationProcessor)
         for name in ("_is_duplicate_liq", "_check_cascade", "_clean_symbol", "_log_liq_stats"):
@@ -2504,7 +2504,7 @@ class TestM13Extraction:
     def test_estimate_leverage(self):
         from types import SimpleNamespace
 
-        from src.data_layer.liquidation_processing import LiquidationProcessor
+        from hyperdata_terminal.data_layer.liquidation_processing import LiquidationProcessor
         est = LiquidationProcessor.estimate_leverage
         assert est(SimpleNamespace(price=100.0, quantity=10.0, size_usd=100.0)) == 10
         assert est(SimpleNamespace(price=100.0, quantity=10.0, size_usd=1000.0)) is None   # 1x: implausible

@@ -10,8 +10,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from data_layer.position_scanner import PositionScanner, TrackedPosition
-from src.data_layer import address_store
+from hyperdata_terminal.data_layer import address_store
+from hyperdata_terminal.data_layer.position_scanner import PositionScanner, TrackedPosition
 
 # ── Fixtures ─────────────────────────────────────────────────────
 
