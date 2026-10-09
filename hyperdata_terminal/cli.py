@@ -14,6 +14,7 @@ import argparse
 import asyncio
 import logging
 import logging.handlers
+import math
 import os
 import signal
 import sys
@@ -79,8 +80,8 @@ def _positive(kind: type) -> Callable[[str], float]:
             value = kind(text)
         except ValueError:
             raise argparse.ArgumentTypeError(f"not a number: {text!r}") from None
-        if not value > 0:
-            raise argparse.ArgumentTypeError(f"must be above zero, got {text}")
+        if not (math.isfinite(value) and value > 0):
+            raise argparse.ArgumentTypeError(f"must be a finite number above zero, got {text}")
         return value
     return parse
 

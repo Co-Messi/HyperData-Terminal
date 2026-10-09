@@ -4,6 +4,7 @@ import asyncio
 import itertools
 import json
 import logging
+import math
 import time
 from collections import OrderedDict, deque
 from dataclasses import dataclass
@@ -78,7 +79,11 @@ def exchange_coverage() -> dict[str, dict[str, str]]:
         },
         "okx": {
             "method": "confirmed",
-            "note": "Real liquidation-orders feed across all SWAP instruments.",
+            "note": (
+                "Real liquidation-orders feed across all SWAP instruments, sized "
+                "by each swap's contract value; a swap missing from OKX's "
+                "instrument list is dropped (see unsized_drops)."
+            ),
         },
         "hyperliquid": {
             "method": "partial",
@@ -294,7 +299,6 @@ class OKXConnection(ExchangeConnection):
         self._specs_attempted_at = 0.0
         self._spec_task: asyncio.Task | None = None
         self._unsized_logged: set[str] = set()
-        self.unsized_drops = 0
 
     async def _load_contracts(self) -> None:
         self._specs_attempted_at = time.time()
@@ -348,6 +352,7 @@ class OKXConnection(ExchangeConnection):
     async def stop(self) -> None:
         if self._spec_task is not None and not self._spec_task.done():
             self._spec_task.cancel()
+            await asyncio.gather(self._spec_task, return_exceptions=True)
         await super().stop()
 
     async def _on_connected(self, ws: aiohttp.ClientWebSocketResponse) -> None:
@@ -404,7 +409,7 @@ class OKXConnection(ExchangeConnection):
                 await self.feed.emit(event)
 
     def _drop_unsized(self, inst_id: str) -> None:
-        self.unsized_drops += 1
+        self.feed.record_unsized_drop("okx")
         if inst_id not in self._unsized_logged:
             self._unsized_logged.add(inst_id)
             logger.warning("[okx] no contract size for %s; its liquidations are dropped "
@@ -597,6 +602,12 @@ class LiquidationFeed:
         # Per-exchange count of records dropped at the parse boundary.
         # Surfaced via get_stats() so schema drift is visible, not silent.
         self.parse_errors: dict[str, int] = {}
+        # Well formed records that could not be sized (an OKX swap missing
+        # from the instrument list), also surfaced via get_stats().
+        self.unsized_drops: dict[str, int] = {}
+
+    def record_unsized_drop(self, exchange: str) -> None:
+        self.unsized_drops[exchange] = self.unsized_drops.get(exchange, 0) + 1
 
     def record_parse_error(self, exchange: str, payload: Any = None) -> None:
         """Count a malformed record dropped at the parse boundary."""
@@ -636,6 +647,13 @@ class LiquidationFeed:
 
     async def emit(self, event: LiquidationEvent) -> None:
         """Public method to inject a liquidation event into the feed."""
+        # float() accepts "nan", "inf" and negatives; one such event would
+        # poison every total in its window.
+        if not (math.isfinite(event.size_usd) and event.size_usd > 0
+                and math.isfinite(event.price) and event.price > 0
+                and math.isfinite(event.quantity)):
+            self.record_parse_error(event.exchange, event)
+            return
         await self._dispatch(event)
 
     async def _dispatch(self, event: LiquidationEvent) -> None:
@@ -722,6 +740,7 @@ class LiquidationFeed:
             "confirmed_volume_usd": confirmed_volume_usd,
             "heuristic_volume_usd": heuristic_volume_usd,
             "parse_errors": dict(self.parse_errors),
+            "unsized_drops": dict(self.unsized_drops),
             "coverage": _coverage,
             "by_exchange": {
                 k: {

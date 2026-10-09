@@ -722,7 +722,7 @@ async def test_okx_liquidation_size_uses_contract_value(inst_id, spec, bk_px, sz
     assert len(got) == 1
     assert got[0].size_usd == pytest.approx(usd)
     assert got[0].quantity == pytest.approx(qty)
-    assert got[0].symbol == "BTC" if inst_id.startswith("BTC") else "DOGE"
+    assert got[0].symbol == ("BTC" if inst_id.startswith("BTC") else "DOGE")
 
 
 async def test_okx_unknown_swap_is_dropped_not_guessed():
@@ -735,8 +735,25 @@ async def test_okx_unknown_swap_is_dropped_not_guessed():
     conn._contracts = {"BTC-USDT-SWAP": ("linear", 0.01)}
     await conn._on_message(_okx_frame("NEWCOIN-USDT-SWAP", "1.0", "500"))
     await conn._on_message(_okx_frame("NEWCOIN-USDT-SWAP", "1.0", "500"))
-    assert got == [] and conn.unsized_drops == 2
+    assert got == [] and feed.unsized_drops == {"okx": 2}
     assert feed.parse_errors.get("okx", 0) == 0  # well formed, just not sizable yet
+    assert feed.get_stats()["unsized_drops"] == {"okx": 2}
+
+
+@pytest.mark.parametrize("bk_px,sz", [("nan", "1"), ("1.0", "inf"), ("1.0", "-5"), ("-1.0", "5"), ("0", "5")])
+async def test_liquidation_feed_drops_non_finite_or_non_positive_sizes(bk_px, sz):
+    """float() accepts 'nan' and 'inf'; one such event made total_volume_usd nan for an hour."""
+    from hyperdata_terminal.data_layer.liquidation_feed import OKXConnection
+
+    feed = LiquidationFeed()
+    got = []
+    feed.on_liquidation(got.append)
+    conn = OKXConnection(feed)
+    conn._contracts = {"BTC-USDT-SWAP": ("linear", 0.01)}
+    await conn._on_message(_okx_frame("BTC-USDT-SWAP", bk_px, sz))
+    assert got == [] and feed.parse_errors == {"okx": 1}
+    stats = feed.get_stats()
+    assert stats["total_volume_usd"] == 0 and stats["total_count"] == 0
 
 
 async def test_okx_loads_contract_values_from_instrument_list():
@@ -846,6 +863,7 @@ def test_smart_money_panel_explains_warmup_until_tiers_exist(n, warming):
 @pytest.mark.parametrize("argv", [
     ["paper", "--balance", "0"], ["paper", "--balance=-5"], ["paper", "--balance", "abc"],
     ["paper", "--interval", "0"], ["paper", "--minutes", "0"],
+    ["paper", "--balance", "inf"], ["paper", "--balance", "nan"], ["paper", "--minutes", "inf"],
 ])
 def test_paper_rejects_non_positive_numbers(argv):
     """Codex P2: --balance 0 divided by zero on exit, before the hub was stopped."""
@@ -860,3 +878,37 @@ def test_paper_accepts_positive_numbers():
 
     args = build_parser().parse_args(["paper", "--balance", "500", "--interval", "5", "--minutes", "0.5"])
     assert (args.balance, args.interval, args.minutes) == (500.0, 5, 0.5)
+
+
+
+async def test_smart_money_analyzes_new_wallets_before_busy_analyzed_ones(monkeypatch):
+    """Sorted by recent activity alone, busy analyzed wallets were due again before new ones got a turn."""
+    import asyncio
+
+    from hyperdata_terminal.data_layer.smart_money import SmartMoneyEngine, WalletProfile
+
+    engine = SmartMoneyEngine()
+    now = time.time()
+    for i in range(25):  # busy, analyzed 10 minutes ago, seen just now
+        a = f"0xa{i:039x}"
+        engine.wallets[a] = WalletProfile(address=a, discovered_at=0, last_seen=now, last_analyzed=now - 600)
+    for i in range(5):   # new, never analyzed, seen a while ago
+        a = f"0xb{i:039x}"
+        engine.wallets[a] = WalletProfile(address=a, discovered_at=0, last_seen=now - 120 + i, last_analyzed=0)
+    order = []
+
+    async def fake_analyze(address):
+        order.append(address)
+        engine.wallets[address].last_analyzed = time.time()
+        return engine.wallets[address]
+
+    async def stop_sleep(seconds):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(engine, "analyze_wallet", fake_analyze)
+    monkeypatch.setattr(asyncio, "sleep", stop_sleep)
+    engine._running = True
+    with pytest.raises(asyncio.CancelledError):
+        await engine._analysis_loop()
+    assert len(order) == engine.ANALYSIS_BATCH_SIZE
+    assert order[:5] == [f"0xb{i:039x}" for i in (4, 3, 2, 1, 0)]  # new first, most recently seen first

@@ -487,8 +487,12 @@ class SmartMoneyEngine:
                     w for w in self.wallets.values()
                     if (now - w.last_analyzed) > self.ANALYSIS_INTERVAL
                 ]
-                # Prioritize: recently active first
-                candidates.sort(key=lambda w: w.last_seen, reverse=True)
+                # Never analyzed first (most recently seen first among them),
+                # then the longest since analyzed. Sorting only by recent
+                # activity let busy, already analyzed wallets crowd out new
+                # ones: under the weight budget a batch takes minutes, so
+                # they are due again by the next cycle.
+                candidates.sort(key=lambda w: (w.last_analyzed > 0, w.last_analyzed, -w.last_seen))
                 batch = candidates[: self.ANALYSIS_BATCH_SIZE]
 
                 logger.info(
