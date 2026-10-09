@@ -166,8 +166,9 @@ class DataHealthMonitor:
                 if ext_lsr_data and len(ext_lsr_data) > 0 else 0.0
             )
         if lsr_source != "binance" and hub_lsr > 0:
+            # Not "pass": nothing was verified, and agents are told to trust this report.
             out.append(HealthCheck(
-                "xref", "btc_long_short_ratio", "pass",
+                "xref", "btc_long_short_ratio", "warn",
                 f"hub={hub_lsr:.2f} from {lsr_source} (Binance unavailable); not cross-checked",
             ))
         elif hub_lsr > 0 and ext_lsr > 0:

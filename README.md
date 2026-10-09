@@ -22,7 +22,7 @@ hyperdata
 ## Why people run it
 
 - **See where leverage gets wiped before it happens.** A liquidation heatmap and a "closest to liquidation" list built from thousands of live Hyperliquid wallets, for every listed asset. The kind of view paid dashboards charge for.
-- **Watch the biggest books on Hyperliquid.** Size, entry, liquidation price, PnL and leverage of the largest open positions, plus Hyperliquid's own market maker (the HLP vault) and the liquidations it absorbs.
+- **Watch the biggest books on Hyperliquid.** Size, entry, liquidation price, PnL and leverage of the largest open positions, plus Hyperliquid's own market maker (the HLP vault: AUM, net delta, gross exposure) and the liquidations it absorbs.
 - **Know when the data is wrong.** Every feed is cross-checked and labelled LIVE, PARTIAL, STALE or DRIFT. Confirmed liquidations are never mixed with guesses. Order flow says when a timeframe is still warming up instead of printing a fake signal. See [docs/DATA_INTEGRITY.md](docs/DATA_INTEGRITY.md).
 - **Plug it into your AI agent.** `hyperdata mcp` gives Claude, Cursor or any MCP client ten read only tools over the same live data.
 - **Build on it.** A local REST and WebSocket API, and a paper trading engine that runs your strategy file on live prices.
@@ -177,7 +177,7 @@ Trades print as they happen and are logged to SQLite; `Ctrl+C` prints the portfo
 | **Coinbase** | Spot fallback for basis | REST |
 | **Deribit** | DVOL implied volatility | REST |
 
-Coverage is honest, not a census. Hyperliquid has no public liquidation feed, so its confirmed liquidations are the ones an HLP vault absorbed; trades of $10K or more are shown separately as estimated large prints and never counted as liquidations. Binance futures is blocked in some regions (the US among them): there the Binance CVD leg reads `silent` and spot, long/short and the price cross check fall back to Coinbase, Bybit or OKX, each value naming its source. Details: [docs/DATA_INTEGRITY.md](docs/DATA_INTEGRITY.md).
+Coverage is honest, not a census. Hyperliquid has no public liquidation feed, so its confirmed liquidations are the ones an HLP vault absorbed (mostly backstop takeovers, which are rare, often days apart); trades of $10K or more are shown separately as estimated large prints and never counted as liquidations. Binance futures is blocked in some regions (the US among them): there the Binance CVD leg reads `silent` and spot, long/short and the price cross check fall back to Coinbase, Bybit or OKX, each value naming its source. Details: [docs/DATA_INTEGRITY.md](docs/DATA_INTEGRITY.md).
 
 ## Configuration
 

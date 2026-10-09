@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "hyperdata-terminal"
 dynamic = ["version"]
-description = "Live crypto market data in your terminal: Hyperliquid whales, liquidation heatmaps, order flow and funding across 5 exchanges"
+description = "Live crypto market data in your terminal: Hyperliquid whales and liquidation heatmaps, liquidations across exchanges, order flow, funding, and an MCP server for AI agents"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]

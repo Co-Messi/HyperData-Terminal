@@ -11,6 +11,7 @@ Live render loop.
 """
 from __future__ import annotations
 
+import time
 from datetime import datetime, timezone
 
 from rich import box
@@ -24,6 +25,9 @@ from hyperdata_terminal.utils.helpers import format_distance_pct as fmt_distance
 from hyperdata_terminal.utils.helpers import format_pct as fmt_pct
 from hyperdata_terminal.utils.helpers import format_price as fmt_price
 from hyperdata_terminal.utils.helpers import format_usd as fmt_usd
+
+# Spot is polled every 5s; older than this means every spot source is failing.
+SPOT_STALE_AFTER_SECONDS = 60
 
 
 def _confidence_text(confidence: float, prefix: str = "") -> Text:
@@ -745,42 +749,32 @@ class HubMarketIntel:
                 lines.append(f"  {sym} IV: ", style="dim")
                 lines.append("--\n", style="dim")
 
-        # ── Spot/Perp Basis ──
+        # ── Basis and long/short: one row per asset, so the panel fits 50 rows ──
         spot_src = getattr(self.hub.spot, "active_source", None)
-        lines.append("\n BASIS (perp-spot)", style="bold bright_green")
-        lines.append(f"  spot: {spot_src}\n" if spot_src else "\n", style="dim")
+        lsr_src = getattr(self.hub.lsr, "active_source", None)
+        sources = [s for s in (f"spot {spot_src}" if spot_src else "",
+                               f"accounts {lsr_src}" if lsr_src else "") if s]
+        lines.append("\n BASIS + L/S", style="bold bright_green")
+        lines.append(f"  {', '.join(sources)}\n" if sources else "\n", style="dim")
+        now = time.time()
         for sym in ["BTC", "ETH", "SOL"]:
+            lines.append(f"  {sym:<4}", style="bold bright_white")
             snap = self.hub.spot.get_latest(sym)
-            if snap:
+            if snap and now - snap.timestamp <= SPOT_STALE_AFTER_SECONDS:
                 b = snap.basis_pct
                 b_style = "bold bright_red" if abs(b) > 0.3 else ("bright_yellow" if abs(b) > 0.1 else "bright_white")
-                lines.append(f"  {sym}: ", style="dim")
-                lines.append(f"{b:+.3f}%", style=b_style)
-                lines.append(f"  spot:{fmt_price(snap.spot_price)}", style="dim")
-                lines.append(f"  perp:{fmt_price(snap.perp_price)}\n", style="dim")
+                lines.append(f"basis {b:+.3f}%", style=b_style)
+            elif snap:
+                # Every spot source failing leaves the last value behind: say so.
+                lines.append("basis stale  ", style="dim yellow")
             else:
-                lines.append(f"  {sym}: --\n", style="dim")
-
-        # ── Long/Short Ratios ──
-        lsr_src = getattr(self.hub.lsr, "active_source", None)
-        lines.append("\n L/S RATIO", style="bold bright_magenta")
-        lines.append(f"  accounts on {lsr_src}\n" if lsr_src else "\n", style="dim")
-        for sym in ["BTC", "ETH", "SOL"]:
-            snap = self.hub.lsr.get_latest(sym)
-            if snap:
-                long_pct = snap.long_ratio * 100
-                r_style = "bright_green" if snap.long_short_ratio > 1.0 else "bright_red"
-                bar_filled = int(long_pct / 100 * 10)
-                bar = Text()
-                bar.append("\u2588" * bar_filled, style="green")
-                bar.append("\u2591" * (10 - bar_filled), style="red")
-                lines.append(f"  {sym} L/S: ", style="dim")
-                lines.append(f"{snap.long_short_ratio:.2f}", style=r_style)
-                lines.append(f"  ({long_pct:.0f}% long) ", style=r_style)
-                lines.append_text(bar)
-                lines.append("\n")
+                lines.append("basis --     ", style="dim")
+            ls = self.hub.lsr.get_latest(sym)
+            if ls:
+                r_style = "bright_green" if ls.long_short_ratio > 1.0 else "bright_red"
+                lines.append(f"  L/S {ls.long_short_ratio:.2f} ({ls.long_ratio * 100:.0f}% long)\n", style=r_style)
             else:
-                lines.append(f"  {sym} L/S: --\n", style="dim")
+                lines.append("  L/S --\n", style="dim")
 
         # ── Cross-Exchange Funding Extremes ──
         lines.append("\n FUNDING EXTREMES (annualized)\n", style="bold bright_yellow")

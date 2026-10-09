@@ -1,7 +1,7 @@
 """Multi-Exchange Liquidation Stream Dashboard.
 
 Real-time terminal dashboard showing liquidation totals across all exchanges
-using the rich library. Styled after Moon Dev's top-right panel.
+using the rich library.
 
 Usage:
     python -m hyperdata_terminal.dashboards.liquidation_stream          # demo mode (mock data)

@@ -62,7 +62,7 @@ Components: liquidation_feed (4 exchanges), orderflow_engine (CVD), position_sca
 
 **API Server** (`api_server.py`): aiohttp.web embedded in the hub's event loop. All endpoints under `/v1/`. WebSocket at `/v1/ws` streams events. Loopback by default; no cross-origin access unless `HYPERDATA_CORS_ORIGINS` lists the origin.
 
-**MCP Server** (`mcp_server.py`): `HubTools` holds the tool logic as plain methods over a hub (unit-tested with a fake hub); `build_server()` wires them into `mcp.server.mcpserver.MCPServer` (mcp 2.x) with the hub started in the lifespan. stdout is the protocol: nothing in the data layer may print.
+**MCP Server** (`mcp_server.py`): `HubTools` holds the tool logic as plain methods over a hub (unit-tested with a fake hub); `build_server()` wires them into `mcp.server.mcpserver.MCPServer` (mcp 2.x) with the hub started in the lifespan. stdout is the protocol: nothing in the data layer may print. Tool wrappers must stay `async def`: the SDK runs plain `def` tools on a worker thread, which races the hub's event loop.
 
 **Paper Trading** (`strategies/`): subclass `Strategy`, implement `evaluate(hub)`, return a `Signal`. `strategies/loader.py` resolves `--strategy` specs (built-in name, `.py` path, `module:Class`).
 
@@ -81,6 +81,8 @@ Components: liquidation_feed (4 exchanges), orderflow_engine (CVD), position_sca
 - **WebSocket broadcast**: `_broadcast()` enqueues per client; each client has a bounded queue drained by its own writer task.
 - **Live by default**: every CLI entry point runs `HyperDataHub(demo=False)`. A `demo=True` path (synthetic generators in `hub_demo.py`) exists only as an offline dev tool; the health monitor is disabled under demo.
 - **Confirmed vs estimated**: Hyperliquid large prints are `LiquidationEvent(confirmed=False)`. Anything that totals liquidations for display, alerts or strategies uses `get_stats(include_estimated=False)`.
+- **HLP**: AUM from the parent's `vaultDetails`, positions netted per coin, gross exposure per vault, fills via `userFillsByTime` watermarks; only absorptions are persisted.
+- **Estimated liquidations live in `LiquidationFeed.estimated_events`**, apart from confirmed `events`, so they can never evict confirmed ones.
 - **Source fallbacks**: spot (Binance, Coinbase, OKX) and L/S (Binance, Bybit, OKX) record `source` on every snapshot and skip a failing source for 10 minutes.
 - **Symbol normalization**: `normalize_symbol()` strips USDT/USD/PERP suffixes.
 

@@ -3,7 +3,7 @@ BTC CVD (Cumulative Volume Delta) Dashboard.
 
 Real-time terminal dashboard showing order flow analysis with
 multi-timeframe signals, live trade tape, and visual bars —
-Moon Dev style using rich + pyfiglet.
+Retro terminal style using rich + pyfiglet.
 """
 
 from __future__ import annotations
@@ -193,12 +193,12 @@ class CVDDashboard:
     # -- header -------------------------------------------------------------
 
     def build_header(self) -> Text:
-        """Big ASCII art 'BTC CVD' header rendered with pyfiglet."""
-        ascii_art = pyfiglet.figlet_format("BTC  CVD", font="big")
+        """Big ASCII art '<SYMBOL> CVD' header rendered with pyfiglet."""
+        ascii_art = pyfiglet.figlet_format(f"{self.symbol}  CVD", font="big")
         header = Text()
         header.append(ascii_art, style="bold bright_cyan")
         header.append(
-            "   Bitcoin Order Flow Alpha | Tick-Level CVD | Multi-Timeframe\n",
+            f"   {self.symbol} Order Flow | Tick-Level CVD | Multi-Timeframe\n",
             style="italic bright_white",
         )
         return header
@@ -247,8 +247,8 @@ class CVDDashboard:
             tps = self.engine.get_trades_per_second(sym)
 
         bar = Text()
-        bar.append("  \u20bf ", style="bold bright_yellow")
-        bar.append("BITCOIN  ", style="bold white")
+        bar.append("  ")
+        bar.append(f"{sym}  ", style="bold white")
         bar.append(f"${price:,.2f}", style="bold bright_white")
         bar.append("  ")
 
@@ -271,7 +271,7 @@ class CVDDashboard:
     def build_timeframe_table(self) -> Table:
         """Multi-timeframe table with visual bars and signals."""
         table = Table(
-            title="\u26a1 BTC CVD ACROSS TIMEFRAMES \u26a1",
+            title=f"\u26a1 {self.symbol} CVD ACROSS TIMEFRAMES \u26a1",
             title_style="bold bright_yellow",
             border_style="bright_blue",
             show_lines=True,
@@ -442,7 +442,7 @@ class CVDDashboard:
         now_str = datetime.now().strftime("%H:%M:%S")
         return Panel(
             table,
-            title="[bold bright_green]\U0001f4c8 BTC CVD[/]",
+            title=f"[bold bright_green]\U0001f4c8 {self.symbol} CVD[/]",
             subtitle=f"[dim]{now_str}  #{self.cycle}[/]",
             border_style="bright_green",
             box=_box.ROUNDED,
@@ -483,9 +483,9 @@ class CVDDashboard:
 
         return Panel(
             Group(*parts),
-            title="[bold bright_cyan]Moon Dev[/bold bright_cyan] "
+            title="[bold bright_cyan]HyperData[/bold bright_cyan] "
                   "[dim]|[/dim] "
-                  "[bold bright_yellow]BTC CVD Dashboard[/bold bright_yellow]",
+                  f"[bold bright_yellow]{self.symbol} CVD Dashboard[/bold bright_yellow]",
             border_style="bright_blue",
             padding=(1, 2),
         )

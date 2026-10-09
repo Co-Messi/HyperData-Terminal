@@ -20,7 +20,10 @@ import sys
 from pathlib import Path
 
 from hyperdata_terminal import __version__
-from hyperdata_terminal.paths import DATA_DIR, LOG_DIR
+
+# hyperdata_terminal.paths resolves the data dir once, at import, from
+# HYPERDATA_DATA_DIR. It is imported lazily, after .env is loaded, so the
+# variable works from a .env file too.
 
 DASHBOARD_HELP = {
     "liq": "BTC positions closest to liquidation",
@@ -38,6 +41,8 @@ DASHBOARD_CLI_ALIASES = {"whale": ["whale"], "all": ["combined"], "stream": ["li
 
 def _setup_logging() -> Path:
     """File logging only: Rich owns the terminal (and stdout is the protocol for MCP)."""
+    from hyperdata_terminal.paths import LOG_DIR
+
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     log_file = LOG_DIR / "hyperdata.log"
     handler = logging.handlers.RotatingFileHandler(log_file, maxBytes=5 * 1024 * 1024, backupCount=3)
@@ -67,6 +72,8 @@ def _api_port(args: argparse.Namespace) -> int | None:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    from hyperdata_terminal.paths import DATA_DIR
+
     parser = argparse.ArgumentParser(
         prog="hyperdata",
         description="HyperData Terminal: live crypto market data from Hyperliquid, Binance, Bybit, OKX and Deribit.",
@@ -91,7 +98,9 @@ def build_parser() -> argparse.ArgumentParser:
             p.add_argument("--symbol", "-s", default=None, help="asset to follow (default BTC)")
 
     api = sub.add_parser("api", help="run the headless REST + WebSocket API")
-    api.add_argument("--port", type=int, default=8420)
+    api.add_argument(
+        "--port", type=int, default=None, help="port to bind (default: --api-port, HYPERDATA_API_PORT or 8420)",
+    )
 
     paper = sub.add_parser(
         "paper", help="paper trade strategies on live data",
@@ -115,11 +124,15 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-async def _run_api(port: int) -> None:
+async def _run_api(port: int) -> int:
     from hyperdata_terminal.data_layer.hub import HyperDataHub
 
     hub = HyperDataHub(demo=False, api_port=port)
     await hub.start()
+    if "api_server" in hub.status.failed_components:
+        await hub.stop()
+        print(f"hyperdata: could not start the API on port {port} (in use? see the log)", file=sys.stderr)
+        return 1
     print(f"HyperData API on http://127.0.0.1:{port}/v1/health  (Ctrl+C to stop)", flush=True)
     logging.getLogger(__name__).info("HyperData API running on port %d (headless)", port)
 
@@ -138,6 +151,7 @@ async def _run_api(port: int) -> None:
         pass
     finally:
         await hub.stop()
+    return 0
 
 
 async def _run_paper(args: argparse.Namespace) -> int:
@@ -188,8 +202,8 @@ async def _run_paper(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> None:
-    args = build_parser().parse_args(argv)
     _load_env()
+    args = build_parser().parse_args(argv)
     _setup_logging()
     boot = not getattr(args, "no_boot", False)
     command = args.command
@@ -212,7 +226,7 @@ def main(argv: list[str] | None = None) -> None:
                     sys.exit(2)
             asyncio.run(run_single(args.dashboard, symbol=symbol, api_port=_api_port(args), boot=boot))
         elif command == "api":
-            asyncio.run(_run_api(args.port))
+            sys.exit(asyncio.run(_run_api(args.port or _api_port(args) or 8420)))
         elif command == "paper":
             sys.exit(asyncio.run(_run_paper(args)))
         elif command == "verify":

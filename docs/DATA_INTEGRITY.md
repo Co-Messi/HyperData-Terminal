@@ -16,7 +16,7 @@ report a `coverage` block plus a per-exchange `method` tag:
 | **OKX** | `confirmed` | Real `liquidation-orders` feed across all SWAP instruments. |
 | **Bybit** | `confirmed` | Real `allLiquidation` v5 feed across the tracked symbols (those with a Bybit linear perp). Subscriptions are batched because Bybit caps args per request. |
 | **Binance** | `sampled` | The `!forceOrder` stream is **throttled by Binance to ~1 liquidation per symbol per second**. Large cascades are undercounted *at the source* — this cannot be fixed client-side, only disclosed. |
-| **Hyperliquid** | `partial` | Hyperliquid has **no public liquidation feed**. *Confirmed* events are liquidations an HLP vault took the other side of: Hyperliquid marks those fills with a `liquidation` object (`method: market` or `backstop`), and the HLP tracker polls every child vault's fills (~2 min delay). Liquidations filled by other traders are invisible. |
+| **Hyperliquid** | `partial` | Hyperliquid has **no public liquidation feed**. *Confirmed* events are liquidations an HLP vault took the other side of: Hyperliquid marks those fills with a `liquidation` object (`method: market` or `backstop`), and the HLP tracker polls every child vault's fills (~2 min delay). In practice these are mostly backstop takeovers by the Liquidator vaults, which are rare (often days apart), so expect `HYP:0` most of the time. Liquidations filled by other traders are invisible. |
 
 Separately, Hyperliquid trades ≥ `HL_LIQUIDATION_MIN_USD` (default $10k) are
 reported as **large prints**: `confirmed=False`, shown with `~`. In a test
@@ -104,12 +104,25 @@ is skipped. Binance trade data for CVD has no substitute: it shows
 ## HLP vault
 
 HLP is a parent vault holding idle USDC plus child vaults (Strategy A/B/X and
-several Liquidators) that hold the positions. The tracker reads the child
-list from `vaultDetails` (hourly, with a static fallback) and every snapshot
-sums the parent and all children; a pass in which any vault request fails is
-discarded rather than shown as a partial sum. Liquidation absorptions come
-from the `liquidation` object on the fills of the child vaults, not from guesses on
-`crossed` or zero PnL.
+several Liquidators) that hold the positions.
+
+- **AUM** is the latest point of the parent's `vaultDetails` portfolio (what
+  Hyperliquid's UI shows), refreshed every 5 minutes along with the child
+  list. Summing `clearinghouseState` instead misses Strategy X, which shows
+  neither equity nor positions there (about $100M of the ~$180M at the time
+  of writing); that sum is only a fallback.
+- **Positions** are netted per coin across vaults, because Strategy A and B
+  usually hold opposite sides of the same coin. **Gross exposure** is summed
+  per vault before netting, so the netting never hides how much is on.
+  Strategy X's positions are not visible.
+- A snapshot pass in which any vault request fails is discarded rather than
+  shown as a partial sum.
+- **Absorptions** come from the `liquidation` object on child vault fills.
+  Fills are read with `userFillsByTime` from a per vault watermark (about 80
+  of Hyperliquid's 1200 per minute weight budget), so an empty or lagging
+  response can never replay old fills; the first poll seeds 24 hours of
+  absorptions as history without emitting them. Only absorptions are
+  persisted, not the ~220 ordinary market making fills a minute.
 
 ## Staleness watchdog (frozen feeds never read as live)
 
@@ -152,7 +165,7 @@ only) and caches the result; the dashboard badge and `/v1/health` read it.
 | Check | Source | Pass condition |
 |---|---|---|
 | BTC price | Binance perp mark (`premiumIndex`), else the OKX perp mark where Binance futures is blocked | within 0.5% of hub |
-| BTC long/short ratio | Binance `globalLongShortAccountRatio` | within 20% (warn beyond); skipped (reported) when the hub's ratio comes from a fallback venue |
+| BTC long/short ratio | Binance `globalLongShortAccountRatio` | within 20% (warn beyond); reported as `warn` ("not cross-checked") when the hub's ratio comes from a fallback venue, since nothing was verified |
 | Deribit DVOL | hub | present |
 | Order flow freshness (blended) | engine `is_stale()` | some venue delivering trades |
 | Order flow freshness per venue | engine `venue_freshness()` | `ok` (warn if this venue is out, fail if all are) |

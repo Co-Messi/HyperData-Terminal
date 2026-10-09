@@ -44,32 +44,59 @@ def _is_concrete_strategy(obj: object) -> bool:
     return inspect.isclass(obj) and issubclass(obj, Strategy) and obj is not Strategy and not inspect.isabstract(obj)
 
 
-def _from_file(path: Path) -> list[Strategy]:
+def _instantiate(cls: type[Strategy], origin: str) -> Strategy:
+    try:
+        return cls()
+    except TypeError as exc:
+        raise StrategyLoadError(
+            f"{origin}: {cls.__name__}() must be constructible with no arguments ({exc})"
+        ) from exc
+
+
+def _ensure_on_path(directory: Path) -> None:
+    entry = str(directory)
+    if entry not in sys.path:
+        sys.path.insert(0, entry)
+
+
+def _strategy_classes_in_file(path: Path) -> list[type[Strategy]]:
     if not path.is_file():
         raise StrategyLoadError(f"strategy file not found: {path}")
-    module_name = f"hyperdata_user_strategy_{path.stem}_{abs(hash(str(path.resolve())))}"
-    spec = importlib.util.spec_from_file_location(module_name, path)
-    if spec is None or spec.loader is None:
-        raise StrategyLoadError(f"cannot import {path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    try:
-        spec.loader.exec_module(module)
-    except Exception as exc:
-        sys.modules.pop(module_name, None)
-        raise StrategyLoadError(f"{path} failed to import: {exc!r}") from exc
+    resolved = path.resolve()
+    module_name = f"hyperdata_user_strategy_{resolved.stem}_{abs(hash(str(resolved)))}"
+    cached = sys.modules.get(module_name)
+    if cached is None:
+        spec = importlib.util.spec_from_file_location(module_name, resolved)
+        if spec is None or spec.loader is None:
+            raise StrategyLoadError(f"cannot import {path}")
+        # Let the strategy import helper modules that sit next to it.
+        _ensure_on_path(resolved.parent)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        try:
+            spec.loader.exec_module(module)
+        except Exception as exc:
+            sys.modules.pop(module_name, None)
+            raise StrategyLoadError(f"{path} failed to import: {exc!r}") from exc
+        cached = module
 
-    classes = [
-        obj for obj in vars(module).values()
-        if _is_concrete_strategy(obj) and obj.__module__ == module_name
+    defined = [
+        obj for obj in vars(cached).values()
+        if inspect.isclass(obj) and issubclass(obj, Strategy) and obj is not Strategy
+        and obj.__module__ == module_name
     ]
+    classes = [c for c in defined if not inspect.isabstract(c)]
     if not classes:
-        raise StrategyLoadError(f"{path} defines no Strategy subclass with evaluate() implemented")
-    return [cls() for cls in classes]
+        if defined:
+            missing = ", ".join(sorted(defined[0].__abstractmethods__))
+            raise StrategyLoadError(f"{path}: {defined[0].__name__} is missing {missing}")
+        raise StrategyLoadError(f"{path} defines no Strategy subclass")
+    return classes
 
 
 def _from_import_path(spec: str) -> list[Strategy]:
     module_name, _, attr = spec.partition(":")
+    _ensure_on_path(Path.cwd())  # the console script does not put the working directory on sys.path
     try:
         module = importlib.import_module(module_name)
     except ImportError as exc:
@@ -77,18 +104,22 @@ def _from_import_path(spec: str) -> list[Strategy]:
     obj = getattr(module, attr, None)
     if not _is_concrete_strategy(obj):
         raise StrategyLoadError(f"{spec} is not a concrete Strategy subclass")
-    return [obj()]
+    return [_instantiate(obj, spec)]
 
 
 def load_strategies(specs: list[str]) -> list[Strategy]:
-    """Turn CLI specs into strategy instances, in order, without duplicates by name."""
+    """Turn CLI specs into strategy instances, in order.
+
+    Repeating a spec loads it once. Two *different* strategies with the same
+    name are an error: the paper trader logs and reports by name.
+    """
     builtins = _builtins()
     strategies: list[Strategy] = []
     for spec in specs:
         if spec in builtins:
-            strategies.append(builtins[spec]())
+            strategies.append(_instantiate(builtins[spec], spec))
         elif spec.endswith(".py") or Path(spec).is_file():
-            strategies.extend(_from_file(Path(spec).expanduser()))
+            strategies.extend(_instantiate(c, spec) for c in _strategy_classes_in_file(Path(spec).expanduser()))
         elif ":" in spec:
             strategies.extend(_from_import_path(spec))
         else:
@@ -96,10 +127,17 @@ def load_strategies(specs: list[str]) -> list[Strategy]:
                 f"unknown strategy {spec!r}. Built-ins: {', '.join(BUILTIN_NAMES)}; "
                 "or pass a path to your own .py file, or module:ClassName"
             )
-    seen: set[str] = set()
+    by_name: dict[str, Strategy] = {}
     unique: list[Strategy] = []
     for s in strategies:
-        if s.name not in seen:
-            seen.add(s.name)
+        existing = by_name.get(s.name)
+        if existing is None:
+            by_name[s.name] = s
             unique.append(s)
+        elif type(existing) is not type(s):
+            raise StrategyLoadError(
+                f"two different strategies are named {s.name!r} "
+                f"({type(existing).__module__}.{type(existing).__name__} and "
+                f"{type(s).__module__}.{type(s).__name__}); rename one"
+            )
     return unique

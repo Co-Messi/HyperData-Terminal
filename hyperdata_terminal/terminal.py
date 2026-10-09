@@ -125,9 +125,10 @@ async def run_interactive(api_port: int | None = None, boot: bool = True) -> Non
 
     hub = HyperDataHub(demo=False, api_port=api_port)
     menu_keys = list(DASHBOARD_INFO.keys())
-    await _start_hub(console, hub, menu_keys, boot)
 
     try:
+        # Inside the try: Ctrl+C during the boot animation must still stop the hub.
+        await _start_hub(console, hub, menu_keys, boot)
         while True:
             _build_menu(console)
 
@@ -170,8 +171,8 @@ async def run_single(
     """Open one dashboard directly (``hyperdata heatmap``); Ctrl+C exits."""
     console = Console()
     hub = HyperDataHub(demo=False, api_port=api_port)
-    await _start_hub(console, hub, [key] if key in DASHBOARD_INFO else list(DASHBOARD_INFO), boot)
     try:
+        await _start_hub(console, hub, [key] if key in DASHBOARD_INFO else list(DASHBOARD_INFO), boot)
         console.clear()
         await run_dashboard(hub, key, symbol=symbol)
     except (KeyboardInterrupt, asyncio.CancelledError):

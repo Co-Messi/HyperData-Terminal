@@ -1,6 +1,6 @@
 """
 BTC Liquidation Watch — Terminal Dashboard
-Moon Dev style retro hacker aesthetic using rich + pyfiglet.
+Retro terminal aesthetic using rich + pyfiglet.
 
 Displays Hyperliquid BTC positions closest to liquidation in real-time.
 """

@@ -1,0 +1,6 @@
+# The sdist must be able to run its own tests: setuptools picks up
+# tests/test_*.py on its own but not conftest.py, tests/__init__.py or the lock.
+graft tests
+include requirements.lock requirements.txt
+global-exclude *.bak *.py[cod]
+prune tests/__pycache__
