@@ -1,8 +1,32 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "hyperdata-terminal"
-version = "1.0.0"
-description = "Open-source crypto market data terminal with real-time dashboards and REST API"
+dynamic = ["version"]
+description = "Live crypto market data in your terminal: Hyperliquid whales and liquidation heatmaps, liquidations across exchanges, order flow, funding, and an MCP server for AI agents"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.12"
+authors = [{ name = "Brayden Siew" }]
+keywords = [
+    "crypto", "hyperliquid", "trading", "terminal", "tui", "liquidations",
+    "orderflow", "cvd", "whale-tracker", "binance", "bybit", "okx", "deribit", "mcp",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Office/Business :: Financial :: Investment",
+    "Topic :: Terminals",
+]
 
 # These ranges MUST contain every pin in requirements.lock —
 # tests/test_dependency_lock.py enforces it, and CI installs `pip install -e .`
@@ -19,14 +43,25 @@ dependencies = [
     "python-dotenv>=1.0.0,<2.0",
 ]
 
+[project.optional-dependencies]
+# `hyperdata mcp`: serve the live data to AI agents over the Model Context Protocol.
+mcp = ["mcp>=2.2,<3"]
+
+[project.urls]
+Homepage = "https://hyperdata.vercel.app"
+Source = "https://github.com/Co-Messi/HyperData-Terminal"
+Issues = "https://github.com/Co-Messi/HyperData-Terminal/issues"
+
 [project.scripts]
-hyperdata = "src.cli:main"
+hyperdata = "hyperdata_terminal.cli:main"
+# Same command under the distribution name, so `uvx hyperdata-terminal` works.
+hyperdata-terminal = "hyperdata_terminal.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "hyperdata_terminal.__version__" }
 
 [tool.setuptools.packages.find]
-include = ["src*", "config*"]
-
-[tool.setuptools.package-data]
-"*" = ["*.json"]
+include = ["hyperdata_terminal*"]
 
 [tool.ruff]
 line-length = 120
@@ -38,7 +73,7 @@ select = ["E", "F", "W", "I"]
 [tool.ruff.lint.per-file-ignores]
 # Presentation layer: ASCII-art boot screens and Rich table markup read
 # better unwrapped; everything else must respect the line limit.
-"src/dashboards/*" = ["E501"]
+"hyperdata_terminal/dashboards/*" = ["E501"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

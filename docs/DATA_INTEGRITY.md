@@ -13,14 +13,20 @@ report a `coverage` block plus a per-exchange `method` tag:
 
 | Exchange | Method | What it means |
 |---|---|---|
-| **OKX** | `confirmed` | Real `liquidation-orders` feed across all SWAP instruments. |
+| **OKX** | `confirmed` | Real `liquidation-orders` feed across all SWAP instruments. OKX reports size in contracts (BTC-USDT-SWAP is 0.01 BTC, DOGE-USDT-SWAP 1000 DOGE, inverse BTC-USD-SWAP $100), converted with each swap's contract value from OKX's instrument list; a swap not in the list is dropped (counted in `unsized_drops`), not guessed. Builds before this fix multiplied contracts by price, so OKX rows stored by them are wrong (BTC 100x too large). |
 | **Bybit** | `confirmed` | Real `allLiquidation` v5 feed across the tracked symbols (those with a Bybit linear perp). Subscriptions are batched because Bybit caps args per request. |
 | **Binance** | `sampled` | The `!forceOrder` stream is **throttled by Binance to ~1 liquidation per symbol per second**. Large cascades are undercounted *at the source* — this cannot be fixed client-side, only disclosed. |
-| **Hyperliquid** | `heuristic` | Hyperliquid has **no liquidation feed**. Events are *inferred* from trades ≥ `HL_LIQUIDATION_MIN_USD` (default $10k) and may include ordinary large fills. Carried as `confirmed=False` and shown as estimated (`~` / `?`) in the UI. |
+| **Hyperliquid** | `partial` | Hyperliquid has **no public liquidation feed**. *Confirmed* events are liquidations an HLP vault took the other side of: Hyperliquid marks those fills with a `liquidation` object (`method: market` or `backstop`), and the HLP tracker polls every child vault's fills (~2 min delay). In practice most are `market` fills by Strategy A/B when HLP happened to be the book counterparty (several per hour in a live check), grouped by transaction hash so a liquidation both vaults filled counts once; Liquidator backstops are rarer. Liquidations filled by other traders are invisible. |
 
-`get_stats()` also returns `confirmed_count` and `heuristic_count` so consumers
-can weight accordingly. The HL threshold is a tunable heuristic: raising it cuts
-false positives but misses smaller liquidations.
+Separately, Hyperliquid trades ≥ `HL_LIQUIDATION_MIN_USD` (default $10k) are
+reported as **large prints**: `confirmed=False`, shown with `~`. In a test
+run 44 of 50 of these were ordinary trades, so the terminal **never adds them
+to liquidation totals**: every dashboard total, the alert digest, the
+`LiquidationCascade` strategy and the LLM agent prompt use
+`get_stats(include_estimated=False)`, and the panels show large prints on
+their own labelled line. `get_stats()` defaults to `include_estimated=True`
+for API compatibility (`/v1/liquidations/stats?include_estimated=false` for
+confirmed only) and always reports `confirmed_*` and `heuristic_*` separately.
 
 ## Order flow / CVD
 
@@ -66,6 +72,93 @@ false positives but misses smaller liquidations.
   than `ok` — one live shard can no longer hide six dead ones. Every shard
   connect is still counted in `connects`.
 
+### Warmup: a 4h window that holds one minute is not a 4h signal
+
+Right after start every timeframe contains the same few minutes of trades.
+Each `CVDSnapshot` carries `coverage` (the share of its window that data
+actually spans, 0..1). Dashboards show `warm NN%` instead of a signal for a
+window under 95% covered, the aggregate reads `WARMING_UP` until the 1h
+window is half covered (`OrderFlowEngine.display_signal`), and
+`/v1/orderflow/{symbol}` returns `coverage` per timeframe. The raw
+`get_multi_timeframe_signal()` used by strategies is unchanged.
+
+## Regional fallbacks (Binance is blocked in some regions)
+
+Binance futures answers HTTP 451 in several regions (the US among them) and
+Bybit 403s in others. Sources that would otherwise go dark fall back in
+order, and every value says which venue it came from:
+
+| Data | Order | Field |
+|---|---|---|
+| Spot price (basis) | Binance (USDT) → Coinbase (USD) → OKX (USDT) | `SpotPriceSnapshot.source`, `hub.spot.active_source` |
+| Long/short account ratio | Binance → Bybit → OKX | `LongShortSnapshot.source`, `hub.lsr.active_source` |
+| BTC price cross-check | Binance perp mark → OKX perp mark | named in the health check detail |
+
+A source that answers 401, 403 or 451 (forbidden or geoblocked) is skipped
+for 10 minutes; any other failure (timeout, reset, 5xx) for 30 seconds, so a
+network blip that hits every venue at once cannot freeze the chain. Values
+that stop updating are marked: basis reads `stale` after 60 seconds, L/S
+after 20 minutes. A fallback L/S ratio counts a different venue's accounts, so the
+health monitor does not cross-check it against Binance, and the
+consistency check of funding against L/S (Binance funding against Binance accounts)
+is skipped. Binance trade data for CVD has no substitute: it shows
+`silent`, as described above.
+
+## HLP vault
+
+HLP is a parent vault holding idle USDC plus child vaults (Strategy A/B/X and
+several Liquidators) that hold the positions.
+
+- **AUM** is the latest point of the parent's `vaultDetails` portfolio (what
+  Hyperliquid's UI shows), refreshed every 5 minutes along with the child
+  list; a failed refresh is retried on the next 30s pass. Summing
+  `clearinghouseState` instead misses Strategy X, which shows neither equity
+  nor positions there (about $100M of the ~$180M at the time of writing).
+  That sum is only a fallback, used when no reading is younger than 15
+  minutes, and it is labelled: `(partial)` in the panel, `aum_source` and
+  `aum_is_partial` in MCP, `aum_source` in `hlp_snapshots`.
+- **Session PnL** is the change in Hyperliquid's own cumulative PnL series
+  (`allTime.pnlHistory`) since the first reading this session. It is never
+  the change in AUM: deposits and withdrawals move AUM by hundreds of
+  thousands of dollars in minutes while PnL moves by hundreds. Without a
+  fresh reading (none yet, or none in 15 minutes) the panel shows `--`, MCP
+  returns `null`, alerts say `unknown`, and `hlp_snapshots.pnl_known` is 0.
+- **Positions** are netted per coin across vaults, because Strategy A and B
+  usually hold opposite sides of the same coin. **Gross exposure** is summed
+  per vault before netting, so the netting never hides how much is on.
+  Strategy X's positions are not visible.
+- A snapshot pass in which any vault request fails is discarded rather than
+  shown as a partial sum.
+- **Absorptions** come from the `liquidation` object on child vault fills,
+  read with `userFillsByTime` from a per vault watermark, so an empty or
+  lagging response can never replay old fills. A full 2000 fill page means a
+  backlog: the tracker pages forward (up to 3 pages per vault per poll,
+  about 20 times the normal rate). Hyperliquid only serves roughly the last
+  10,000 fills per vault, so after a long gap (a laptop asleep) the oldest
+  missed fills can be gone; the tracker logs a warning naming the lost
+  span. One liquidation is often filled by both Strategy A and B: fills are
+  grouped by transaction hash (all zero hashes are ignored) into one
+  absorption with the sizes summed, emitted once as a confirmed Hyperliquid
+  liquidation, and stored as one `hlp_trades` row, upserted by hash and only
+  ever grown, so a restart or a later share of the same liquidation never
+  adds a row or shrinks one. The first poll seeds 24 hours of absorptions
+  from the quiet Liquidator vaults; the busy strategy vaults resume one poll
+  interval before session start, which covers the end of a previous run.
+  Pre-start fills are stored but never emitted as live liquidations, and
+  absorptions read when the app stops are still stored. Ordinary market
+  making fills (~300 a minute) are not stored.
+
+## Smart money warmup
+
+Wallets are ranked from their own fill history (`userFills`, about 120
+request weight for an active wallet). Hyperliquid allows 1200 weight a minute
+per IP, shared by every component, and the rest of the app uses about 750
+(measured), so smart money keeps to 360 a minute: a few wallets a minute.
+Tiers need 10 ranked wallets, so the smart and dumb money tables fill in over
+the first few minutes, and the panel says so while they do. Without the
+budget, a batch of wallets drew HTTP 429s, and because the limit is shared,
+going over it puts the scanner and the HLP tracker at risk too.
+
 ## Staleness watchdog (frozen feeds never read as live)
 
 Every WebSocket feed connects with `heartbeat=20`, so a half-open TCP connection
@@ -106,8 +199,8 @@ only) and caches the result; the dashboard badge and `/v1/health` read it.
 
 | Check | Source | Pass condition |
 |---|---|---|
-| BTC price | Binance spot ticker | within 0.5% of hub |
-| BTC long/short ratio | Binance `globalLongShortAccountRatio` | within 20% (warn beyond) |
+| BTC price | Binance perp mark (`premiumIndex`), else the OKX perp mark where Binance futures is blocked | within 0.5% of hub |
+| BTC long/short ratio | Binance `globalLongShortAccountRatio` | within 20% (warn beyond); reported as `warn` ("not cross-checked") when the hub's ratio comes from a fallback venue, since nothing was verified |
 | Deribit DVOL | hub | present |
 | Order flow freshness (blended) | engine `is_stale()` | some venue delivering trades |
 | Order flow freshness per venue | engine `venue_freshness()` | `ok` (warn if this venue is out, fail if all are) |
@@ -119,7 +212,7 @@ only) and caches the result; the dashboard badge and `/v1/health` read it.
 Run it once from the CLI:
 
 ```bash
-python3 src/verify_data.py --wait 30
+hyperdata verify --wait 30
 ```
 
 It prints a PASS/WARN/FAIL report and exits non-zero on any failure (handy for
@@ -131,7 +224,7 @@ alongside per-feed `feeds` status.
 SQLite runs in WAL mode and commits on a time interval
 (`COMMIT_INTERVAL_SECONDS`, default 5s) as well as every 50 events, so an
 uncatchable crash (SIGKILL/OOM) loses at most a few seconds of events. A graceful
-exit flushes via an `atexit` handler, and the headless server (`run_api.py`)
+exit flushes via an `atexit` handler, and the headless server (`hyperdata api`)
 installs SIGINT/SIGTERM handlers so `kill <pid>` shuts down cleanly.
 
 Writes never run on the event loop: feed callbacks enqueue rows for a

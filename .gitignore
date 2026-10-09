@@ -24,3 +24,4 @@ venv/
 # Editor/tool backup files (a hook in this environment drops these next to edited files)
 *.bak
 .venv-verify/
+.gstack/

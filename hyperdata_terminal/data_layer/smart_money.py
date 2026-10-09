@@ -1,0 +1,876 @@
+"""
+Smart Money Scoring Engine — discovers, tracks, and ranks Hyperliquid wallets.
+
+Continuously watches the trade WebSocket for active addresses, fetches their
+fill history, computes PnL / win-rate / Sharpe, and generates actionable
+signals when "smart money" or "dumb money" opens positions.
+
+Usage:
+    engine = SmartMoneyEngine()
+    await engine.start()          # begins discovery + analysis loops
+    engine.on_signal(my_callback) # get notified on signals
+    ...
+    await engine.stop()
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import math
+import time
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Any, Callable
+
+import aiohttp
+import numpy as np
+
+from hyperdata_terminal.data_layer import address_store
+from hyperdata_terminal.paths import DATA_DIR
+
+logger = logging.getLogger(__name__)
+
+ANCHOR_PATH = DATA_DIR / "anchor_wallets.json"
+
+LEADERBOARD_URLS: list[str] = []  # No external leaderboard in OSS build
+
+
+# ── Data models ────────────────────────────────────────────────────────────
+
+@dataclass
+class WalletProfile:
+    address: str
+    discovered_at: float            # When we first saw this wallet
+    last_seen: float                # Last trade activity
+    last_analyzed: float            # Last time we fetched their fills
+
+    # Performance metrics
+    total_trades: int = 0
+    winning_trades: int = 0
+    losing_trades: int = 0
+    total_realized_pnl: float = 0.0
+    total_volume_usd: float = 0.0
+    largest_win: float = 0.0
+    largest_loss: float = 0.0
+    avg_hold_time_seconds: float = 0.0
+
+    # Computed scores
+    win_rate: float = 0.0           # winning / total
+    pnl_score: float = 0.0         # log-scaled PnL, [-1, 1]
+    # Risk-adjusted per-trade RETURN ratio (mean/std of closedPnl/notional,
+    # shrunk toward 0 on small samples). NOT an annualised Sharpe ratio —
+    # no time basis, no risk-free rate. The field keeps its historical name
+    # for the in-memory consumers (dashboards, demo generator); it is NOT
+    # persisted — profiles are recomputed from fills every session — so the
+    # change from a dollar-based ratio to this one left no stale rows
+    # anywhere (the dead `wallets` table was dropped in DataStore v4).
+    sharpe_ratio: float = 0.0
+    composite_score: float = 0.0    # final weighted score, ordinal only
+    confidence: float = 0.0         # 0-1 sample-size confidence (see _compute_confidence)
+
+    # Classification
+    rank: int = 0                   # 1 = best performer
+    tier: str = "unknown"           # "smart", "average", "dumb"
+
+    # Current state
+    account_value: float = 0.0
+    open_positions: int = 0
+    active_symbols: list = field(default_factory=list)
+
+    def __post_init__(self):
+        if self.active_symbols is None:
+            self.active_symbols = []
+
+
+@dataclass
+class SmartMoneySignal:
+    timestamp: float
+    address: str
+    tier: str               # "smart" or "dumb"
+    action: str             # "OPEN_LONG", "OPEN_SHORT", "CLOSE_LONG", "CLOSE_SHORT"
+    symbol: str
+    size_usd: float
+    wallet_rank: int
+    wallet_win_rate: float
+    wallet_pnl: float
+    signal_type: str        # "follow" (smart money) or "fade" (dumb money)
+    # Sample-size confidence of the wallet's tier (WalletProfile.confidence,
+    # 0-1). A "smart" label on 10 trades is not the same as one on 500;
+    # every consumer of `tier` must show this next to it.
+    wallet_confidence: float = 0.0
+
+
+# ── Engine ─────────────────────────────────────────────────────────────────
+
+class SmartMoneyEngine:
+    API_URL = "https://api.hyperliquid.xyz/info"
+
+    # ── Scoring ──────────────────────────────────────────────────
+    # composite = ALPHA*win_rate + BETA*pnl_score + GAMMA*risk_adjusted
+    #
+    # Every component is bounded (win_rate in [0, 1], the other two in
+    # [-1, 1]) and the weights sum to 1, so the composite is bounded in
+    # [-0.65, 1] and is an ORDINAL ranking key — not a probability and not
+    # fitted to data. The weights encode a stated preference:
+    #   BETA  0.40  realised PnL is what a follower actually captures, and
+    #               it is the hardest of the three to fake;
+    #   ALPHA 0.35  win rate is intuitive but gameable with tiny scalps, so
+    #               it must not dominate PnL;
+    #   GAMMA 0.25  the risk-adjusted ratio breaks ties between wallets
+    #               with similar PnL; it is the noisiest input on small
+    #               samples, hence the smallest weight and the shrinkage.
+    ALPHA = 0.35
+    BETA = 0.40
+    GAMMA = 0.25
+    # pnl_score = sign(pnl) * min(1, log10(1 + |pnl|) / PNL_LOG_SCALE):
+    # $1k -> 0.50, $10k -> 0.67, $100k -> 0.83, $1M+ -> 1.0. The previous
+    # divisor of 10 compressed three orders of magnitude into 0.3..0.6 and
+    # made BETA's nominal weight mostly decorative.
+    PNL_LOG_SCALE = 6.0
+    # Small-sample shrinkage for the risk-adjusted ratio: raw * n/(n+K).
+    # 10 trades keep a third of the raw ratio, 20 keep half, 100 keep ~83%.
+    RISK_SHRINK_TRADES = 20
+
+    # Thresholds. Three closed trades says nothing about skill — a coin flip
+    # "wins" three in a row 12.5% of the time — so ranking requires a
+    # minimally meaningful sample plus real volume, and every profile carries
+    # a sample-size confidence that consumers must surface alongside tiers.
+    MIN_TRADES_FOR_RANKING = 10
+    MIN_VOLUME_FOR_RANKING = 50_000     # Total traded volume (USD)
+    FULL_CONFIDENCE_TRADES = 50         # Trades at which confidence saturates
+    # Tiers are PROPORTIONAL: the top and bottom TIER_FRACTION of the
+    # qualified population, each capped at SMART_MONEY_TOP_N /
+    # DUMB_MONEY_BOTTOM_N. Fixed "top 100 / bottom 100" boundaries made
+    # "average" unreachable below 200 qualified wallets — the normal state of
+    # a fresh install — so every ranked wallet was labelled smart or dumb.
+    # Below MIN_TIERED_POPULATION there is no meaningful top/bottom decile at
+    # all: wallets are ranked but every tier is "average".
+    TIER_FRACTION = 0.10
+    MIN_TIERED_POPULATION = 10
+    SMART_MONEY_TOP_N = 100             # Cap on the smart-money tier size
+    DUMB_MONEY_BOTTOM_N = 100           # Cap on the dumb-money tier size
+    ANALYSIS_INTERVAL = 300             # Analyze wallets every 5 minutes
+    WARMUP_ANALYSIS_INTERVAL = 30       # ...but every 30s until the first wallet is ranked
+    DISCOVERY_INTERVAL = 10             # Discover new addresses every 10 seconds
+    MIN_ACCOUNT_VALUE = 1000            # Ignore wallets < $1K
+    ANALYSIS_BATCH_SIZE = 20            # Wallets per analysis cycle
+
+    def __init__(self) -> None:
+        self.wallets: dict[str, WalletProfile] = {}
+        self.signals: deque[SmartMoneySignal] = deque(maxlen=1000)
+        self._callbacks: list[Callable] = []
+        self._session: aiohttp.ClientSession | None = None
+        self._running = False
+        self._tasks: list[asyncio.Task] = []
+        # Rate limiting
+        self._request_times: deque = deque(maxlen=8)
+        self._weight_log: deque[tuple[float, int]] = deque()  # (time, request weight), last 60s
+
+    # ── Lifecycle ──────────────────────────────────────────────────────
+
+    async def start(self) -> None:
+        """Start discovery and analysis loops."""
+        self._running = True
+        self._session = aiohttp.ClientSession()
+        self._tasks = [
+            asyncio.create_task(self._discovery_loop(), name="sm-discovery"),
+            asyncio.create_task(self._analysis_loop(), name="sm-analysis"),
+            asyncio.create_task(self.seed_from_leaderboard(), name="sm-seed"),
+        ]
+        logger.info("[smart_money] Engine started")
+
+    async def stop(self) -> None:
+        """Graceful shutdown."""
+        self._running = False
+        for t in self._tasks:
+            t.cancel()
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+        self._tasks.clear()
+        if self._session and not self._session.closed:
+            await self._session.close()
+            self._session = None
+        logger.info("[smart_money] Engine stopped — %d wallets tracked", len(self.wallets))
+
+    def on_signal(self, callback: Callable[[SmartMoneySignal], Any]) -> None:
+        """Register callback for smart money signals."""
+        self._callbacks.append(callback)
+
+    # ── Address persistence ────────────────────────────────────────────
+
+    def _save_addresses(self) -> None:
+        """Persist tracked wallets to SQLite (atomic, race-free)."""
+        try:
+            address_store.add_addresses(self.wallets.keys(), source="smart_money")
+        except Exception:
+            logger.debug("[smart_money] Failed to save discovered addresses")
+
+    # ── Leaderboard seeding ────────────────────────────────────────────
+
+    async def fetch_leaderboard_wallets(self, top_n: int = 50) -> list[str]:
+        """Fetch top wallets from on-chain activity. Returns list of 0x addresses.
+
+        In the open-source build, wallets are discovered organically from
+        Hyperliquid position activity. No external leaderboard seeding.
+        """
+        addresses: list[str] = []
+
+        # Fallback: HTTP API endpoints
+        session = self._session
+        if session is None or session.closed:
+            session = aiohttp.ClientSession()
+            own = True
+        else:
+            own = False
+
+        try:
+            for url in LEADERBOARD_URLS:
+                try:
+                    async with session.get(
+                        url,
+                        params={"limit": str(top_n), "sort": "profit"},
+                        timeout=aiohttp.ClientTimeout(total=15),
+                    ) as resp:
+                        if resp.status != 200:
+                            continue
+                        data = await resp.json()
+                        rows = data if isinstance(data, list) else data.get("data", [])
+                        if not isinstance(rows, list):
+                            continue
+                        for row in rows:
+                            addr = (
+                                row.get("proxy_wallet")
+                                or row.get("address")
+                                or row.get("wallet")
+                                or row.get("maker")
+                                or row.get("user")
+                                or ""
+                            )
+                            if address_store.is_valid_address(addr):
+                                addresses.append(address_store.normalize_address(addr))
+                        if addresses:
+                            logger.info(
+                                "[smart_money] Fetched %d leaderboard wallets from %s",
+                                len(addresses), url,
+                            )
+                            break
+                except Exception:
+                    logger.debug("[smart_money] Leaderboard fetch failed: %s", url)
+                    continue
+        finally:
+            if own and not session.closed:
+                await session.close()
+
+        return addresses
+
+    async def seed_from_leaderboard(self) -> int:
+        """Seed wallets from anchor file + on-chain leaderboard."""
+        now = time.time()
+        seed_addrs: list[str] = []  # ordered, deduped later
+
+        # 1. Load anchor_wallets.json
+        anchor_count = 0
+        try:
+            if ANCHOR_PATH.exists():
+                raw = json.loads(ANCHOR_PATH.read_text())
+                for entry in raw.get("anchors", []):
+                    addr = entry.get("address", "")
+                    if address_store.is_valid_address(addr):
+                        seed_addrs.append(address_store.normalize_address(addr))
+                        anchor_count += 1
+        except Exception:
+            logger.debug("[smart_money] Failed to load anchor_wallets.json")
+
+        # 2. Fetch leaderboard
+        leaderboard = await self.fetch_leaderboard_wallets(top_n=50)
+        lb_count = len(leaderboard)
+        seed_addrs.extend(leaderboard)
+
+        # 3. Deduplicate preserving order
+        seen: set[str] = set()
+        unique: list[str] = []
+        for addr in seed_addrs:
+            if addr not in seen:
+                seen.add(addr)
+                unique.append(addr)
+
+        # 4. Add new wallets
+        added = 0
+        for addr in unique:
+            if addr not in self.wallets:
+                self.wallets[addr] = WalletProfile(
+                    address=addr,
+                    discovered_at=now,
+                    last_seen=now,
+                    last_analyzed=0,
+                )
+                added += 1
+
+        # 5. Persist
+        self._save_addresses()
+
+        logger.info(
+            "[smart_money] Seeded %d new wallets (%d anchors + %d leaderboard)",
+            added, anchor_count, lb_count,
+        )
+        logger.info(
+            "[smart_money] Total tracked wallets after seed: %d",
+            len(self.wallets),
+        )
+        return added
+
+    # ── Rate limiting ─────────────────────────────────────────────────
+
+    # Hyperliquid limits each IP to 1200 request weight per minute, shared by
+    # every component (measured: the rest of the app uses about 750). A
+    # userFills call costs 20 plus 1 per 20 fills returned: an active wallet
+    # returns 2000 fills, so ~120 weight. A batch of 20 wallets at 8 requests a
+    # second spent ~2400 weight in seconds and drew HTTP 429s, and going over a
+    # shared limit puts the scanner and HLP tracker at risk too. Smart money
+    # now keeps to its own budget.
+    WEIGHT_BUDGET_PER_MIN = 360
+
+    async def _rate_limit(self) -> None:
+        """Max 8 requests per second, and at most WEIGHT_BUDGET_PER_MIN weight a minute."""
+        now = time.time()
+        self._request_times.append(now)
+        if len(self._request_times) >= 8:
+            oldest = self._request_times[0]
+            elapsed = now - oldest
+            if elapsed < 1.0:
+                await asyncio.sleep(1.0 - elapsed)
+        while True:
+            now = time.time()
+            while self._weight_log and now - self._weight_log[0][0] > 60:
+                self._weight_log.popleft()
+            if sum(w for _, w in self._weight_log) < self.WEIGHT_BUDGET_PER_MIN:
+                return
+            await asyncio.sleep(max(0.5, 60 - (now - self._weight_log[0][0])))
+
+    def _record_weight(self, request_type: str, data: Any) -> None:
+        weight = 2 if request_type in ("clearinghouseState", "allMids", "l2Book") else 20
+        if request_type in ("userFills", "userFillsByTime") and isinstance(data, list):
+            weight += len(data) // 20
+        self._weight_log.append((time.time(), weight))
+
+    # ── API helpers ───────────────────────────────────────────────────
+
+    async def _post(self, payload: dict) -> Any:
+        """POST to Hyperliquid info endpoint with rate limiting."""
+        if self._session is None or self._session.closed:
+            return None
+        await self._rate_limit()
+        data = None
+        try:
+            async with self._session.post(self.API_URL, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data
+                logger.warning("[smart_money] API %d for %s", resp.status, payload.get("type"))
+                return None
+        except Exception:
+            logger.debug("[smart_money] API request failed for %s", payload.get("type"))
+            return None
+        finally:
+            self._record_weight(str(payload.get("type", "")), data)
+
+    async def _fetch_fills(self, address: str) -> list[dict]:
+        """Fetch recent trade fills for a wallet."""
+        data = await self._post({"type": "userFills", "user": address})
+        if isinstance(data, list):
+            return data
+        return []
+
+    async def _fetch_clearinghouse(self, address: str) -> dict | None:
+        """Fetch clearinghouse state (positions + account value)."""
+        return await self._post({"type": "clearinghouseState", "user": address})
+
+    # ── Discovery ─────────────────────────────────────────────────────
+
+    async def _discovery_loop(self) -> None:
+        """Watch trade WebSocket and collect addresses."""
+        coins = ["BTC", "ETH", "SOL", "DOGE", "XRP", "AVAX", "LINK", "ARB"]
+        while self._running:
+            try:
+                async with self._session.ws_connect(
+                    "wss://api.hyperliquid.xyz/ws", heartbeat=20
+                ) as ws:
+                    for coin in coins:
+                        await ws.send_json({
+                            "method": "subscribe",
+                            "subscription": {"type": "trades", "coin": coin},
+                        })
+
+                    async for msg in ws:
+                        if not self._running:
+                            break
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            data = json.loads(msg.data)
+                            if data.get("channel") == "trades":
+                                for trade in data.get("data", []):
+                                    for addr in trade.get("users", []):
+                                        # Untrusted payload: only well-formed
+                                        # wallet addresses become profiles.
+                                        if not address_store.is_valid_address(addr):
+                                            continue
+                                        addr = address_store.normalize_address(addr)
+                                        if addr not in self.wallets:
+                                            self.wallets[addr] = WalletProfile(
+                                                address=addr,
+                                                discovered_at=time.time(),
+                                                last_seen=time.time(),
+                                                last_analyzed=0,
+                                            )
+                                        else:
+                                            self.wallets[addr].last_seen = time.time()
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                logger.exception("[smart_money] Discovery WS error")
+                await asyncio.sleep(5)
+
+    async def discover_from_trades(self, symbols: list[str] | None = None, duration: float = 10) -> int:
+        """One-shot discovery: watch trades for N seconds, collect addresses."""
+        symbols = symbols or ["BTC", "ETH", "SOL"]
+        before = len(self.wallets)
+        session = self._session or aiohttp.ClientSession()
+        own_session = self._session is None
+
+        try:
+            async with session.ws_connect("wss://api.hyperliquid.xyz/ws", heartbeat=20) as ws:
+                for coin in symbols:
+                    await ws.send_json({
+                        "method": "subscribe",
+                        "subscription": {"type": "trades", "coin": coin},
+                    })
+
+                end_time = time.time() + duration
+                async for msg in ws:
+                    if time.time() >= end_time:
+                        break
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        data = json.loads(msg.data)
+                        if data.get("channel") == "trades":
+                            for trade in data.get("data", []):
+                                for addr in trade.get("users", []):
+                                    if not address_store.is_valid_address(addr):
+                                        continue
+                                    addr = address_store.normalize_address(addr)
+                                    if addr not in self.wallets:
+                                        self.wallets[addr] = WalletProfile(
+                                            address=addr,
+                                            discovered_at=time.time(),
+                                            last_seen=time.time(),
+                                            last_analyzed=0,
+                                        )
+        except Exception:
+            logger.exception("[smart_money] One-shot discovery error")
+        finally:
+            if own_session and not session.closed:
+                await session.close()
+
+        discovered = len(self.wallets) - before
+        logger.info("[smart_money] Discovered %d new addresses in %.0fs", discovered, duration)
+        return discovered
+
+    # ── Analysis ──────────────────────────────────────────────────────
+
+    async def _analysis_loop(self) -> None:
+        """Periodically analyze wallet performance."""
+        while self._running:
+            try:
+                now = time.time()
+                # Pick wallets that haven't been analyzed recently
+                candidates = [
+                    w for w in self.wallets.values()
+                    if (now - w.last_analyzed) > self.ANALYSIS_INTERVAL
+                ]
+                # Never analyzed first (most recently seen first among them),
+                # then the longest since analyzed. Sorting only by recent
+                # activity let busy, already analyzed wallets crowd out new
+                # ones: under the weight budget a batch takes minutes, so
+                # they are due again by the next cycle.
+                candidates.sort(key=lambda w: (w.last_analyzed > 0, w.last_analyzed, -w.last_seen))
+                batch = candidates[: self.ANALYSIS_BATCH_SIZE]
+
+                logger.info(
+                    "[smart_money] Analysis cycle: %d wallets to analyze (of %d tracked)",
+                    len(batch), len(self.wallets),
+                )
+
+                for wallet in batch:
+                    if not self._running:
+                        break
+                    try:
+                        await self.analyze_wallet(wallet.address)
+                    except Exception:
+                        logger.debug("[smart_money] Failed to analyze %s", wallet.address[:10])
+                    # The weight budget makes a batch take minutes (a few wallets
+                    # a minute), so rank after every wallet: tiers then appear the
+                    # moment enough wallets qualify, and the panel's ranked count
+                    # never runs ahead of its tiers.
+                    self.rank_all()
+
+                ranked_count = sum(1 for w in self.wallets.values() if self._qualifies_for_ranking(w))
+                logger.info(
+                    "[smart_money] Analyzed %d wallets, %d total tracked, %d ranked",
+                    len(batch), len(self.wallets), ranked_count,
+                )
+
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                logger.exception("[smart_money] Analysis loop error")
+                ranked_count = 0
+
+            # The first pass runs before discovery has seen any wallet, so a
+            # flat 5-minute sleep left the panel empty for 5+ minutes. Until
+            # something is ranked, come back quickly for newly seen wallets
+            # (each is still analyzed at most once per ANALYSIS_INTERVAL).
+            await asyncio.sleep(self.ANALYSIS_INTERVAL if ranked_count else self.WARMUP_ANALYSIS_INTERVAL)
+
+    async def analyze_wallet(self, address: str) -> WalletProfile:
+        """Fetch fills for a wallet and compute all performance metrics."""
+        wallet = self.wallets.get(address)
+        if wallet is None:
+            wallet = WalletProfile(
+                address=address,
+                discovered_at=time.time(),
+                last_seen=time.time(),
+                last_analyzed=0,
+            )
+            self.wallets[address] = wallet
+
+        # 1. Fetch recent fills
+        fills = await self._fetch_fills(address)
+        if not fills:
+            wallet.last_analyzed = time.time()
+            return wallet
+
+        # 2. Parse closedPnl and compute metrics
+        close_pnls: list[float] = []
+        close_returns: list[float] = []   # closedPnl / fill notional, per close
+        total_volume = 0.0
+        winning = 0
+        losing = 0
+        total_pnl = 0.0
+        largest_win = 0.0
+        largest_loss = 0.0
+        open_times: dict[str, float] = {}  # coin -> open timestamp
+        hold_times: list[float] = []
+
+        for fill in fills:
+            px = float(fill.get("px", 0))
+            sz = float(fill.get("sz", 0))
+            fill_time = fill.get("time", 0)
+            if isinstance(fill_time, str):
+                fill_time = float(fill_time)
+            fill_time_s = fill_time / 1000.0 if fill_time > 1e12 else fill_time
+
+            size_usd = px * sz
+            total_volume += size_usd
+
+            direction = fill.get("dir", "")
+            coin = fill.get("coin", "")
+            closed_pnl = float(fill.get("closedPnl", "0"))
+
+            # Track open/close for hold time estimation
+            if direction.startswith("Open"):
+                open_times[coin] = fill_time_s
+            elif direction.startswith("Close"):
+                if coin in open_times:
+                    ht = fill_time_s - open_times[coin]
+                    if ht > 0:
+                        hold_times.append(ht)
+                    del open_times[coin]
+
+                # Every close fill counts as a trade (including breakeven)
+                close_pnls.append(closed_pnl)
+                if size_usd > 0:
+                    close_returns.append(closed_pnl / size_usd)
+                total_pnl += closed_pnl
+                if closed_pnl > 0:
+                    winning += 1
+                    largest_win = max(largest_win, closed_pnl)
+                elif closed_pnl < 0:
+                    losing += 1
+                    largest_loss = min(largest_loss, closed_pnl)
+
+        total_close_trades = len(close_pnls)
+
+        # 3. Update wallet profile
+        wallet.total_trades = total_close_trades
+        wallet.winning_trades = winning
+        wallet.losing_trades = losing
+        wallet.total_realized_pnl = total_pnl
+        wallet.total_volume_usd = total_volume
+        wallet.largest_win = largest_win
+        wallet.largest_loss = largest_loss
+        wallet.avg_hold_time_seconds = float(np.mean(hold_times)) if hold_times else 0.0
+
+        # 4. Compute derived scores
+        wallet.win_rate = winning / total_close_trades if total_close_trades > 0 else 0.0
+        wallet.sharpe_ratio = self._compute_risk_adjusted(close_returns)
+        wallet.pnl_score = self._compute_pnl_score(total_pnl)
+        wallet.composite_score = self._compute_composite(wallet)
+        wallet.confidence = self._compute_confidence(wallet)
+
+        # 5. Fetch clearinghouse state for account value + open positions
+        ch = await self._fetch_clearinghouse(address)
+        if ch and isinstance(ch, dict):
+            margin = ch.get("marginSummary", {})
+            wallet.account_value = float(margin.get("accountValue", 0))
+            positions = ch.get("assetPositions", [])
+            active = []
+            for pos_wrapper in positions:
+                pos = pos_wrapper.get("position", pos_wrapper)
+                sz = float(pos.get("szi", 0))
+                if sz != 0:
+                    active.append(pos.get("coin", "?"))
+            wallet.open_positions = len(active)
+            wallet.active_symbols = active
+
+        wallet.last_analyzed = time.time()
+
+        # 6. Check for signals from recent fills
+        await self.check_signals(address, fills)
+
+        return wallet
+
+    # ── Scoring ───────────────────────────────────────────────────────
+
+    def _compute_pnl_score(self, total_pnl: float) -> float:
+        """Signed log-scaled PnL in [-1, 1]; monotonic in PnL, saturating at
+        ±10**PNL_LOG_SCALE dollars (see the class-level scoring notes)."""
+        if total_pnl == 0:
+            return 0.0
+        magnitude = math.log10(1 + abs(total_pnl)) / self.PNL_LOG_SCALE
+        return math.copysign(min(1.0, magnitude), total_pnl)
+
+    def _compute_risk_adjusted(self, returns: list[float]) -> float:
+        """Small-sample-shrunk mean/std of per-trade RETURNS.
+
+        Inputs are closedPnl / fill notional, so a wallet scalping ten
+        consistent $50 wins on $50k notional does not out-score a wallet
+        compounding real returns; dollar PnL magnitude lives in pnl_score.
+        Zero dispersion (identical returns) says nothing about risk and
+        scores 0. The raw ratio is multiplied by n/(n+RISK_SHRINK_TRADES),
+        so a handful of similar trades cannot max the component.
+        Not annualised, no risk-free rate — see WalletProfile.sharpe_ratio.
+        """
+        n = len(returns)
+        if n < 2:
+            return 0.0
+        arr = np.array(returns, dtype=float)
+        std = float(np.std(arr))
+        # Identical returns give std ~1e-19 from float rounding, not 0.0 —
+        # an exact-zero test would turn that noise into a ~1e15 ratio.
+        if not std > 1e-12:
+            return 0.0
+        raw = float(np.mean(arr)) / std
+        return raw * (n / (n + self.RISK_SHRINK_TRADES))
+
+    def _compute_composite(self, w: WalletProfile) -> float:
+        """Weighted composite ranking key, bounded in [-0.65, 1]."""
+        # Win rate: already 0-1
+        wr = max(0.0, min(1.0, w.win_rate))
+
+        # Log-scaled PnL, [-1, 1]
+        pnl = self._compute_pnl_score(w.total_realized_pnl)
+
+        # Risk-adjusted ratio clamped to [-3, 3] then scaled to [-1, 1]
+        risk = max(-3.0, min(3.0, w.sharpe_ratio)) / 3.0
+
+        return self.ALPHA * wr + self.BETA * pnl + self.GAMMA * risk
+
+    def _compute_confidence(self, w: WalletProfile) -> float:
+        """Sample-size confidence in [0, 1].
+
+        Linear in closed-trade count up to FULL_CONFIDENCE_TRADES. This is a
+        coverage heuristic (recent fills only, no confidence interval on win
+        rate) — consumers must show it next to any smart/dumb label rather
+        than presenting tiers as certainty.
+        """
+        return min(1.0, w.total_trades / float(self.FULL_CONFIDENCE_TRADES))
+
+    def _qualifies_for_ranking(self, w: WalletProfile) -> bool:
+        return (w.total_trades >= self.MIN_TRADES_FOR_RANKING
+                and w.total_volume_usd >= self.MIN_VOLUME_FOR_RANKING)
+
+    # ── Ranking ───────────────────────────────────────────────────────
+
+    def tier_counts(self, population: int) -> tuple[int, int]:
+        """(smart_n, dumb_n) for a qualified population of the given size.
+
+        Top/bottom TIER_FRACTION each, capped at the *_N constants; zero
+        below MIN_TIERED_POPULATION. Always leaves an "average" middle.
+        """
+        if population < self.MIN_TIERED_POPULATION:
+            return 0, 0
+        k = int(population * self.TIER_FRACTION)
+        return min(k, self.SMART_MONEY_TOP_N), min(k, self.DUMB_MONEY_BOTTOM_N)
+
+    def rank_all(self) -> None:
+        """Re-rank all wallets by composite_score and assign proportional tiers."""
+        qualified = [w for w in self.wallets.values() if self._qualifies_for_ranking(w)]
+        qualified.sort(key=lambda w: w.composite_score, reverse=True)
+
+        qualified_set = {w.address for w in qualified}
+        # Wallets that no longer qualify must lose their old rank/tier, or a
+        # stale "smart" label survives after the sample stops qualifying.
+        for w in self.wallets.values():
+            if w.address not in qualified_set:
+                w.rank = 0
+                if w.tier in ("smart", "average", "dumb"):
+                    w.tier = "unknown"
+
+        n = len(qualified)
+        smart_n, dumb_n = self.tier_counts(n)
+        for i, w in enumerate(qualified, 1):
+            w.rank = i
+            if i <= smart_n:
+                w.tier = "smart"
+            elif i > n - dumb_n:
+                w.tier = "dumb"
+            else:
+                w.tier = "average"
+
+    # ── Signal generation ─────────────────────────────────────────────
+
+    async def check_signals(self, address: str, fills: list[dict]) -> None:
+        """Check if a ranked wallet just opened/closed a position."""
+        wallet = self.wallets.get(address)
+        if wallet is None or wallet.tier == "unknown" or wallet.tier == "average":
+            return
+        if wallet.rank == 0:
+            return
+
+        # Only look at very recent fills (last 10 minutes)
+        cutoff = time.time() - 600
+        for fill in fills:
+            fill_time = fill.get("time", 0)
+            if isinstance(fill_time, str):
+                fill_time = float(fill_time)
+            fill_time_s = fill_time / 1000.0 if fill_time > 1e12 else fill_time
+            if fill_time_s < cutoff:
+                continue
+
+            direction = fill.get("dir", "")
+            coin = fill.get("coin", "")
+            px = float(fill.get("px", 0))
+            sz = float(fill.get("sz", 0))
+            size_usd = px * sz
+
+            action_map = {
+                "Open Long": "OPEN_LONG",
+                "Open Short": "OPEN_SHORT",
+                "Close Long": "CLOSE_LONG",
+                "Close Short": "CLOSE_SHORT",
+            }
+            action = action_map.get(direction)
+            if action is None:
+                continue
+
+            # Determine signal type
+            if wallet.tier == "smart":
+                signal_type = "follow"
+            elif wallet.tier == "dumb":
+                signal_type = "fade"
+            else:
+                continue
+
+            signal = SmartMoneySignal(
+                timestamp=fill_time_s,
+                address=address,
+                tier=wallet.tier,
+                action=action,
+                symbol=coin,
+                size_usd=size_usd,
+                wallet_rank=wallet.rank,
+                wallet_win_rate=wallet.win_rate,
+                wallet_pnl=wallet.total_realized_pnl,
+                signal_type=signal_type,
+                wallet_confidence=wallet.confidence,
+            )
+
+            # Deduplicate: skip if we already have this exact signal
+            if self.signals and any(
+                s.address == signal.address
+                and s.timestamp == signal.timestamp
+                and s.symbol == signal.symbol
+                and s.action == signal.action
+                for s in self.signals
+            ):
+                continue
+
+            self.signals.append(signal)
+            self._emit_signal(signal)
+
+    def _emit_signal(self, signal: SmartMoneySignal) -> None:
+        """Notify all registered callbacks."""
+        for cb in self._callbacks:
+            try:
+                cb(signal)
+            except Exception:
+                logger.exception("[smart_money] Signal callback error")
+
+    # ── Queries ───────────────────────────────────────────────────────
+
+    def get_smart_money(self, n: int = 20) -> list[WalletProfile]:
+        """Get top N smart money wallets."""
+        ranked = [w for w in self.wallets.values() if w.tier == "smart" and w.rank > 0]
+        ranked.sort(key=lambda w: w.rank)
+        return ranked[:n]
+
+    def get_dumb_money(self, n: int = 20) -> list[WalletProfile]:
+        """Get bottom N wallets."""
+        ranked = [w for w in self.wallets.values() if w.tier == "dumb" and w.rank > 0]
+        ranked.sort(key=lambda w: w.rank, reverse=True)
+        return ranked[:n]
+
+    def get_recent_signals(self, n: int = 50, max_age_s: int = 300) -> list[SmartMoneySignal]:
+        """Return last N signals within max_age_s seconds.
+
+        Time-filtered to prevent the full deque being replayed on
+        cluster restart.
+        """
+        cutoff = time.time() - max_age_s
+        return [
+            s for s in list(self.signals)[-n:]
+            if getattr(s, "timestamp", 0) >= cutoff
+        ]
+
+    def get_wallet(self, address: str) -> WalletProfile | None:
+        """Look up a specific wallet."""
+        return self.wallets.get(address)
+
+    def get_stats(self) -> dict:
+        """Summary stats: total wallets, ranked wallets, signals generated."""
+        # Wallets rank_all() has ranked, so the count always matches the tiers.
+        ranked = sum(1 for w in self.wallets.values() if w.rank > 0)
+        smart = sum(1 for w in self.wallets.values() if w.tier == "smart")
+        dumb = sum(1 for w in self.wallets.values() if w.tier == "dumb")
+        average = sum(1 for w in self.wallets.values() if w.tier == "average")
+        return {
+            "total_wallets": len(self.wallets),
+            "ranked_wallets": ranked,
+            "smart_wallets": smart,
+            "dumb_wallets": dumb,
+            "average_wallets": average,
+            "total_signals": len(self.signals),
+            # Coverage caveats: rankings come from recent fills only and small
+            # samples — consumers should show these limits, not just tiers.
+            "ranking_criteria": {
+                "min_trades": self.MIN_TRADES_FOR_RANKING,
+                "min_volume_usd": self.MIN_VOLUME_FOR_RANKING,
+                "tier_fraction": self.TIER_FRACTION,
+                "min_tiered_population": self.MIN_TIERED_POPULATION,
+                "note": (
+                    "Performance is computed from recent fills only; tiers are "
+                    "heuristic. Check each wallet's `confidence` (0-1 sample-"
+                    "size score) before acting on smart/dumb labels."
+                ),
+            },
+        }

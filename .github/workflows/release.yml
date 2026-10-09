@@ -1,0 +1,61 @@
+name: Release
+
+# Publishes to PyPI when a version tag is pushed (git tag v1.0.0 && git push --tags).
+# Uses PyPI Trusted Publishing: no API token is stored anywhere. One-time setup
+# on pypi.org > Account > Publishing > "Add a new pending publisher":
+#   PyPI project name: hyperdata-terminal
+#   Owner: Co-Messi   Repository: HyperData-Terminal
+#   Workflow: release.yml   Environment: pypi
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Tag must match the package version
+        run: |
+          version=$(python -c "import re,pathlib; print(re.search(r'__version__ = \"(.+?)\"', pathlib.Path('hyperdata_terminal/__init__.py').read_text()).group(1))")
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "tag $GITHUB_REF_NAME does not match hyperdata_terminal.__version__ ($version)"; exit 1
+          fi
+
+      - name: Build sdist and wheel
+        run: |
+          pip install build==1.3.0
+          python -m build
+
+      - name: Smoke test the wheel
+        run: |
+          python -m venv /tmp/clean
+          /tmp/clean/bin/pip install dist/*.whl
+          cd /tmp && /tmp/clean/bin/hyperdata --version
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/hyperdata-terminal/
+    permissions:
+      id-token: write  # OIDC token for Trusted Publishing; nothing else
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: dist
+          path: dist/
+
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2

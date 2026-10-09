@@ -6,7 +6,7 @@ import time
 
 import pytest
 
-from data_layer.liquidation_feed import (
+from hyperdata_terminal.data_layer.liquidation_feed import (
     BybitConnection,
     LiquidationEvent,
     LiquidationFeed,

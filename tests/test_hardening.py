@@ -18,16 +18,7 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
-from data_layer.liquidation_feed import (
-    BinanceConnection,
-    BybitConnection,
-    LiquidationEvent,
-    LiquidationFeed,
-    OKXConnection,
-)
-from data_layer.orderbook import OrderBookEngine
-from data_layer.persistence import DataStore
-from src.api_server import (
+from hyperdata_terminal.api_server import (
     WS_BAD_MSG_LIMIT,
     HyperDataAPI,
     _is_loopback_host,
@@ -37,9 +28,18 @@ from src.api_server import (
     _RateLimiter,
     _WSClient,
 )
-from src.strategies.base import Signal
-from src.strategies.llm_agent import LLMAgent
-from src.strategies.paper_trader import PaperTrader
+from hyperdata_terminal.data_layer.liquidation_feed import (
+    BinanceConnection,
+    BybitConnection,
+    LiquidationEvent,
+    LiquidationFeed,
+    OKXConnection,
+)
+from hyperdata_terminal.data_layer.orderbook import OrderBookEngine
+from hyperdata_terminal.data_layer.persistence import DataStore
+from hyperdata_terminal.strategies.base import Signal
+from hyperdata_terminal.strategies.llm_agent import LLMAgent
+from hyperdata_terminal.strategies.paper_trader import PaperTrader
 
 # ── Helpers ──────────────────────────────────────────────────────
 
@@ -362,6 +362,7 @@ class TestMalformedPayloads:
     async def test_okx_malformed_detail_dropped_individually(self):
         feed = LiquidationFeed()
         conn = OKXConnection(feed)
+        conn._contracts = {"BTC-USDT-SWAP": ("linear", 0.01)}
         received = []
         feed.on_liquidation(received.append)
 
@@ -406,14 +407,14 @@ class TestMalformedPayloads:
 class TestHubDegradedStartup:
     @pytest.mark.asyncio
     async def test_failed_component_recorded_not_swallowed(self, tmp_path, monkeypatch):
-        from src.data_layer import address_store, persistence
+        from hyperdata_terminal.data_layer import address_store, persistence
         monkeypatch.setattr(persistence, "DB_PATH", tmp_path / "hub.db")
         monkeypatch.setattr(address_store, "DATA_DIR", tmp_path)
         monkeypatch.setattr(address_store, "DB_PATH", tmp_path / "hub.db")
         monkeypatch.setattr(address_store, "LEGACY_JSON", tmp_path / "legacy.json")
         monkeypatch.setattr(address_store, "_initialized", False)
 
-        from src.data_layer.hub import HyperDataHub
+        from hyperdata_terminal.data_layer.hub import HyperDataHub
         hub = HyperDataHub()
         # Every component start is stubbed: one fails, the rest succeed.
         hub.liquidations.start = AsyncMock(side_effect=ConnectionError("down"))
@@ -442,7 +443,7 @@ class TestHubDegradedStartup:
 def _trader_with_db(price=100.0, balance=10_000.0, **kw) -> PaperTrader:
     """A PaperTrader with an in-memory trade log — required since M2: a
     trader whose log is not open refuses every trade."""
-    from src.strategies.paper_trader import CREATE_TABLE_SQL
+    from hyperdata_terminal.strategies.paper_trader import CREATE_TABLE_SQL
     hub = MagicMock()
     hub.market.assets = {"BTC": SimpleNamespace(price=price)}
     trader = PaperTrader(hub, [], starting_balance=balance, **kw)
@@ -582,14 +583,14 @@ class TestPersistence:
 class TestAlertRedaction:
     @pytest.mark.asyncio
     async def test_alert_payload_not_logged(self, caplog):
-        from data_layer.alerts import AlertManager
+        from hyperdata_terminal.data_layer.alerts import AlertManager
         mgr = AlertManager()
         mgr.telegram_token = ""   # no channels configured
         mgr.discord_webhook = ""
         secret_wallet = "0x" + "ab" * 20
         message = f"whale alert\nwallet {secret_wallet} is near liquidation"
 
-        with caplog.at_level("WARNING", logger="data_layer.alerts"):
+        with caplog.at_level("WARNING", logger="hyperdata_terminal.data_layer.alerts"):
             await mgr._send(message)
         log_text = caplog.text
         assert secret_wallet not in log_text
@@ -601,7 +602,7 @@ class TestAlertRedaction:
 
 class TestSmartMoneyThresholds:
     def _wallet(self, engine, addr, trades, volume, score):
-        from data_layer.smart_money import WalletProfile
+        from hyperdata_terminal.data_layer.smart_money import WalletProfile
         w = WalletProfile(
             address=addr, discovered_at=0, last_seen=0, last_analyzed=0,
             total_trades=trades, total_volume_usd=volume, composite_score=score,
@@ -610,7 +611,7 @@ class TestSmartMoneyThresholds:
         return w
 
     def test_small_samples_not_ranked(self):
-        from data_layer.smart_money import SmartMoneyEngine
+        from hyperdata_terminal.data_layer.smart_money import SmartMoneyEngine
         engine = SmartMoneyEngine()
         tiny = self._wallet(engine, "0x" + "1" * 40, trades=3, volume=1e6, score=0.9)
         thin = self._wallet(engine, "0x" + "2" * 40, trades=50, volume=100.0, score=0.9)
@@ -625,7 +626,7 @@ class TestSmartMoneyThresholds:
         assert solid.rank == 1 and solid.tier == "average"
 
     def test_disqualified_wallet_loses_stale_tier(self):
-        from data_layer.smart_money import SmartMoneyEngine
+        from hyperdata_terminal.data_layer.smart_money import SmartMoneyEngine
         engine = SmartMoneyEngine()
         w = self._wallet(engine, "0x" + "4" * 40, trades=20, volume=1e6, score=0.8)
         engine.rank_all()
@@ -636,7 +637,7 @@ class TestSmartMoneyThresholds:
         assert w.tier == "unknown"
 
     def test_confidence_scales_with_sample(self):
-        from data_layer.smart_money import SmartMoneyEngine, WalletProfile
+        from hyperdata_terminal.data_layer.smart_money import SmartMoneyEngine, WalletProfile
         engine = SmartMoneyEngine()
         w = WalletProfile(address="0x" + "5" * 40, discovered_at=0,
                           last_seen=0, last_analyzed=0, total_trades=25)
@@ -649,7 +650,7 @@ class TestSmartMoneyThresholds:
 
 class TestPerVenueFreshness:
     def test_dead_venue_visible_while_combined_fresh(self):
-        from data_layer.orderflow_engine import OrderFlowEngine
+        from hyperdata_terminal.data_layer.orderflow_engine import OrderFlowEngine
         e = OrderFlowEngine(symbols=["BTC"])
         now = time.time()
         e.last_hl_message_at = now - 1000    # HL dead
@@ -662,7 +663,7 @@ class TestPerVenueFreshness:
         assert fresh["binance"]["stale"] is False
 
     def test_no_data_reports_none_age(self):
-        from data_layer.orderflow_engine import OrderFlowEngine
+        from hyperdata_terminal.data_layer.orderflow_engine import OrderFlowEngine
         e = OrderFlowEngine(symbols=["BTC"])
         fresh = e.venue_freshness()
         assert fresh["hyperliquid"]["data_age_seconds"] is None
@@ -815,7 +816,7 @@ class TestPersistenceRound2:
     def test_locked_db_raises_instead_of_quarantining(self, tmp_path, monkeypatch):
         """'database is locked' is contention, not corruption — a healthy DB
         held by another process must never be quarantined."""
-        import data_layer.persistence as persistence_mod
+        import hyperdata_terminal.data_layer.persistence as persistence_mod
 
         real_connect = persistence_mod.sqlite3.connect
 
@@ -834,7 +835,7 @@ class TestAlertsRound2:
     async def test_send_failure_does_not_leak_token(self, caplog):
         """aiohttp error messages can embed the request URL — which contains
         the bot token — so failure logs carry the exception type only."""
-        from data_layer.alerts import AlertManager
+        from hyperdata_terminal.data_layer.alerts import AlertManager
         mgr = AlertManager()
         mgr.telegram_token = "123456:SECRET-TOKEN-VALUE"
         mgr.telegram_chat_id = "42"
@@ -845,19 +846,19 @@ class TestAlertsRound2:
         ))
         mgr._session = session
 
-        with caplog.at_level("DEBUG", logger="data_layer.alerts"):
+        with caplog.at_level("DEBUG", logger="hyperdata_terminal.data_layer.alerts"):
             await mgr._send("test message")
         assert "SECRET-TOKEN-VALUE" not in caplog.text
         assert "Telegram send failed" in caplog.text
 
     @pytest.mark.asyncio
     async def test_wallet_on_first_line_still_redacted(self, caplog):
-        from data_layer.alerts import AlertManager
+        from hyperdata_terminal.data_layer.alerts import AlertManager
         mgr = AlertManager()
         mgr.telegram_token = ""
         mgr.discord_webhook = ""
         wallet = "0x" + "cd" * 20
-        with caplog.at_level("WARNING", logger="data_layer.alerts"):
+        with caplog.at_level("WARNING", logger="hyperdata_terminal.data_layer.alerts"):
             await mgr._send(f"whale {wallet} near liquidation")
         assert wallet not in caplog.text
         assert "ALERT sent" in caplog.text
@@ -868,7 +869,7 @@ class TestCascadeExampleStrategy:
     def test_cascade_strategy_actually_fires(self):
         """getattr on the stats dict always returned 0 and silently disabled
         this strategy — dict access must read the real key."""
-        from src.strategies.examples import LiquidationCascade
+        from hyperdata_terminal.strategies.examples import LiquidationCascade
         hub = MagicMock()
         hub.liquidations.get_stats.return_value = {"long_volume_usd": 2_000_000.0}
         strat = LiquidationCascade(symbol="BTC", cascade_threshold_usd=1_000_000)
