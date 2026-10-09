@@ -277,6 +277,38 @@ class TestHlp:
         assert rows == (1, 1)
 
 
+def test_db_from_an_early_build_of_this_branch_gets_the_hlp_columns(tmp_path):
+    """Early builds recorded schema v5 without the HLP columns; v6 must add them."""
+    import sqlite3
+
+    from hyperdata_terminal.data_layer.hlp_tracker import HLPTrade
+    from hyperdata_terminal.data_layer.persistence import DataStore
+
+    path = tmp_path / "early_v5.db"
+    store = DataStore(path)
+    store.close()
+    conn = sqlite3.connect(path)
+    conn.executescript("""
+        DROP INDEX IF EXISTS idx_hlp_trade_hash;
+        CREATE TABLE hlp_trades_old AS SELECT id, timestamp, symbol, side, price, size, size_usd,
+            direction, closed_pnl, is_liquidation, created_at FROM hlp_trades;
+        DROP TABLE hlp_trades;
+        ALTER TABLE hlp_trades_old RENAME TO hlp_trades;
+        DELETE FROM schema_version WHERE version > 5;
+    """)
+    conn.commit()
+    conn.close()
+    store = DataStore(path)
+    try:
+        assert store.get_schema_version() == DataStore.SCHEMA_VERSION >= 6
+        store._save_hlp_absorption(HLPTrade(1.0, "JUP", "sell", 1, 2, 2, "Open Short", 0, True, "market", "0xA", "0xh"))
+        store._save_hlp_absorption(HLPTrade(1.0, "JUP", "sell", 1, 3, 3, "Open Short", 0, True, "market", "0xA", "0xh"))
+        store.flush()
+        assert store._conn.execute("SELECT COUNT(*), MAX(size) FROM hlp_trades").fetchone() == (1, 3)
+    finally:
+        store.close()
+
+
 def test_long_short_source_is_persisted(tmp_path):
     from hyperdata_terminal.data_layer.long_short_ratio import LongShortSnapshot
     from hyperdata_terminal.data_layer.persistence import DataStore

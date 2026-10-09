@@ -439,11 +439,13 @@ class DataStore:
     #   v5  long_short_ratios.source: which venue's accounts a row counts
     #       (Binance, or the Bybit/OKX fallback where Binance is blocked), so
     #       stored history never silently mixes crowds. Existing rows were all
-    #       Binance, hence the default. hlp_snapshots.aum_source;
-    #       hlp_trades.fill_hash (unique) and .vault, so an absorbed
-    #       liquidation is one row however many vaults filled it or how often
-    #       the tracker restarts.
-    SCHEMA_VERSION = 5
+    #       Binance, hence the default.
+    #   v6  hlp_snapshots.aum_source; hlp_trades.fill_hash (unique) and
+    #       .vault, so an absorbed liquidation is one row however many vaults
+    #       filled it or how often the tracker restarts. (A separate version
+    #       because DBs created by an early build of this branch already
+    #       recorded v5 without these columns.)
+    SCHEMA_VERSION = 6
 
     # Tables that no code path has ever written to, by the version that
     # drops them. A dead table is dropped only when EMPTY; a populated one
@@ -490,6 +492,8 @@ class DataStore:
 
     def _migrate_v5(self) -> None:
         self._add_column("long_short_ratios", "source", "TEXT NOT NULL DEFAULT 'binance'")
+
+    def _migrate_v6(self) -> None:
         self._add_column("hlp_snapshots", "aum_source", "TEXT NOT NULL DEFAULT 'clearinghouseState'")
         self._add_column("hlp_trades", "fill_hash", "TEXT")
         self._add_column("hlp_trades", "vault", "TEXT NOT NULL DEFAULT ''")
@@ -499,7 +503,7 @@ class DataStore:
 
     # version -> migration step. Steps run in order for every version above
     # the DB's recorded one, each followed by a schema_version row.
-    _MIGRATIONS = {3: _migrate_v3, 4: _migrate_v4, 5: _migrate_v5}
+    _MIGRATIONS = {3: _migrate_v3, 4: _migrate_v4, 5: _migrate_v5, 6: _migrate_v6}
 
     def _run_migrations(self) -> None:
         """Versioned migrations. Caller holds the lock.
