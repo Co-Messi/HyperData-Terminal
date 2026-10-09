@@ -92,7 +92,8 @@ class HubStatus:
     failed_components: list = field(default_factory=list)
 
     # Counters
-    total_liquidations: int = 0
+    total_liquidations: int = 0           # confirmed events only
+    total_estimated_liquidations: int = 0  # HL large prints (heuristic), never in the total above
     total_trades_processed: int = 0
     tracked_positions: int = 0
     tracked_assets: int = 0
@@ -212,6 +213,7 @@ class HyperDataHub:
 
         # ── Background tasks ─────────────────────────────────────
         self._tasks: list[asyncio.Task] = []
+        self._emit_tasks: set[asyncio.Task] = set()
         self._running = False
         # Debounce for per-venue orderflow staleness warnings.
         self._venue_stale_warned_at: dict[str, float] = {}
@@ -248,7 +250,10 @@ class HyperDataHub:
                 logger.exception("Signal callback error")
 
     def _handle_liquidation(self, event: LiquidationEvent) -> None:
-        self.status.total_liquidations += 1
+        if getattr(event, "confirmed", True):
+            self.status.total_liquidations += 1
+        else:
+            self.status.total_estimated_liquidations += 1
         self.status.last_liq_event = time.time()
         for cb in self._on_liquidation_cbs:
             try:
@@ -269,11 +274,44 @@ class HyperDataHub:
         self.status.hlp_trades += 1
         if trade.is_liquidation:
             self.status.hlp_liquidation_absorptions += 1
+            self._emit_hlp_liquidation(trade)
         for cb in self._on_hlp_trade_cbs:
             try:
                 cb(trade)
             except Exception:
                 logger.exception("HLP trade callback error")
+
+    # A fill older than this (relative to hub start) is history from the
+    # first userFills poll, not a liquidation that happened while running.
+    HLP_LIQ_BACKFILL_SECONDS = 300
+
+    def _emit_hlp_liquidation(self, trade: HLPTrade) -> None:
+        """Feed an HLP liquidation absorption into the liquidation stream as a
+        CONFIRMED Hyperliquid liquidation (Hyperliquid itself flagged the fill).
+
+        Only fills from this session (plus a short backfill) are forwarded; the
+        first poll returns days of history that must not inflate the counters.
+        """
+        started = self.status.started_at or time.time()
+        if trade.timestamp < started - self.HLP_LIQ_BACKFILL_SECONDS:
+            return
+        event = LiquidationEvent(
+            timestamp=trade.timestamp,
+            exchange="hyperliquid",
+            symbol=trade.symbol,
+            side=trade.liquidated_side,
+            size_usd=trade.size_usd,
+            price=trade.price,
+            quantity=trade.size,
+            confirmed=True,
+        )
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = loop.create_task(self.liquidations.emit(event))
+        self._emit_tasks.add(task)
+        task.add_done_callback(self._emit_tasks.discard)
 
     # ── Lifecycle ─────────────────────────────────────────────────
 

@@ -152,6 +152,7 @@ class SmartMoneyEngine:
     SMART_MONEY_TOP_N = 100             # Cap on the smart-money tier size
     DUMB_MONEY_BOTTOM_N = 100           # Cap on the dumb-money tier size
     ANALYSIS_INTERVAL = 300             # Analyze wallets every 5 minutes
+    WARMUP_ANALYSIS_INTERVAL = 30       # ...but every 30s until the first wallet is ranked
     DISCOVERY_INTERVAL = 10             # Discover new addresses every 10 seconds
     MIN_ACCOUNT_VALUE = 1000            # Ignore wallets < $1K
     ANALYSIS_BATCH_SIZE = 20            # Wallets per analysis cycle
@@ -489,8 +490,13 @@ class SmartMoneyEngine:
                 return
             except Exception:
                 logger.exception("[smart_money] Analysis loop error")
+                ranked_count = 0
 
-            await asyncio.sleep(self.ANALYSIS_INTERVAL)
+            # The first pass runs before discovery has seen any wallet, so a
+            # flat 5-minute sleep left the panel empty for 5+ minutes. Until
+            # something is ranked, come back quickly for newly seen wallets
+            # (each is still analyzed at most once per ANALYSIS_INTERVAL).
+            await asyncio.sleep(self.ANALYSIS_INTERVAL if ranked_count else self.WARMUP_ANALYSIS_INTERVAL)
 
     async def analyze_wallet(self, address: str) -> WalletProfile:
         """Fetch fills for a wallet and compute all performance metrics."""

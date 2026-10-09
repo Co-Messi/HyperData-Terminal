@@ -139,17 +139,27 @@ class DataHealthMonitor:
         else:
             out.append(HealthCheck("xref", "btc_price", "warn", "price unavailable"))
 
-        # BTC long/short ratio: hub vs Binance.
+        # BTC long/short ratio: hub vs Binance. Only meaningful when the hub's
+        # ratio came from Binance too; a Bybit/OKX fallback counts a different
+        # crowd of accounts, so a "diff" against Binance would be noise.
         hub_lsr_snap = hub.lsr.get_latest("BTC")
+        lsr_source = getattr(hub_lsr_snap, "source", "binance") if hub_lsr_snap else "binance"
         hub_lsr = hub_lsr_snap.long_short_ratio if hub_lsr_snap else 0.0
-        ext_lsr_data = await _fetch_json(
-            session, BINANCE_LSR, {"symbol": "BTCUSDT", "period": "5m", "limit": "1"}
-        )
-        ext_lsr = (
-            float(ext_lsr_data[0]["longShortRatio"])
-            if ext_lsr_data and len(ext_lsr_data) > 0 else 0.0
-        )
-        if hub_lsr > 0 and ext_lsr > 0:
+        ext_lsr = 0.0
+        if lsr_source == "binance":
+            ext_lsr_data = await _fetch_json(
+                session, BINANCE_LSR, {"symbol": "BTCUSDT", "period": "5m", "limit": "1"}
+            )
+            ext_lsr = (
+                float(ext_lsr_data[0]["longShortRatio"])
+                if ext_lsr_data and len(ext_lsr_data) > 0 else 0.0
+            )
+        if lsr_source != "binance" and hub_lsr > 0:
+            out.append(HealthCheck(
+                "xref", "btc_long_short_ratio", "pass",
+                f"hub={hub_lsr:.2f} from {lsr_source} (Binance unavailable); not cross-checked",
+            ))
+        elif hub_lsr > 0 and ext_lsr > 0:
             diff = _pct_diff(hub_lsr, ext_lsr)
             status = "pass" if diff < LSR_TOLERANCE_PCT else "warn"
             out.append(HealthCheck(
@@ -271,6 +281,8 @@ class DataHealthMonitor:
         # warnings. Skipped when funding is ~flat (no clear directional bias).
         binance_fr = hub.funding.rates.get("binance", {}).get("BTC")
         lsr_snap = hub.lsr.get_latest("BTC")
+        if lsr_snap is not None and getattr(lsr_snap, "source", "binance") != "binance":
+            lsr_snap = None  # fallback venue's accounts: not comparable with Binance funding
         if binance_fr and lsr_snap and lsr_snap.long_short_ratio > 0:
             rate = binance_fr.funding_rate_hourly
             if abs(rate) >= 1e-6:

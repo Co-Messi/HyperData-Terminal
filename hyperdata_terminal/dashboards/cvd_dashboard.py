@@ -41,6 +41,7 @@ SIGNAL_STYLES: dict[str, str] = {
     "BULLISH": "green",
     "NEUTRAL": "white",
     "CONTESTED": "yellow",
+    "WARMING_UP": "dim",
     "BEARISH": "red",
     "STRONG_BEAR": "bold bright_red",
 }
@@ -305,7 +306,10 @@ class CVDDashboard:
             cvd_ratio = (snap.ofi + 1.0) / 2.0
             cvd_bar = self._make_bar(cvd_ratio, width=10)
 
-            sig_text = Text(snap.signal, style=self._signal_color(snap.signal))
+            if getattr(snap, "warming_up", False):
+                sig_text = Text(f"warming {snap.coverage:.0%}", style="dim")
+            else:
+                sig_text = Text(snap.signal, style=self._signal_color(snap.signal))
             table.add_row(tf, price_bar, cvd_bar, sig_text)
 
         return table
@@ -381,7 +385,7 @@ class CVDDashboard:
         if self.engine is None:
             return Text("  Aggregate: ---\n", style="dim")
 
-        agg = self.engine.get_multi_timeframe_signal(self.symbol)
+        agg = self.engine.display_signal(self.symbol)
         line = Text("  Aggregate Signal: ")
         emoji = SIGNAL_EMOJI.get(agg, "")
         line.append(f"{emoji} {agg}", style=self._signal_color(agg))
@@ -426,7 +430,10 @@ class CVDDashboard:
                 total = snap.buy_volume + snap.sell_volume
                 buy_ratio = snap.buy_volume / total if total > 0 else 0.5
                 flow_bar = self._make_bar(buy_ratio, width=10)
-                sig = Text(snap.signal[:6], style=self._signal_color(snap.signal))
+                if getattr(snap, "warming_up", False):
+                    sig = Text(f"warm {snap.coverage:.0%}", style="dim")
+                else:
+                    sig = Text(snap.signal[:6], style=self._signal_color(snap.signal))
                 table.add_row(tf, flow_bar, sig)
         else:
             for tf in DISPLAY_TFS:

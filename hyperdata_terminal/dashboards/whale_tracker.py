@@ -26,7 +26,7 @@ from rich.text import Text
 # Resolve project root so imports work when run as a script
 # ---------------------------------------------------------------------------
 from hyperdata_terminal.data_layer.position_scanner import PositionScanner, TrackedPosition
-from hyperdata_terminal.utils.helpers import format_pct_value as fmt_pct
+from hyperdata_terminal.utils.helpers import format_distance_pct as fmt_distance
 from hyperdata_terminal.utils.helpers import format_price as fmt_price
 
 # -- Formatting helpers (imported from central helpers) ---------------------
@@ -231,7 +231,7 @@ class WhaleTrackerDashboard:
                 Text(fmt_usd(pos.size_usd), style=size_style),
                 fmt_price(pos.entry_price),
                 Text(pnl_str, style=pnl_style),
-                Text(fmt_pct(pos.distance_pct), style=dist_style),
+                Text(fmt_distance(pos.distance_pct), style=dist_style),
                 Text(f"{pos.leverage:.0f}x", style="dim bright_white"),
                 Text(shorten_addr(pos.address)),
             )
@@ -419,7 +419,7 @@ class WhaleTrackerDashboard:
                 Text(pos.symbol),
                 fmt_usd(pos.size_usd),
                 pnl_str,
-                Text(fmt_pct(pos.distance_pct), style=dist_style),
+                Text(fmt_distance(pos.distance_pct), style=dist_style),
             )
 
         now_str = datetime.now(timezone.utc).strftime("%H:%M:%S")

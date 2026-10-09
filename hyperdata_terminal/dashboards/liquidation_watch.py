@@ -31,7 +31,7 @@ from hyperdata_terminal.config.settings import (
     LIQ_ZONE_5_PCT,
 )
 from hyperdata_terminal.data_layer.position_scanner import PositionScanner, TrackedPosition
-from hyperdata_terminal.utils.helpers import format_pct_value as fmt_pct
+from hyperdata_terminal.utils.helpers import format_distance_pct as fmt_distance
 from hyperdata_terminal.utils.helpers import format_price as fmt_price
 
 # ── Formatting helpers (imported from central helpers) ────────────────────
@@ -253,7 +253,7 @@ class LiquidationWatchDashboard:
                 Text(fmt_usd(pos.size_usd), style="bright_white"),
                 Text(fmt_price(pos.entry_price), style="bright_white"),
                 Text(fmt_price(pos.liq_price), style="bright_white"),
-                Text(fmt_pct(pos.distance_pct), style=dist_style),
+                Text(fmt_distance(pos.distance_pct), style=dist_style),
                 Text(pnl_str, style=pnl_style),
                 Text(f"{pos.leverage:.0f}x", style="dim bright_white"),
             )
@@ -350,7 +350,7 @@ class LiquidationWatchDashboard:
             table.add_row(
                 Text(pos.side.upper()[:1], style=side_style),
                 fmt_usd(pos.size_usd),
-                Text(fmt_pct(pos.distance_pct), style=dist_style),
+                Text(fmt_distance(pos.distance_pct), style=dist_style),
                 Text(f"{pnl_sign}{fmt_usd(pos.unrealized_pnl)}", style=pnl_style),
                 f"{pos.leverage:.0f}x",
             )

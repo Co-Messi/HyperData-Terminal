@@ -20,6 +20,7 @@ from rich.table import Table
 from rich.text import Text
 
 from hyperdata_terminal.data_layer.hub import HyperDataHub
+from hyperdata_terminal.utils.helpers import format_distance_pct as fmt_distance
 from hyperdata_terminal.utils.helpers import format_pct as fmt_pct
 from hyperdata_terminal.utils.helpers import format_price as fmt_price
 from hyperdata_terminal.utils.helpers import format_usd as fmt_usd
@@ -77,7 +78,7 @@ class HubLiqWatch:
             box=box.SIMPLE_HEAVY, border_style="bright_cyan",
             header_style="bold bright_white", expand=True, padding=(0, 0),
         )
-        table.add_column("SIDE", justify="center", width=2)
+        table.add_column("L/S", justify="center", width=3)
         table.add_column("SYM", style="bright_white", justify="center", width=5)
         table.add_column("SIZE", justify="right", min_width=7)
         table.add_column("DIST", justify="right", min_width=5)
@@ -91,7 +92,7 @@ class HubLiqWatch:
             sign = "+" if pos.unrealized_pnl >= 0 else ""
             table.add_row(
                 Text(pos.side[0].upper(), style=s), Text(pos.symbol),
-                fmt_usd(pos.size_usd), Text(fmt_pct(pos.distance_pct), style=ds),
+                fmt_usd(pos.size_usd), Text(fmt_distance(pos.distance_pct), style=ds),
                 Text(f"{sign}{fmt_usd(pos.unrealized_pnl)}", style=ps),
                 f"{pos.leverage:.0f}x",
             )
@@ -116,7 +117,10 @@ class HubLiqStream:
         from hyperdata_terminal.dashboards.liquidation_stream import EXCHANGE_COLORS, SIDE_LONG, SIDE_SHORT
 
         feed = self.hub.liquidations
-        stats_1h = feed.get_stats(window_minutes=60)
+        # Confirmed liquidations only. Hyperliquid large prints (trades >= $10K
+        # inferred from the public tape) are mostly ordinary trades; they get
+        # their own labelled line instead of inflating every number here.
+        stats_1h = feed.get_stats(window_minutes=60, include_estimated=False)
 
         by_ex = stats_1h.get("by_exchange", {})
         ex_line = Text()
@@ -124,38 +128,39 @@ class HubLiqStream:
             ex_data = by_ex.get(ex_name, {"count": 0, "volume_usd": 0.0})
             ex_line.append(f" {ex_name[:3].upper()}", style=f"bold {color}")
             ex_line.append(f":{ex_data['count']}", style="bright_white")
-            # Show ✓ for confirmed feeds, ~ for heuristic
-            if ex_name == "bybit" and ex_data["count"] > 0:
-                ex_line.append("\u2713", style="bold bright_green")
-            elif ex_name == "hyperliquid" and ex_data["count"] > 0:
-                ex_line.append("~", style="dim yellow")
             ex_line.append(f"/{fmt_usd(ex_data['volume_usd'])} ", style="dim")
+        if stats_1h.get("heuristic_count"):
+            ex_line.append(
+                f"\n ~HL large prints {stats_1h['heuristic_count']}/{fmt_usd(stats_1h['heuristic_volume_usd'])}"
+                " (not liquidations)",
+                style="dim yellow",
+            )
 
         summary = Text()
         for label, mins in [("10m", 10), ("1h", 60), ("4h", 240), ("24h", 1440)]:
-            s = feed.get_stats(window_minutes=mins)
+            s = feed.get_stats(window_minutes=mins, include_estimated=False)
             summary.append(f" {label} ", style="bold white")
             summary.append(f"L:{s['long_count']}", style="green")
             summary.append(f"/{fmt_usd(s['long_volume_usd'])}", style="green")
             summary.append(f" S:{s['short_count']}", style="red")
             summary.append(f"/{fmt_usd(s['short_volume_usd'])}\n", style="red")
 
-        recent = feed.get_recent(minutes=60)[:20]
+        recent = [ev for ev in feed.get_recent(minutes=60) if getattr(ev, "confirmed", True)][:20]
         lines = Text()
         for ev in recent:
             ts = datetime.fromtimestamp(ev.timestamp, tz=timezone.utc).strftime("%H:%M:%S")
             icon = SIDE_LONG if ev.side == "long" else SIDE_SHORT
             side_style = "green" if ev.side == "long" else "red"
             ex_color = EXCHANGE_COLORS.get(ev.exchange, "white")
-            confirmed_mark = "" if getattr(ev, 'confirmed', True) else "~"
             lines.append(f"{ts}", style="dim")
             lines.append(f" {icon}", style=side_style)
             lines.append(f" {ev.exchange[:3].upper()}", style=ex_color)
-            lines.append(f" {ev.symbol:<5}", style="bright_white")
-            lines.append(f" {confirmed_mark}{fmt_usd(ev.size_usd):>8}\n", style="bold white" if not confirmed_mark else "dim white")
+            lines.append(" ")
+            lines.append(f"{ev.symbol:<5}", style="bright_white")
+            lines.append(f" {fmt_usd(ev.size_usd):>8}\n", style="bold white")
 
         if not recent:
-            lines.append("  Waiting for liquidations...\n", style="dim")
+            lines.append("  Waiting for confirmed liquidations...\n", style="dim")
 
         now_str = datetime.now(timezone.utc).strftime("%H:%M:%S")
         total = self.hub.status.total_liquidations
@@ -184,7 +189,7 @@ class HubCVD:
         info = Text()
         for sym in symbols:
             tps = engine.get_trades_per_second(sym)
-            agg = engine.get_multi_timeframe_signal(sym)
+            agg = engine.display_signal(sym)
             agg_style = SIGNAL_STYLES.get(agg, "white")
             price_val = 0.0
             asset = self.hub.market.assets.get(sym)
@@ -222,9 +227,11 @@ class HubCVD:
             bar = Text()
             bar.append("\u2588" * filled, style="green")
             bar.append("\u2591" * (12 - filled), style="red")
-            sig_style = SIGNAL_STYLES.get(snap.signal, "white")
-            table.add_row(tf, fmt_usd(snap.buy_volume), fmt_usd(snap.sell_volume),
-                          bar, Text(snap.signal[:8], style=sig_style))
+            if getattr(snap, "warming_up", False):
+                sig_cell = Text(f"warm {snap.coverage:.0%}", style="dim")
+            else:
+                sig_cell = Text(snap.signal[:8], style=SIGNAL_STYLES.get(snap.signal, "white"))
+            table.add_row(tf, fmt_usd(snap.buy_volume), fmt_usd(snap.sell_volume), bar, sig_cell)
 
         tape = Text()
         recent = list(engine.recent_trades.get("BTC", []))[-10:]
@@ -300,8 +307,10 @@ class HubMarket:
             else:
                 prem_style = "dim"
             prem_str = f"{prem:+.2f}%" if prem != 0.0 else "--"
+            # Whole dollars above $1K: "$82,217.00" overflowed the column at 160 cols.
+            price_str = f"${a.price:,.0f}" if a.price >= 1000 else fmt_price(a.price)
             table.add_row(
-                str(i), Text(a.symbol), fmt_price(a.price),
+                str(i), Text(a.symbol), price_str,
                 Text(fmt_pct(a.price_change_24h_pct), style=chg_style),
                 Text(fmt_funding(a.funding_rate), style=fund_style),
                 Text(prem_str, style=prem_style),
@@ -359,7 +368,7 @@ class HubWhales:
             box=box.SIMPLE_HEAVY, border_style="bright_cyan",
             header_style="bold bright_white", expand=True, padding=(0, 0),
         )
-        table.add_column("SIDE", justify="center", width=2)
+        table.add_column("L/S", justify="center", width=3)
         table.add_column("SYM", style="bright_white", justify="center", width=5)
         table.add_column("SIZE", justify="right", min_width=7)
         table.add_column("PnL", justify="right", min_width=7)
@@ -376,7 +385,7 @@ class HubWhales:
                 Text(p.side[0].upper(), style=ss), Text(p.symbol),
                 Text(fmt_usd(p.size_usd), style=sz_style),
                 Text(f"{sign}{fmt_usd(p.unrealized_pnl)}", style=ps),
-                Text(fmt_pct(p.distance_pct), style=ds),
+                Text(fmt_distance(p.distance_pct), style=ds),
                 f"{p.leverage:.0f}x",
             )
 
@@ -409,7 +418,7 @@ class HubStatusPanel:
         mode_style = "bold bright_green" if s.mode == "demo" else "bold bright_red"
         lines.append(f"{s.mode.upper()}\n", style=mode_style)
         lines.append(f"  UPTIME: {h:02d}:{m:02d}:{sec:02d}\n", style="bright_white")
-        lines.append(f"  CYCLE: #{s.scan_cycle}\n", style="bright_white")
+        lines.append(f"  POSITION SCANS: {s.scan_cycle}\n", style="bright_white")
 
         lines.append("\n  COMPONENTS:\n", style="bold bright_cyan")
         components = [
@@ -480,6 +489,11 @@ class HubSmartMoney:
         stats_line.append(f" Tracked:{sm_stats['total_wallets']:,}", style="bright_white")
         stats_line.append(f"  Ranked:{sm_stats['ranked_wallets']:,}", style="bright_yellow")
         stats_line.append(f"  Signals:{sm_stats['total_signals']:,}\n", style="bright_cyan")
+        if not sm_stats["ranked_wallets"]:
+            # Wallets are ranked from their fill history, fetched as they show
+            # up on the tape: an empty table at start is warmup, not a fault.
+            stats_line.append(" Ranking wallets from their fill history (fills in over the first minutes)\n",
+                              style="dim yellow")
 
         # ── Smart money table ──
         # CONF = sample-size confidence (0-100%). A tier label is a heuristic
@@ -649,7 +663,7 @@ class HubHLP:
             box=box.SIMPLE_HEAVY, border_style="bright_magenta",
             header_style="bold bright_white", expand=True, padding=(0, 0),
         )
-        pos_table.add_column("SIDE", justify="center", width=2)
+        pos_table.add_column("L/S", justify="center", width=3)
         pos_table.add_column("SYM", style="bright_white", justify="center", width=5)
         pos_table.add_column("SIZE", justify="right", min_width=8)
         pos_table.add_column("PnL", justify="right", min_width=7)
@@ -730,7 +744,9 @@ class HubMarketIntel:
                 lines.append("--\n", style="dim")
 
         # ── Spot/Perp Basis ──
-        lines.append("\n BASIS (perp-spot)\n", style="bold bright_green")
+        spot_src = getattr(self.hub.spot, "active_source", None)
+        lines.append("\n BASIS (perp-spot)", style="bold bright_green")
+        lines.append(f"  spot: {spot_src}\n" if spot_src else "\n", style="dim")
         for sym in ["BTC", "ETH", "SOL"]:
             snap = self.hub.spot.get_latest(sym)
             if snap:
@@ -744,7 +760,9 @@ class HubMarketIntel:
                 lines.append(f"  {sym}: --\n", style="dim")
 
         # ── Long/Short Ratios ──
-        lines.append("\n L/S RATIO\n", style="bold bright_magenta")
+        lsr_src = getattr(self.hub.lsr, "active_source", None)
+        lines.append("\n L/S RATIO", style="bold bright_magenta")
+        lines.append(f"  accounts on {lsr_src}\n" if lsr_src else "\n", style="dim")
         for sym in ["BTC", "ETH", "SOL"]:
             snap = self.hub.lsr.get_latest(sym)
             if snap:

@@ -116,6 +116,9 @@ class ShardState:
     idle: bool = False          # none of its symbols are listed: no socket expected
 
 
+# A window counts as filled once data spans this share of it.
+WARM_COVERAGE = 0.95
+
 TIMEFRAME_WINDOWS: dict[str, int] = {
     "1m": 60,
     "5m": 300,
@@ -152,6 +155,14 @@ class CVDSnapshot:
     ofi: float            # Order Flow Imbalance: (buy-sell)/(buy+sell), [-1,1]
     trades_per_sec: float
     signal: str           # STRONG_BULL / BULLISH / NEUTRAL / BEARISH / STRONG_BEAR
+    # Share of the window that data actually covers, 0..1. Right after start
+    # a 4h window holds a minute of trades; every timeframe then shows the
+    # same numbers, and a "4h STRONG_BULL" is really a 1m reading.
+    coverage: float = 1.0
+
+    @property
+    def warming_up(self) -> bool:
+        return self.coverage < WARM_COVERAGE
 
 
 # ---------------------------------------------------------------------------
@@ -187,11 +198,15 @@ class TimeframeBucket:
         self.buy_volume: float = 0.0
         self.sell_volume: float = 0.0
         self.trade_count: int = 0
+        # Timestamp of the first trade this bucket ever saw (0 = none yet).
+        self.first_trade_at: float = 0.0
 
     # -- mutators -----------------------------------------------------------
 
     def add_trade(self, trade: Trade) -> None:
         """Add a trade and evict any that fell outside the window."""
+        if not self.first_trade_at or trade.timestamp < self.first_trade_at:
+            self.first_trade_at = trade.timestamp
         self.trades.append(trade)
         if trade.side == "buy":
             self.buy_volume += trade.size_usd
@@ -234,6 +249,10 @@ class TimeframeBucket:
         total = self.buy_volume + self.sell_volume
         ofi = (self.buy_volume - self.sell_volume) / total if total > 0 else 0.0
         tps = self.trade_count / self.window if self.window > 0 else 0.0
+        if not self.first_trade_at or self.window <= 0:
+            coverage = 0.0
+        else:
+            coverage = max(0.0, min(1.0, (now - self.first_trade_at) / self.window))
 
         return CVDSnapshot(
             timestamp=now,
@@ -246,6 +265,7 @@ class TimeframeBucket:
             ofi=ofi,
             trades_per_sec=tps,
             signal=classify_signal(ofi),
+            coverage=coverage,
         )
 
 
@@ -681,6 +701,14 @@ class OrderFlowEngine:
             tf: bucket.get_snapshot()
             for tf, bucket in self.buckets[symbol].items()
         }
+
+    def display_signal(self, symbol: str) -> str:
+        """The 1h/4h aggregate for display: "WARMING_UP" until the 1h window
+        is at least half covered, because before that the "1h/4h" verdict is
+        a few minutes of trades wearing a longer timeframe's label."""
+        if self.get_snapshot(symbol, "1h").coverage < 0.5:
+            return "WARMING_UP"
+        return self.get_multi_timeframe_signal(symbol)
 
     def get_multi_timeframe_signal(self, symbol: str) -> str:
         """Combine 1h and 4h signals into one aggregate signal.

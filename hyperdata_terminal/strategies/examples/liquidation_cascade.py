@@ -38,7 +38,9 @@ class LiquidationCascade(Strategy):
             return None
 
         # Get liquidation stats for the last 5 minutes
-        stats = hub.liquidations.get_stats(window_minutes=5)
+        # Confirmed only: Hyperliquid large prints are ordinary trades far
+        # more often than liquidations and would fake a cascade.
+        stats = hub.liquidations.get_stats(window_minutes=5, include_estimated=False)
         if not stats:
             return None
 

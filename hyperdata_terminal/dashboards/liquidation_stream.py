@@ -156,7 +156,7 @@ class LiquidationStreamDashboard:
         table.add_column("VOL SHORT", style="red", justify="right", min_width=10)
 
         for label, minutes in TIME_WINDOWS:
-            stats = self.feed.get_stats(window_minutes=minutes)
+            stats = self.feed.get_stats(window_minutes=minutes, include_estimated=False)
             table.add_row(
                 label,
                 fmt_number(stats["long_count"]),
@@ -171,7 +171,8 @@ class LiquidationStreamDashboard:
 
     def build_totals_panel(self) -> Panel:
         """Summary panel: total counts, long/short split, per-exchange breakdown."""
-        stats = self.feed.get_stats(window_minutes=60)
+        # Confirmed liquidations only; Hyperliquid large prints get their own line.
+        stats = self.feed.get_stats(window_minutes=60, include_estimated=False)
 
         lines: list[Text] = []
 
@@ -215,7 +216,7 @@ class LiquidationStreamDashboard:
         by_exchange: dict[str, dict[str, Any]] = stats.get("by_exchange", {})
         coverage: dict[str, dict[str, str]] = stats.get("coverage", {})
         # Tags that warn the count is not a complete census.
-        method_tag = {"sampled": " (sampled)", "heuristic": " (est.)"}
+        method_tag = {"sampled": " (sampled)", "heuristic": " (est.)", "partial": " (HLP fills only)"}
 
         for ex_name in all_exchanges:
             ex_data = by_exchange.get(ex_name, {"count": 0, "volume_usd": 0.0})
@@ -231,6 +232,17 @@ class LiquidationStreamDashboard:
             if method in method_tag:
                 ex_line.append(method_tag[method], style="dim yellow")
             lines.append(ex_line)
+
+        if stats.get("heuristic_count"):
+            lines.append(Text())
+            est = Text()
+            est.append("  ~ HL large prints: ", style="dim yellow")
+            est.append(
+                f"{fmt_number(stats['heuristic_count'])} ({fmt_usd(stats['heuristic_volume_usd'])})",
+                style="yellow",
+            )
+            est.append("  trades >= $10K, not counted above", style="dim")
+            lines.append(est)
 
         return Panel(
             Group(*lines),
@@ -297,7 +309,7 @@ class LiquidationStreamDashboard:
                 table.add_row(ts_str, exchange_text, Text(ev.symbol), side_text, size_text)
 
             if any_heuristic:
-                table.caption = "~ / ? = estimated (Hyperliquid heuristic, not a confirmed liquidation)"
+                table.caption = "~ = Hyperliquid large print (trade >= $10K), not a confirmed liquidation; excluded from totals"
                 table.caption_style = "dim yellow"
 
         return table
@@ -319,15 +331,15 @@ class LiquidationStreamDashboard:
         table.add_column("SHORT", style="red", justify="right", min_width=8)
 
         for label, minutes in TIME_WINDOWS[:3]:  # 10min, 1hr, 4hr
-            stats = self.feed.get_stats(window_minutes=minutes)
+            stats = self.feed.get_stats(window_minutes=minutes, include_estimated=False)
             table.add_row(
                 label,
                 fmt_usd(stats["long_volume_usd"]),
                 fmt_usd(stats["short_volume_usd"]),
             )
 
-        # Add last 3 recent events
-        recent = self.feed.get_recent(minutes=60)[:3]
+        # Add last 3 confirmed events
+        recent = [ev for ev in self.feed.get_recent(minutes=60) if getattr(ev, "confirmed", True)][:3]
         recent_lines = Text()
         if recent:
             for ev in recent:
@@ -362,7 +374,7 @@ class LiquidationStreamDashboard:
 
         header = self.build_header()
         title_text = Text(
-            "  BTC LIQUIDATION TOTALS  ALL EXCHANGES  ",
+            "  LIQUIDATION TOTALS  ALL EXCHANGES  ",
             style="bold bright_cyan on grey11",
         )
 

@@ -254,7 +254,7 @@ class AlertManager:
         # ── 2. Liquidations (4h window) ────────────────────────────
         lines.append("💥 LIQUIDATIONS (4h)")
         try:
-            liq_stats = hub.liquidations.get_stats(window_minutes=240)
+            liq_stats = hub.liquidations.get_stats(window_minutes=240, include_estimated=False)
             total_count = liq_stats["total_count"]
             total_vol = liq_stats["total_volume_usd"]
             long_c = liq_stats["long_count"]
@@ -272,7 +272,7 @@ class AlertManager:
             cutoff = time.time() - 240 * 60
             top_liq = None
             for ev in hub.liquidations.events:
-                if ev.timestamp < cutoff:
+                if ev.timestamp < cutoff or not getattr(ev, "confirmed", True):
                     continue
                 if top_liq is None or ev.size_usd > top_liq.size_usd:
                     top_liq = ev

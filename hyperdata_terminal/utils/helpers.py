@@ -100,6 +100,18 @@ def format_pct_value(value: float) -> str:
     return f"{value:.2f}%"
 
 
+def format_distance_pct(value: float) -> str:
+    """Format a distance-to-liquidation that is already a percentage.
+
+    Cross-margined whales routinely sit hundreds of percent from liquidation
+    (or have none at all: inf); past 999% the exact figure is noise, so it is
+    capped instead of printing '+97058.45%'.
+    """
+    if value != value or value == float("inf") or value > 999:
+        return ">999%"
+    return f"{value:.2f}%"
+
+
 class RateLimiter:
     """Async rate limiter using a token-bucket algorithm."""
 

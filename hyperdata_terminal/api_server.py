@@ -910,6 +910,9 @@ class HyperDataAPI:
                     "net_volume": snap.buy_volume - snap.sell_volume,
                     "trade_count": snap.trade_count,
                     "ofi": snap.ofi, "signal": snap.signal,
+                    # Share of the window covered by data; < 0.95 means the
+                    # timeframe is still warming up after start.
+                    "coverage": round(snap.coverage, 3),
                 }
         # Per-venue attribution: `cumulative_cvd` stays the combined figure
         # for back-compat, but it is never returned alone — a consumer can
@@ -949,7 +952,10 @@ class HyperDataAPI:
 
     async def handle_liquidation_stats(self, request: web.Request) -> web.Response:
         minutes = _int_param(request, "minutes", 60, minimum=1, maximum=10080)
-        stats = self.hub.liquidations.get_stats(window_minutes=minutes)
+        # ?include_estimated=false drops Hyperliquid large prints (heuristic)
+        # from every total; default true keeps the pre-existing response.
+        include_estimated = request.query.get("include_estimated", "true").lower() not in ("0", "false", "no")
+        stats = self.hub.liquidations.get_stats(window_minutes=minutes, include_estimated=include_estimated)
         return web.json_response(stats)
 
     async def handle_funding_rates(self, request: web.Request) -> web.Response:

@@ -80,11 +80,14 @@ def exchange_coverage() -> dict[str, dict[str, str]]:
             "note": "Real liquidation-orders feed across all SWAP instruments.",
         },
         "hyperliquid": {
-            "method": "heuristic",
+            "method": "partial",
             "note": (
-                f"Hyperliquid has no liquidation feed; events are inferred from "
-                f"trades >= ${HL_LIQUIDATION_MIN_USD:,.0f} and may include "
-                f"non-liquidation fills."
+                "Hyperliquid has no public liquidation feed. Confirmed events are "
+                "liquidations an HLP vault absorbed (Hyperliquid flags those fills; "
+                "polled every ~2 min), so liquidations filled by other traders are "
+                f"missed. Separately, trades >= ${HL_LIQUIDATION_MIN_USD:,.0f} are "
+                "reported as estimated 'large prints' (confirmed=false): most are "
+                "ordinary trades, so they are excluded from confirmed totals."
             ),
         },
     }
@@ -528,7 +531,15 @@ class LiquidationFeed:
             except Exception:
                 logger.exception("callback error")
 
-    def get_stats(self, window_minutes: int = 60) -> dict[str, Any]:
+    def get_stats(self, window_minutes: int = 60, include_estimated: bool = True) -> dict[str, Any]:
+        """Aggregate liquidations in the window.
+
+        include_estimated=False drops heuristic events (Hyperliquid large
+        prints) from every total, side and breakdown; confirmed_* and
+        heuristic_* are reported either way. The terminal always passes
+        False for headline numbers; the API keeps True for compatibility and
+        exposes ``include_estimated`` as a query parameter.
+        """
         cutoff = time.time() - (window_minutes * 60)
         totals = _TimeWindow()
         by_exchange: dict[str, _TimeWindow] = {}
@@ -543,14 +554,16 @@ class LiquidationFeed:
             if ev.timestamp < cutoff:
                 continue
 
-            totals.count += 1
-            totals.volume_usd += ev.size_usd
             if getattr(ev, "confirmed", True):
                 confirmed_count += 1
                 confirmed_volume_usd += ev.size_usd
             else:
                 heuristic_count += 1
                 heuristic_volume_usd += ev.size_usd
+                if not include_estimated:
+                    continue
+            totals.count += 1
+            totals.volume_usd += ev.size_usd
             if ev.side == "long":
                 totals.long_count += 1
                 totals.long_volume += ev.size_usd
