@@ -191,3 +191,28 @@ def test_budget_env_is_clamped_to_the_ip_limit(monkeypatch):
     assert HLRateGovernor().budget_per_min == 1200
     monkeypatch.setenv("HYPERDATA_HL_WEIGHT_PER_MIN", "junk")
     assert HLRateGovernor().budget_per_min == 1000
+
+
+@pytest.mark.asyncio
+async def test_item_weighted_requests_prepay_the_worst_case_then_settle():
+    """Charging per item weight only after the response let several userFills
+    in flight push a live window past the budget (peak 1094 of 1000 in a
+    smoke run); the worst case is reserved first and refunded after."""
+    from hyperdata_terminal.data_layer.hl_rate import prepaid_weight
+
+    assert prepaid_weight({"type": "userFills"}) == 120
+    assert prepaid_weight({"type": "clearinghouseState"}) == 2
+    gov, _ = _gov(budget=300.0)
+    hl_rate.reset_governor(gov)
+    peaks = []
+
+    class _Slow(_Resp):
+        async def json(self):
+            peaks.append(gov.used_last_minute())
+            await asyncio.sleep(0)
+            return self._data
+
+    session = _Session(_Slow(200, [{}] * 10))
+    await asyncio.gather(*(hl_rate.hl_info(session, {"type": "userFills"}, component="hlp") for _ in range(2)))
+    assert max(peaks) <= 300.0          # two prepaid 120s fit; a third would have waited
+    assert gov.used_last_minute() == 2 * 20  # settled to 20 + 10 // 20 each

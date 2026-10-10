@@ -81,6 +81,20 @@ STALE_INSTANCE_SECONDS = 20.0
 MAX_BACKOFF_SECONDS = 60.0
 
 
+# Item counts to prepay for before the response says how many came back:
+# a full userFills / userFillsByTime page is 2000 fills (+100 weight).
+# Prepaying the worst case keeps the window from overshooting the budget
+# when several such requests are in flight; settle() refunds the rest.
+PREPAY_ITEMS = {"userFills": 2000, "userFillsByTime": 2000, "recentTrades": 40}
+
+
+def prepaid_weight(payload: dict) -> int:
+    """Weight reserved before a request: the base plus the worst case items."""
+    typ = str(payload.get("type", ""))
+    items = PREPAY_ITEMS.get(typ, 0)
+    return request_weight(payload) + (items // 20 if typ in PER_20_ITEM_TYPES else items // 60)
+
+
 def request_weight(payload: dict) -> int:
     """The weight Hyperliquid charges up front for an info request."""
     typ = str(payload.get("type", ""))
@@ -174,7 +188,8 @@ class HLRateGovernor:
         self.registry_dir = registry_dir
         self._clock = clock
         self._sleep = sleep or asyncio.sleep
-        self._window: deque[tuple[float, float, str]] = deque()
+        # [time, weight, component]; lists so a prepaid estimate can be settled.
+        self._window: deque[list] = deque()
         self._used = 0.0
         self.active_elastic: set[str] = set(ELASTIC_WEIGHTS)
         self.paused_until = 0.0
@@ -276,26 +291,41 @@ class HLRateGovernor:
             return 0.25
         return 0.0
 
-    async def acquire(self, weight: float, component: str = "other") -> None:
-        """Wait until `weight` fits this process's budget, then charge it."""
+    async def acquire(self, weight: float, component: str = "other") -> list:
+        """Wait until `weight` fits this process's budget, then charge it.
+
+        Returns the window entry, so a request whose real weight is only
+        known from the response (per item) can settle() it afterwards."""
         started = None
         while True:
             now = self._clock()
             wait = self._wait_seconds(weight, component, now)
             if wait <= 0:
-                self._charge(weight, component, now)
+                entry = self._charge(weight, component, now)
                 if started is not None:
                     self.waited_seconds += now - started
-                return
+                return entry
             if started is None:
                 started = now
             await self._sleep(min(wait, 5.0))
 
-    def _charge(self, weight: float, component: str, now: float | None = None) -> None:
+    def _charge(self, weight: float, component: str, now: float | None = None) -> list:
         now = self._clock() if now is None else now
-        self._window.append((now, float(weight), component))
+        entry = [now, float(weight), component]
+        self._window.append(entry)
         self._used += weight
         self.weight_by_component[component] = self.weight_by_component.get(component, 0.0) + weight
+        return entry
+
+    def settle(self, entry: list, actual: float) -> None:
+        """Replace a prepaid estimate with the weight actually charged."""
+        diff = float(actual) - entry[1]
+        if not diff:
+            return
+        entry[1] = float(actual)
+        if entry in self._window:  # still inside the window
+            self._used += diff
+        self.weight_by_component[entry[2]] = self.weight_by_component.get(entry[2], 0.0) + diff
 
     def charge(self, weight: float, component: str = "other") -> None:
         """Add weight Hyperliquid charged after answering (per item returned)."""
@@ -486,7 +516,7 @@ async def hl_info(
     aiohttp.ClientResponseError on any other non-2xx answer.
     """
     gov = get_governor()
-    await gov.acquire(request_weight(payload), component)
+    entry = await gov.acquire(prepaid_weight(payload), component)
     gov.requests_total += 1
     async with session.post(
         HL_INFO_URL, json=payload, headers={"Content-Type": "application/json"},
@@ -501,5 +531,5 @@ async def hl_info(
             resp.raise_for_status()
         data = await resp.json()
     gov.on_success()
-    gov.charge(response_extra_weight(payload, data), component)
+    gov.settle(entry, request_weight(payload) + response_extra_weight(payload, data))
     return data
