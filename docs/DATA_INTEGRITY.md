@@ -406,6 +406,15 @@ requests are rate-limited per client IP, and WebSocket clients get bounded
 per-client send queues plus inbound message size/rate limits. Numeric query
 params are validated (bad values return `400`, not `500`).
 
+The settings that control this (`HYPERDATA_API_HOST`, `HYPERDATA_API_PORT`,
+`HYPERDATA_API_KEY`, `HYPERDATA_UNSAFE_PUBLIC_API`, `HYPERDATA_CORS_ORIGINS`),
+the data dir and `LLM_BASE_URL` are read only from the environment or the
+data dir's `.env`, never from a `.env` in the working directory: a cloned
+repository's `.env` (and an MCP server runs in whatever project the client
+has open) cannot bind the API to every interface or send the user's
+`LLM_API_KEY` to another server. The `llm_agent` strategy sends its key only
+over https or to a server on this machine, judged by the parsed host.
+
 ## Timestamps
 
 Liquidation, order-flow, and funding-rate records use **exchange event time**

@@ -347,7 +347,11 @@ def test_cli_import_does_not_resolve_the_data_dir():
     assert out.stdout.strip() == "False"
 
 
-def test_env_file_sets_the_data_dir(tmp_path, monkeypatch):
+def test_cwd_env_file_cannot_move_the_data_dir(tmp_path, monkeypatch):
+    """A .env in the working directory (a cloned repository, or whatever
+    project an MCP client has open) used to be able to point the data dir
+    anywhere; that, the API bind and the LLM endpoint now come only from the
+    environment or the data dir's own .env."""
     target = tmp_path / "from-dotenv"
     (tmp_path / ".env").write_text(f"HYPERDATA_DATA_DIR={target}\n")
     code = (
@@ -361,7 +365,8 @@ def test_env_file_sets_the_data_dir(tmp_path, monkeypatch):
     env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1])}
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True,
                          cwd=tmp_path, env=env)
-    assert out.stdout.strip() == str(target)
+    assert out.stdout.strip() != str(target)
+    assert "ignored HYPERDATA_DATA_DIR" in out.stderr
 
 
 async def test_api_command_fails_loudly_when_the_port_is_taken(monkeypatch, capsys):

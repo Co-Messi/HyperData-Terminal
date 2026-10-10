@@ -25,8 +25,8 @@ from pathlib import Path
 from hyperdata_terminal import __version__
 
 # hyperdata_terminal.paths resolves the data dir once, at import, from
-# HYPERDATA_DATA_DIR. It is imported lazily, after .env is loaded, so the
-# variable works from a .env file too.
+# HYPERDATA_DATA_DIR, which only the real environment (or the data dir's own
+# .env, for nothing but the other settings) may set; see envfile.
 
 DASHBOARD_HELP = {
     "liq": "BTC positions closest to liquidation",
@@ -55,13 +55,23 @@ def _setup_logging() -> Path:
     return log_file
 
 
+_IGNORED_ENV_KEYS: list[str] = []
+
+
 def _load_env() -> None:
-    """Read ``.env`` from the working directory (LLM keys, alert webhooks)."""
-    try:
-        from dotenv import load_dotenv
-    except ImportError:  # pragma: no cover - python-dotenv is a hard dependency
-        return
-    load_dotenv(Path.cwd() / ".env", override=False)
+    """Read ``.env`` from the working directory and the data dir (see
+    envfile: the working directory's file cannot set network exposure, the
+    data dir or the LLM endpoint)."""
+    from hyperdata_terminal.envfile import load_env
+
+    ignored = load_env()
+    _IGNORED_ENV_KEYS[:] = ignored
+    if ignored:
+        print(
+            f"hyperdata: ignored {', '.join(sorted(ignored))} from ./.env: these are read only from the "
+            "environment or the data dir's .env",
+            file=sys.stderr,
+        )
 
 
 def _api_port(args: argparse.Namespace) -> int | None:
@@ -279,6 +289,11 @@ def main(argv: list[str] | None = None) -> None:
     _load_env()
     args = build_parser().parse_args(argv)
     _setup_logging()
+    if _IGNORED_ENV_KEYS:
+        logging.getLogger(__name__).warning(
+            "Ignored %s from %s: network exposure, the data dir and LLM_BASE_URL are read only from "
+            "the environment or <data dir>/.env", ", ".join(sorted(_IGNORED_ENV_KEYS)), Path.cwd() / ".env",
+        )
     boot = not getattr(args, "no_boot", False)
     command = args.command
 

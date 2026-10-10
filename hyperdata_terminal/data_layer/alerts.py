@@ -36,11 +36,8 @@ import time
 from dataclasses import dataclass
 
 import aiohttp
-from dotenv import load_dotenv
 
 from hyperdata_terminal.data_layer.cascade import CascadeDetector, WindowTotals
-
-load_dotenv()
 
 logger = logging.getLogger(__name__)
 

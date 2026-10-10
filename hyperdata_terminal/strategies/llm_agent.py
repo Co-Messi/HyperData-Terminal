@@ -5,10 +5,14 @@ Sends a market data summary to any OpenAI-compatible API and asks for a
 BUY / SELL / HOLD decision. Works with any OpenAI-compatible API:
 OpenAI, Ollama, LM Studio, Groq, Together, etc.
 
-Configure via environment variables (or .env file):
+Configure via environment variables (the ``hyperdata`` command also reads
+``.env``; LLM_BASE_URL only from the environment or the data dir's .env):
     LLM_BASE_URL  — API base URL   (default: http://localhost:11434/v1)
     LLM_MODEL     — Model name     (default: llama3)
     LLM_API_KEY   — API key        (default: empty, not needed for Ollama)
+
+The key is sent only over https, or to a local server (localhost, 127.0.0.1
+or ::1) over plain http.
 
 Transport model (H3): the request is a plain aiohttp call awaited under
 asyncio.wait_for, so a timeout actually CANCELS the in-flight request —
@@ -20,11 +24,13 @@ one is running is skipped, not queued.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import logging
 import os
 import time
 from collections import deque
+from urllib.parse import urlsplit
 
 import aiohttp
 
@@ -32,12 +38,24 @@ from .base import Signal, Strategy
 
 logger = logging.getLogger(__name__)
 
-# Try to load .env if python-dotenv is installed (optional dependency)
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
+
+def is_local_url(url: str) -> bool:
+    """True if the URL's host is this machine (localhost, 127.x, ::1).
+
+    Parses the host instead of searching the string: "localhost" in
+    https://localhost.evil.example is not local, http://127.0.0.1:1234
+    (LM Studio) is.
+    """
+    try:
+        host = (urlsplit(url).hostname or "").lower()
+    except ValueError:
+        return False
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 # System prompt sent to the LLM
 SYSTEM_PROMPT = (
@@ -112,11 +130,19 @@ class LLMAgent(Strategy):
         evaluation is still in flight this tick is skipped (no budget slot
         consumed) rather than queued behind it.
         """
+        local = is_local_url(self.base_url)
         # If no API key and not using a local model, warn and skip
-        if not self.api_key and "localhost" not in self.base_url:
+        if not self.api_key and not local:
             logger.warning(
-                "LLM_API_KEY not set and not using localhost — skipping LLM agent. "
-                "Set LLM_BASE_URL, LLM_MODEL, and LLM_API_KEY in your .env file."
+                "LLM_API_KEY not set and LLM_BASE_URL is not a local server — skipping LLM agent. "
+                "Set LLM_BASE_URL, LLM_MODEL and LLM_API_KEY."
+            )
+            return None
+        # Never send the key in the clear to another machine.
+        if self.api_key and not local and urlsplit(self.base_url).scheme.lower() != "https":
+            logger.error(
+                "Refusing to send LLM_API_KEY over plain http to %s; use https or a local server",
+                urlsplit(self.base_url).hostname,
             )
             return None
 
