@@ -12,6 +12,7 @@ import pytest
 
 from hyperdata_terminal.data_layer import address_store
 from hyperdata_terminal.data_layer.position_scanner import PositionScanner, TrackedPosition
+from tests.fixture_data import load_fixture
 
 # ── Fixtures ─────────────────────────────────────────────────────
 
@@ -61,14 +62,6 @@ def _mock_session(json_payload) -> MagicMock:
 
 MOCK_ALL_MIDS = {"BTC": "71000.0", "ETH": "3500.0", "SOL": "150.0"}
 
-MOCK_META = {
-    "universe": [
-        {"name": "BTC", "maintenanceMarginRatio": "0.03"},
-        {"name": "ETH", "maintenanceMarginRatio": "0.03"},
-        {"name": "SOL", "maintenanceMarginRatio": "0.05"},
-    ]
-}
-
 MOCK_CLEARINGHOUSE_STATE = {
     "assetPositions": [
         {
@@ -112,54 +105,6 @@ class TestTrackedPosition:
         assert p.side == "short"
         assert p.symbol == "ETH"
         assert p.distance_pct == 1.5
-
-
-class TestLiquidationPriceCalculation:
-    def test_long_liq_price(self):
-        scanner = PositionScanner()
-        scanner.market_meta = MOCK_META
-        liq = scanner._calculate_liq_price("long", 70_000.0, 10.0, "BTC")
-        # liq = 70000 * (1 - 1/10 + 0.03/10) = 70000 * 0.903 = 63210
-        assert abs(liq - 63_210.0) < 0.01
-
-    def test_short_liq_price(self):
-        scanner = PositionScanner()
-        scanner.market_meta = MOCK_META
-        liq = scanner._calculate_liq_price("short", 70_000.0, 10.0, "BTC")
-        # liq = 70000 * (1 + 1/10 - 0.03/10) = 70000 * 1.097 = 76790
-        assert abs(liq - 76_790.0) < 0.01
-
-    def test_zero_leverage_returns_zero(self):
-        scanner = PositionScanner()
-        scanner.market_meta = MOCK_META
-        assert scanner._calculate_liq_price("long", 70_000.0, 0.0, "BTC") == 0.0
-
-    def test_unknown_coin_uses_default_mm(self):
-        scanner = PositionScanner()
-        scanner.market_meta = MOCK_META
-        liq = scanner._calculate_liq_price("long", 100.0, 5.0, "UNKNOWN")
-        # default mm = 0.03, liq = 100 * (1 - 1/5 + 0.03/5) = 100 * 0.806 = 80.6
-        assert abs(liq - 80.6) < 0.01
-
-    def test_high_mm_sol(self):
-        scanner = PositionScanner()
-        scanner.market_meta = MOCK_META
-        liq = scanner._calculate_liq_price("long", 150.0, 10.0, "SOL")
-        # mm=0.05, liq = 150 * (1 - 0.1 + 0.005) = 150 * 0.905 = 135.75
-        assert abs(liq - 135.75) < 0.01
-
-
-class TestMaintenanceMarginLookup:
-    def test_known_coin(self):
-        scanner = PositionScanner()
-        scanner.market_meta = MOCK_META
-        assert scanner._get_maintenance_margin("BTC") == 0.03
-        assert scanner._get_maintenance_margin("SOL") == 0.05
-
-    def test_unknown_coin_defaults(self):
-        scanner = PositionScanner()
-        scanner.market_meta = MOCK_META
-        assert scanner._get_maintenance_margin("MEME") == 0.03
 
 
 class TestFilterMethods:
@@ -290,7 +235,6 @@ class TestGetPositionsForAddress:
     async def test_parses_clearinghouse_state(self):
         scanner = PositionScanner()
         scanner.market_prices = {"BTC": 71_000.0, "ETH": 3_500.0}
-        scanner.market_meta = MOCK_META
         scanner._session = _mock_session(MOCK_CLEARINGHOUSE_STATE)
 
         positions = await scanner.get_positions_for_address(_addr("fed"))
@@ -312,39 +256,65 @@ class TestGetPositionsForAddress:
     async def test_empty_positions(self):
         scanner = PositionScanner()
         scanner.market_prices = {}
-        scanner.market_meta = MOCK_META
         scanner._session = _mock_session({"assetPositions": [], "marginSummary": {}})
 
         positions = await scanner.get_positions_for_address(_addr("e"))
         assert positions == []
 
-    @pytest.mark.asyncio
-    async def test_fallback_liq_price_when_missing(self):
-        state = {
-            "assetPositions": [
-                {
-                    "position": {
-                        "coin": "BTC",
-                        "szi": "1.0",
-                        "entryPx": "70000",
-                        "positionValue": "70000",
-                        "unrealizedPnl": "0",
-                        "leverage": {"type": "cross", "value": 10},
-                        "liquidationPx": None,
-                    }
-                }
-            ],
-            "marginSummary": {"totalMarginUsed": "7000"},
+    @staticmethod
+    def _marks(state: dict) -> dict[str, float]:
+        """Mark prices implied by the captured payload itself (value / size)."""
+        return {
+            ap["position"]["coin"]: float(ap["position"]["positionValue"]) / abs(float(ap["position"]["szi"]))
+            for ap in state["assetPositions"]
         }
 
+    @pytest.mark.asyncio
+    async def test_null_liquidation_px_is_no_liquidation_price(self):
+        """Captured cross account: Hyperliquid reports liquidationPx null for
+        18 of its 28 positions (all longs). Null means no price liquidates
+        them; the scanner used to invent an isolated-margin level instead
+        (BTC long at 40x read ~0.3% from liquidation)."""
+        state = load_fixture("hyperliquid/clearinghouse_cross_null_liquidation_px.json")
         scanner = PositionScanner()
-        scanner.market_prices = {"BTC": 70_000.0}
-        scanner.market_meta = MOCK_META
+        scanner.market_prices = self._marks(state)
         scanner._session = _mock_session(state)
 
         positions = await scanner.get_positions_for_address(_addr("f"))
-        assert len(positions) == 1
-        assert abs(positions[0].liq_price - 63_210.0) < 0.01
+
+        raw = {ap["position"]["coin"]: ap["position"]["liquidationPx"] for ap in state["assetPositions"]}
+        nulls = [p for p in positions if raw[p.symbol] is None]
+        assert len(nulls) == 18
+        for p in nulls:
+            assert p.liq_price is None and not p.has_liq_price
+            assert p.distance_pct == float("inf")
+            assert p.margin_mode == "cross"
+        numeric = [p for p in positions if raw[p.symbol] is not None]
+        assert all(p.liq_price == float(raw[p.symbol]) for p in numeric)
+
+        scanner.positions = positions
+        assert not any(p in nulls for p in scanner.get_danger_zone(threshold_pct=100.0))
+        assert scanner.get_closest_longs(50) == [p for p in scanner.get_closest_longs(50) if p.has_liq_price]
+        assert scanner.get_zone_summary()["within_5pct"]["count"] == sum(
+            1 for p in numeric if 0 <= p.distance_pct <= 5
+        )
+
+    @pytest.mark.asyncio
+    async def test_numeric_liquidation_px_cross_short_and_isolated_long(self):
+        for name, side, mode in (
+            ("hyperliquid/clearinghouse_cross_short_numeric.json", "short", "cross"),
+            ("hyperliquid/clearinghouse_isolated_long.json", "long", "isolated"),
+        ):
+            state = load_fixture(name)
+            scanner = PositionScanner()
+            scanner.market_prices = self._marks(state)
+            scanner._session = _mock_session(state)
+            (pos,) = await scanner.get_positions_for_address(_addr("a"))
+            raw = state["assetPositions"][0]["position"]
+            assert pos.side == side and pos.margin_mode == mode
+            assert pos.liq_price == float(raw["liquidationPx"])
+            # Signed distance, positive on the safe side.
+            assert pos.distance_pct > 0
 
 
 class TestDiscoverAddresses:
@@ -379,44 +349,29 @@ class TestUpdatePrices:
         assert scanner.market_prices["SOL"] == 150.0
 
 
-class TestUpdateMeta:
-    @pytest.mark.asyncio
-    async def test_update_meta(self):
-        scanner = PositionScanner()
-        scanner._session = _mock_session(MOCK_META)
-
-        await scanner.update_meta()
-        assert scanner.market_meta == MOCK_META
-        assert scanner._meta_updated_at > 0
-
-    @pytest.mark.asyncio
-    async def test_meta_caching(self):
-        scanner = PositionScanner()
-        scanner.market_meta = MOCK_META
-        scanner._meta_updated_at = float("inf")
-
-        mock_session = MagicMock()
-        mock_session.post = MagicMock()
-        scanner._session = mock_session
-
-        await scanner.update_meta()
-        mock_session.post.assert_not_called()
-
-
 class TestDistanceCalculation:
-    def test_distance_for_long(self):
-        # liq at 63500, current at 70000
-        # distance = |70000 - 63500| / 70000 * 100 = 9.2857%
-        current = 70_000.0
-        liq = 63_500.0
-        expected = abs(current - liq) / current * 100
-        assert abs(expected - 9.2857) < 0.01
+    """Distance is signed: positive on the safe side, negative once crossed."""
 
-    def test_distance_for_short(self):
-        current = 3_500.0
-        liq = 3_740.0
-        expected = abs(current - liq) / current * 100
-        assert abs(expected - 6.857) < 0.01
+    def test_long_above_liquidation_is_positive(self):
+        from hyperdata_terminal.data_layer.position_scanner import liquidation_distance_pct
+
+        assert liquidation_distance_pct("long", 70_000.0, 63_500.0) == pytest.approx(9.2857, abs=1e-3)
+
+    def test_short_below_liquidation_is_positive(self):
+        from hyperdata_terminal.data_layer.position_scanner import liquidation_distance_pct
+
+        assert liquidation_distance_pct("short", 3_500.0, 3_740.0) == pytest.approx(6.857, abs=1e-3)
+
+    def test_crossed_long_is_negative(self):
+        from hyperdata_terminal.data_layer.position_scanner import liquidation_distance_pct
+
+        # Mark already below the long's liquidation price.
+        assert liquidation_distance_pct("long", 63_250.0, 63_500.0) < 0
+
+    def test_no_liquidation_price_is_infinite(self):
+        from hyperdata_terminal.data_layer.position_scanner import liquidation_distance_pct
+
+        assert liquidation_distance_pct("long", 70_000.0, None) == float("inf")
 
 
 class TestRateLimiter:

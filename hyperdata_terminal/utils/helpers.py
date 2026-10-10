@@ -120,13 +120,20 @@ def source_cooldown_seconds(exc: BaseException) -> float:
 
 
 def format_distance_pct(value: float) -> str:
-    """Format a distance-to-liquidation that is already a percentage.
+    """Format a signed distance-to-liquidation that is already a percentage.
 
-    Cross-margined whales routinely sit hundreds of percent from liquidation
-    (or have none at all: inf); past 999% the exact figure is noise, so it is
-    capped instead of printing '+97058.45%'.
+    inf means Hyperliquid reports no liquidation price ("none"), a negative
+    value means the price has already crossed it ("crossed"). Cross-margined
+    whales routinely sit hundreds of percent away; past 999% the exact figure
+    is noise, so it is capped instead of printing '97058.45%'.
     """
-    if value != value or value == float("inf") or value > 999:
+    if value != value:
+        return "n/a"
+    if value == float("inf"):
+        return "none"
+    if value < 0:
+        return "crossed"
+    if value > 999:
         return ">999%"
     return f"{value:.2f}%"
 

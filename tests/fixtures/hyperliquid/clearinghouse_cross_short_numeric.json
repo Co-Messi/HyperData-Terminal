@@ -1,0 +1,49 @@
+{
+ "_meta": {
+  "source": "POST https://api.hyperliquid.xyz/info {\"type\": \"clearinghouseState\"}",
+  "captured": "2026-10-10",
+  "note": "cross short with a numeric liquidationPx"
+ },
+ "payload": {
+  "marginSummary": {
+   "accountValue": "37331.427627",
+   "totalNtlPos": "669293.40564",
+   "totalRawUsd": "706624.833267",
+   "totalMarginUsed": "35225.968717"
+  },
+  "crossMarginSummary": {
+   "accountValue": "37331.427627",
+   "totalNtlPos": "669293.40564",
+   "totalRawUsd": "706624.833267",
+   "totalMarginUsed": "35225.968717"
+  },
+  "crossMaintenanceMarginUsed": "8366.16757",
+  "withdrawable": "0.0",
+  "assetPositions": [
+   {
+    "type": "oneWay",
+    "position": {
+     "coin": "BTC",
+     "szi": "-8.10793",
+     "leverage": {
+      "type": "cross",
+      "value": 19
+     },
+     "entryPx": "82587.6",
+     "positionValue": "669293.40564",
+     "unrealizedPnl": "321.38337",
+     "returnOnEquity": "0.0091190997",
+     "liquidationPx": "86076.3560974667",
+     "marginUsed": "35225.968717",
+     "maxLeverage": 40,
+     "cumFunding": {
+      "allTime": "-12872.186545",
+      "sinceOpen": "-1137.87342",
+      "sinceChange": "0.0"
+     }
+    }
+   }
+  ],
+  "time": 1791594374932
+ }
+}

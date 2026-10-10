@@ -54,7 +54,9 @@ def compute_zone_breakdown(positions: list[TrackedPosition]) -> list[dict]:
     for z in zones:
         lc = lv = sc = sv = 0
         for p in positions:
-            if p.distance_pct <= z["threshold"]:
+            # Only real, uncrossed liquidation prices: a crossed position is
+            # past liquidation (stale cache), not "near" it.
+            if p.near_liquidation(z["threshold"]):
                 if p.side == "long":
                     lc += 1
                     lv += p.size_usd
@@ -208,8 +210,9 @@ class LiquidationWatchDashboard:
 
     def build_closest_positions_table(self, n: int = 3) -> Table:
         """Build the closest-to-liquidation table (N longs + N shorts)."""
-        longs = [p for p in self.positions if p.side == "long"][:n]
-        shorts = [p for p in self.positions if p.side == "short"][:n]
+        ranked = [p for p in self.positions if p.has_liq_price and not p.crossed]
+        longs = [p for p in ranked if p.side == "long"][:n]
+        shorts = [p for p in ranked if p.side == "short"][:n]
 
         table = Table(
             title=f"\U0001f3af {n} CLOSEST LONGS + {n} CLOSEST SHORTS TO LIQUIDATION",
@@ -252,7 +255,7 @@ class LiquidationWatchDashboard:
                 side_text,
                 Text(fmt_usd(pos.size_usd), style="bright_white"),
                 Text(fmt_price(pos.entry_price), style="bright_white"),
-                Text(fmt_price(pos.liq_price), style="bright_white"),
+                Text(fmt_price(pos.liq_price) if pos.has_liq_price else "none", style="bright_white"),
                 Text(fmt_distance(pos.distance_pct), style=dist_style),
                 Text(pnl_str, style=pnl_style),
                 Text(f"{pos.leverage:.0f}x", style="dim bright_white"),
@@ -338,8 +341,9 @@ class LiquidationWatchDashboard:
         table.add_column("PnL", justify="right", min_width=8)
         table.add_column("LVG", justify="right", width=4)
 
-        longs = [p for p in self.positions if p.side == "long"][:3]
-        shorts = [p for p in self.positions if p.side == "short"][:3]
+        ranked = [p for p in self.positions if p.has_liq_price and not p.crossed]
+        longs = [p for p in ranked if p.side == "long"][:3]
+        shorts = [p for p in ranked if p.side == "short"][:3]
 
         for pos in longs + shorts:
             side_style = "bold bright_green" if pos.side == "long" else "bold bright_red"

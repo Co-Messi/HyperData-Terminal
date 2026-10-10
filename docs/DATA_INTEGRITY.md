@@ -179,6 +179,31 @@ the first few minutes, and the panel says so while they do. Without the
 budget, a batch of wallets drew HTTP 429s, and because the limit is shared,
 going over it puts the scanner and the HLP tracker at risk too.
 
+## Liquidation prices and distances
+
+Liquidation prices are Hyperliquid's own `liquidationPx` from
+`clearinghouseState`, never an estimate.
+
+- **No liquidation price.** Hyperliquid returns `liquidationPx: null` when no
+  price liquidates the position: the account's equity covers it all the way
+  down. In a live sample of 1,382 positions across 65 active wallets, 598
+  of 613 cross-margin longs were null (no short and no isolated position
+  was). Such a position has `liq_price: null` (API, MCP) and a distance of
+  "none"; it never appears in the danger zone, the liquidation heatmap or
+  `get_positions_near_liquidation`. Earlier builds replaced null with an
+  isolated-margin formula on the leverage setting, which put a 40x cross
+  long that cannot be liquidated "0.3% from liquidation".
+- **Signed distance.** `distance_pct` is positive while a long is above (a
+  short below) its liquidation price and negative once the price has
+  crossed it. A crossed position is being, or already was, liquidated; its
+  cached state is out of date until its wallet is scanned again. Crossed
+  positions are excluded from every "near liquidation" view and counted
+  separately (`crossed_liquidation_price` in the MCP tool, "crossed" in the
+  panels).
+- For a cross-margin position the liquidation price moves with the rest of
+  the account, so between scans the distance is recomputed from a fresh
+  mark against a liquidation price as of `scanned_at`.
+
 ## Staleness watchdog (frozen feeds never read as live)
 
 Every WebSocket feed connects with `heartbeat=20`, so a half-open TCP connection

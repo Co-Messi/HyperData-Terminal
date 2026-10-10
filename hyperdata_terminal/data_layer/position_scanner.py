@@ -16,7 +16,6 @@ logger = logging.getLogger(__name__)
 API_URL = "https://api.hyperliquid.xyz/info"
 
 RATE_LIMIT_PER_SEC = 10
-META_CACHE_TTL = 300  # 5 minutes
 
 # Per-cycle address budget (H4). scan() used to walk EVERY tracked address
 # at 10 req/s, so cycle time grew linearly with the store — 50k addresses
@@ -45,7 +44,7 @@ BATCH_SLEEP_SECONDS = 1.0
 # so a broken endpoint still surfaces as staleness, not as a slow cycle.)
 BATCH_LATENCY_ALLOWANCE_SECONDS = 1.0
 
-# Allowance per cycle for the allMids/meta refresh that precedes the batches.
+# Allowance per cycle for the allMids refresh that precedes the batches.
 CYCLE_OVERHEAD_ALLOWANCE_SECONDS = 1.0
 
 # Address discovery: every DISCOVERY_INTERVAL_SECONDS scan() pulls recent
@@ -74,7 +73,7 @@ def scan_cycle_seconds_worst_case(
 ) -> float:
     """Wall-clock seconds one hub scan cycle takes when every request is
     answered within its latency allowance: the batches, the sleeps between
-    them, the price/meta refresh and the hub's idle interval."""
+    them, the price refresh and the hub's idle interval."""
     batches = -(-budget // RATE_LIMIT_PER_SEC)
     return (
         batches * BATCH_LATENCY_ALLOWANCE_SECONDS
@@ -112,6 +111,20 @@ POSITION_STALE_AFTER_SECONDS = float(math.ceil(full_pass_seconds_worst_case() * 
 HTTP_TIMEOUT = aiohttp.ClientTimeout(total=10, connect=3, sock_connect=3, sock_read=5)
 
 
+def liquidation_distance_pct(side: str, price: float, liq_price: float | None) -> float:
+    """Signed distance from `price` to the liquidation price, in percent.
+
+    Positive while the position is on the safe side of its liquidation
+    price (a long above it, a short below it), negative once the price has
+    crossed it. ``inf`` when there is no liquidation price, or no price.
+    """
+    if liq_price is None or not price > 0:
+        return math.inf
+    if side == "long":
+        return (price - liq_price) / price * 100
+    return (liq_price - price) / price * 100
+
+
 @dataclass
 class TrackedPosition:
     address: str
@@ -120,7 +133,12 @@ class TrackedPosition:
     size_usd: float
     entry_price: float
     current_price: float
-    liq_price: float
+    # Hyperliquid's own liquidation price. None when Hyperliquid reports
+    # none (``liquidationPx: null``: the account's equity covers the
+    # position at any price); nothing is ever estimated in its place.
+    liq_price: float | None
+    # Signed (see liquidation_distance_pct): negative means the price has
+    # already crossed the liquidation price; inf means there is none.
     distance_pct: float
     leverage: float
     unrealized_pnl: float
@@ -129,6 +147,22 @@ class TrackedPosition:
     # current_price/distance_pct may be newer (recomputed from fresh mids);
     # size, entry, liq price and PnL are as of this moment.
     scanned_at: float = 0.0
+    # "cross" or "isolated", from Hyperliquid's leverage object.
+    margin_mode: str = ""
+
+    @property
+    def has_liq_price(self) -> bool:
+        return self.liq_price is not None
+
+    @property
+    def crossed(self) -> bool:
+        """The price is past the liquidation price: the position is being
+        (or already was) liquidated and the cached state is out of date."""
+        return self.distance_pct < 0
+
+    def near_liquidation(self, threshold_pct: float) -> bool:
+        """Within threshold_pct of a real liquidation price, not past it."""
+        return 0 <= self.distance_pct <= threshold_pct
 
 
 @dataclass
@@ -136,7 +170,6 @@ class PositionScanner:
     positions: list[TrackedPosition] = field(default_factory=list)
     discovered_addresses: set[str] = field(default_factory=set)
     market_prices: dict[str, float] = field(default_factory=dict)
-    market_meta: dict = field(default_factory=dict)
     scan_budget: int = SCAN_ADDRESS_BUDGET
     # End of the last completed scan() cycle (0 = never).
     last_scan_at: float = 0.0
@@ -147,7 +180,6 @@ class PositionScanner:
     # Per-position freshness is scanned_at, not this stamp.
     last_full_pass_at: float = 0.0
 
-    _meta_updated_at: float = field(default=0.0, repr=False)
     _request_times: list[float] = field(default_factory=list, repr=False)
     _session: aiohttp.ClientSession | None = field(default=None, repr=False)
     # address -> positions from its last successful scan (possibly []).
@@ -171,16 +203,10 @@ class PositionScanner:
         async with aiohttp.ClientSession() as session:
             self._session = session
             try:
-                # Independent updates: one endpoint failing must not discard
-                # the other's result (meta is a 5-min cache — losing a refresh
-                # means stale maintenance margins for the whole window).
-                results = await asyncio.gather(
-                    self.update_prices(), self.update_meta(),
-                    return_exceptions=True,
-                )
-                for name, res in zip(("update_prices", "update_meta"), results):
-                    if isinstance(res, BaseException):
-                        logger.warning("[scanner] %s failed: %r", name, res)
+                try:
+                    await self.update_prices()
+                except Exception as exc:
+                    logger.warning("[scanner] update_prices failed: %r", exc)
 
                 # Discover new addresses: always on first run, then every
                 # DISCOVERY_INTERVAL_SECONDS.
@@ -233,14 +259,18 @@ class PositionScanner:
                 self._session = None
 
     def _assemble_positions(self) -> list[TrackedPosition]:
-        """Every cached position, distance re-derived from the freshest mids."""
+        """Every cached position, distance re-derived from the freshest mids.
+
+        Sorted by signed distance: crossed positions (negative) first, then
+        the closest to liquidation, then positions with no liquidation price.
+        """
         out: list[TrackedPosition] = []
         for plist in self._position_cache.values():
             for p in plist:
                 price = self.market_prices.get(p.symbol, 0.0)
                 if price > 0:
                     p.current_price = price
-                    p.distance_pct = abs(price - p.liq_price) / price * 100
+                    p.distance_pct = liquidation_distance_pct(p.side, price, p.liq_price)
                 out.append(p)
         return sorted(out, key=lambda p: p.distance_pct)
 
@@ -366,21 +396,20 @@ class PositionScanner:
 
             leverage_info = pos.get("leverage", {})
             leverage_value = float(leverage_info.get("value", 1)) if isinstance(leverage_info, dict) else 1.0
+            margin_mode = str(leverage_info.get("type", "")) if isinstance(leverage_info, dict) else ""
 
+            # Hyperliquid's liquidation price, or None when it reports none
+            # (null: the account's equity covers the position at any price).
+            # Never estimated: an isolated-margin formula on the leverage
+            # setting invented levels for cross positions that cannot be
+            # liquidated at all.
             liq_price_raw = pos.get("liquidationPx")
-            if liq_price_raw is not None and liq_price_raw != "":
-                liq_price = float(liq_price_raw)
-            else:
-                liq_price = self._calculate_liq_price(
-                    side, entry_price, leverage_value, coin
-                )
+            liq_price = float(liq_price_raw) if liq_price_raw not in (None, "") else None
+            if liq_price is not None and not (math.isfinite(liq_price) and liq_price > 0):
+                liq_price = None
 
             current_price = self.market_prices.get(coin, entry_price)
-
-            if current_price > 0:
-                distance_pct = abs(current_price - liq_price) / current_price * 100
-            else:
-                distance_pct = float("inf")
+            distance_pct = liquidation_distance_pct(side, current_price, liq_price)
 
             num_positions = max(len(data["assetPositions"]), 1)
             margin_used = total_margin_used / num_positions
@@ -397,24 +426,33 @@ class PositionScanner:
                 leverage=leverage_value,
                 unrealized_pnl=unrealized_pnl,
                 margin_used=margin_used,
+                margin_mode=margin_mode,
             ))
 
         return positions
 
     # ── Filtering / query helpers ────────────────────────────────
+    # Distance views only ever contain positions with a real liquidation
+    # price that the price has not crossed. A crossed position is being (or
+    # already was) liquidated and its cached state is out of date until its
+    # address is scanned again; get_crossed() lists those separately.
 
     def get_danger_zone(self, threshold_pct: float = 2.0) -> list[TrackedPosition]:
-        """Get all positions within threshold% of liquidation."""
-        return [p for p in self.positions if p.distance_pct <= threshold_pct]
+        """Positions within threshold% of their liquidation price (not past it)."""
+        return [p for p in self.positions if p.near_liquidation(threshold_pct)]
+
+    def get_crossed(self) -> list[TrackedPosition]:
+        """Positions whose price is already past their liquidation price."""
+        return [p for p in self.positions if p.crossed]
 
     def get_closest_longs(self, n: int = 3) -> list[TrackedPosition]:
         """Get N long positions closest to liquidation."""
-        longs = [p for p in self.positions if p.side == "long"]
+        longs = [p for p in self.positions if p.side == "long" and p.distance_pct >= 0 and p.has_liq_price]
         return sorted(longs, key=lambda p: p.distance_pct)[:n]
 
     def get_closest_shorts(self, n: int = 3) -> list[TrackedPosition]:
         """Get N short positions closest to liquidation."""
-        shorts = [p for p in self.positions if p.side == "short"]
+        shorts = [p for p in self.positions if p.side == "short" and p.distance_pct >= 0 and p.has_liq_price]
         return sorted(shorts, key=lambda p: p.distance_pct)[:n]
 
     def get_zone_summary(self) -> dict:
@@ -425,15 +463,10 @@ class PositionScanner:
             "within_5pct": {"count": 0, "total_value": 0.0},
         }
         for p in self.positions:
-            if p.distance_pct <= 1.0:
-                zones["within_1pct"]["count"] += 1
-                zones["within_1pct"]["total_value"] += p.size_usd
-            if p.distance_pct <= 2.0:
-                zones["within_2pct"]["count"] += 1
-                zones["within_2pct"]["total_value"] += p.size_usd
-            if p.distance_pct <= 5.0:
-                zones["within_5pct"]["count"] += 1
-                zones["within_5pct"]["total_value"] += p.size_usd
+            for limit, key in ((1.0, "within_1pct"), (2.0, "within_2pct"), (5.0, "within_5pct")):
+                if p.near_liquidation(limit):
+                    zones[key]["count"] += 1
+                    zones[key]["total_value"] += p.size_usd
         return zones
 
     # ── Price & meta updates ─────────────────────────────────────
@@ -443,37 +476,6 @@ class PositionScanner:
         data = await self._post({"type": "allMids"})
         if isinstance(data, dict):
             self.market_prices = {k: float(v) for k, v in data.items()}
-
-    async def update_meta(self):
-        """Fetch market metadata (maintenance margins, etc). Cached for 5 min."""
-        now = time.monotonic()
-        if self.market_meta and (now - self._meta_updated_at) < META_CACHE_TTL:
-            return
-
-        data = await self._post({"type": "meta"})
-        if isinstance(data, dict):
-            self.market_meta = data
-            self._meta_updated_at = now
-
-    # ── Liquidation price fallback ───────────────────────────────
-
-    def _calculate_liq_price(
-        self, side: str, entry_price: float, leverage: float, coin: str
-    ) -> float:
-        mm_rate = self._get_maintenance_margin(coin)
-        if leverage == 0:
-            return 0.0
-        if side == "long":
-            return entry_price * (1 - 1 / leverage + mm_rate / leverage)
-        return entry_price * (1 + 1 / leverage - mm_rate / leverage)
-
-    def _get_maintenance_margin(self, coin: str) -> float:
-        """Look up maintenance margin rate from cached metadata."""
-        universe = self.market_meta.get("universe", [])
-        for asset in universe:
-            if asset.get("name") == coin:
-                return float(asset.get("maintenanceMarginRatio", 0.03))
-        return 0.03  # default 3%
 
     # ── Rate limiter ─────────────────────────────────────────────
 

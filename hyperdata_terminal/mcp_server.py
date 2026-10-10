@@ -99,8 +99,12 @@ class HubTools:
             "size_usd": _num(p.size_usd, 0),
             "entry_price": _num(p.entry_price, 6),
             "mark_price": _num(p.current_price, 6),
+            # null when Hyperliquid reports no liquidation price for the
+            # position (account equity covers it at any price).
             "liquidation_price": _num(p.liq_price, 6),
+            # Signed: negative means the price has crossed the liquidation price.
             "distance_to_liquidation_pct": _num(p.distance_pct, 3),
+            "margin_mode": getattr(p, "margin_mode", "") or None,
             "leverage": _num(p.leverage, 1),
             "unrealized_pnl_usd": _num(p.unrealized_pnl, 0),
         }
@@ -170,7 +174,7 @@ class HubTools:
             }
         if sym in hub.orderflow.buckets:
             out["order_flow"] = self._order_flow_frames(sym)
-        near = [p for p in hub.positions.positions if p.symbol == sym and p.distance_pct <= 5]
+        near = [p for p in hub.positions.positions if p.symbol == sym and p.near_liquidation(5)]
         out["tracked_positions_within_5pct_of_liquidation"] = {
             "count": len(near),
             "long_usd": _num(sum(p.size_usd for p in near if p.side == "long"), 0),
@@ -294,13 +298,24 @@ class HubTools:
         self, max_distance_pct: float = 2.0, symbol: str | None = None, limit: int = 20,
     ) -> dict[str, Any]:
         cap = max(0.01, float(max_distance_pct))
-        positions = [p for p in self.hub.get_all_positions_sorted() if p.distance_pct <= cap]
+        everything = self.hub.get_all_positions_sorted()
         if symbol:
-            positions = [p for p in positions if p.symbol == self._sym(symbol)]
+            everything = [p for p in everything if p.symbol == self._sym(symbol)]
+        # Only positions with a real liquidation price the price has not yet
+        # crossed. A crossed one is being (or was) liquidated and its cached
+        # state is out of date: counted, never listed as "near".
+        positions = [p for p in everything if p.near_liquidation(cap)]
+        crossed = [p for p in everything if p.crossed]
         return self._with_meta({
             "venue": "hyperliquid",
             "max_distance_pct": cap,
             "count": len(positions),
+            "crossed_liquidation_price": {
+                "count": len(crossed),
+                "size_usd": _num(sum(p.size_usd for p in crossed), 0),
+                "note": "price is past these positions' liquidation price; they are likely already "
+                        "liquidated and drop out when their wallet is next scanned",
+            },
             "long_usd": _num(sum(p.size_usd for p in positions if p.side == "long"), 0),
             "short_usd": _num(sum(p.size_usd for p in positions if p.side != "long"), 0),
             "positions": [self._position(p) for p in positions[: max(1, min(limit, 100))]],

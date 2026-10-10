@@ -375,7 +375,7 @@ def test_empty_bucket_has_zero_coverage():
 
 @pytest.mark.parametrize("value,expected", [
     (0.053, "0.05%"), (154.638, "154.64%"), (999.0, "999.00%"), (970.58, "970.58%"),
-    (1500.0, ">999%"), (math.inf, ">999%"), (math.nan, ">999%"),
+    (1500.0, ">999%"), (math.inf, "none"), (math.nan, "n/a"), (-0.4, "crossed"),
 ])
 def test_distance_formatter(value, expected):
     from hyperdata_terminal.utils.helpers import format_distance_pct

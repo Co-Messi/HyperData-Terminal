@@ -1459,14 +1459,13 @@ class TestH3LLMTransport:
 class TestH4ScanBudget:
     @staticmethod
     def _quiet(monkeypatch, s):
-        """No network: prices/meta/discovery are no-ops, batch sleeps are instant."""
+        """No network: prices/discovery are no-ops, batch sleeps are instant."""
         import asyncio
         import time as _t
         from unittest.mock import AsyncMock
 
         from hyperdata_terminal.data_layer import position_scanner as ps
         monkeypatch.setattr(s, "update_prices", AsyncMock())
-        monkeypatch.setattr(s, "update_meta", AsyncMock())
         s._last_discovery = _t.time()
         monkeypatch.setattr(ps.asyncio, "sleep", AsyncMock())
         assert asyncio.sleep is ps.asyncio.sleep

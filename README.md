@@ -130,7 +130,7 @@ curl http://localhost:8420/v1/positions/danger-zone
 | `GET /v1/deribit/iv` | DVOL implied volatility |
 | `GET /v1/orderbook/{symbol}` | Orderbook snapshot |
 | `GET /v1/whales` | Top whale positions |
-| `GET /v1/positions/danger-zone` | Positions closest to liquidation |
+| `GET /v1/positions/danger-zone` | Positions within `?threshold=` percent of Hyperliquid's own liquidation price (none estimated, none already crossed) |
 | `GET /v1/public/metrics` | Server metrics and component health |
 | `WS /v1/ws` | Event stream: liquidations, trades, signals |
 

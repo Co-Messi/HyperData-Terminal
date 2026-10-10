@@ -14,7 +14,7 @@ import time
 from hyperdata_terminal.data_layer.hlp_tracker import HLPPosition, HLPSnapshot, HLPTrade
 from hyperdata_terminal.data_layer.liquidation_feed import LiquidationEvent
 from hyperdata_terminal.data_layer.orderflow_engine import Trade
-from hyperdata_terminal.data_layer.position_scanner import TrackedPosition
+from hyperdata_terminal.data_layer.position_scanner import TrackedPosition, liquidation_distance_pct
 from hyperdata_terminal.data_layer.smart_money import SmartMoneySignal, WalletProfile
 
 logger = logging.getLogger(__name__)
@@ -112,7 +112,7 @@ async def demo_position_scan(hub) -> None:
             liq_price = entry_price * (1 + 1 / leverage - mm / leverage)
             pnl_pct = (entry_price - current_price) / entry_price
 
-        distance = abs(current_price - liq_price) / current_price * 100
+        distance = liquidation_distance_pct(side, current_price, liq_price)
 
         positions.append(TrackedPosition(
             address=f"0x{''.join(random.choices('0123456789abcdef', k=40))}",

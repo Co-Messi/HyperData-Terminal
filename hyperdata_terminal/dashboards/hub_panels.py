@@ -80,7 +80,14 @@ class HubLiqWatch:
             zone_lines.append(f"{fmt_usd(z['short_value']):>8}", style="red")
             zone_lines.append(f"  T:{fmt_usd(z['total_value']):>8}\n", style="bold bright_yellow")
 
-        danger = [p for p in all_pos if p.distance_pct < 5.0][:15]
+        crossed = [p for p in all_pos if p.crossed]
+        if crossed:
+            zone_lines.append(
+                f" crossed {len(crossed)} ({fmt_usd(sum(p.size_usd for p in crossed))}): "
+                "price past liquidation, awaiting rescan\n",
+                style="dim yellow",
+            )
+        danger = [p for p in all_pos if p.near_liquidation(5.0)][:15]
         table = Table(
             box=box.SIMPLE_HEAVY, border_style="bright_cyan",
             header_style="bold bright_white", expand=True, padding=(0, 0),

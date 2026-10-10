@@ -92,8 +92,10 @@ def compute_heatmap_buckets(
 
     # Assign positions to buckets based on their liquidation price
     for pos in sym_positions:
+        # No liquidation price (Hyperliquid reports none), or the price has
+        # already crossed it: neither is a level where liquidations wait.
         liq = pos.liq_price
-        if liq <= 0 or liq < price_low or liq > price_high:
+        if liq is None or pos.crossed or liq <= 0 or liq < price_low or liq > price_high:
             continue
 
         idx = int((liq - price_low) / bucket_size)
