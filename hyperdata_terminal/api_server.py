@@ -931,6 +931,8 @@ class HyperDataAPI:
                 "events_persisted": s.events_persisted,
                 "write_queue_pending": s.write_queue_pending,
                 "dropped_writes": s.dropped_writes,
+                "failed_writes": getattr(s, "failed_writes", 0),
+                "enabled": getattr(s, "persistence_enabled", True),
             },
             "data_health": data_health,
             "docs": "https://github.com/Co-Messi/HyperData-Terminal",

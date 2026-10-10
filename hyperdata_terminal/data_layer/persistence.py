@@ -3,17 +3,28 @@ Persistence layer — stores events to SQLite for historical analysis.
 Integrates with HyperDataHub via callbacks.
 
 Usage:
-    store = DataStore("data/hyperdata.db")
-    store.attach(hub)  # Automatically saves all events
+    store = DataStore(DATA_DIR / "hyperdata.db")
+    store.attach(hub)  # saves liquidations, HLP absorptions, signals, snapshots
 
-    # Query historical data:
+    # Query historical data (confirmed liquidations unless include_estimated):
     store.get_liquidations(since_hours=24)
-    store.get_trade_summary(symbol="BTC", hours=1)
     store.get_liquidation_stats(hours=24)
+    store.get_liquidation_stats(hours=24, include_estimated=True)
+
+Raw trades are stored (1 in 2) only with HYPERDATA_PERSIST_TRADES=1:
+nothing in the package reads them back, and they were most of the file.
+
+Rows written by 1.0.0 and earlier carry known errors that no migration can
+undo, because the inputs needed to recompute them were never stored: Bybit
+liquidations have long and short swapped, OKX sizes from builds before the
+contract value fix are up to 100x too large, and funding rows have no
+interval (interval_hours NULL) and were all divided by 8. Retention removes
+them within RETENTION_DAYS of upgrading.
 """
 
 import atexit
 import logging
+import os
 import shutil
 import sqlite3
 import threading
@@ -45,6 +56,21 @@ WRITE_QUEUE_MAX = 50_000
 
 # How long flush()/close()/reads wait for the writer to catch up.
 DRAIN_TIMEOUT_SECONDS = 10.0
+
+
+class CorruptDatabase(sqlite3.DatabaseError):
+    """The file failed SQLite's integrity check or is not a database."""
+
+
+def _is_corruption(exc: BaseException) -> bool:
+    if isinstance(exc, CorruptDatabase):
+        return True
+    text = str(exc).lower()
+    return "file is not a database" in text or "malformed" in text
+
+
+def persist_trades_enabled() -> bool:
+    return os.environ.get("HYPERDATA_PERSIST_TRADES", "").strip().lower() in ("1", "true", "yes", "on")
 
 
 class DataStore:
@@ -82,6 +108,12 @@ class DataStore:
         self._enqueued_seq = 0
         self._applied_seq = 0
         self.dropped_writes = 0
+        # Writes the writer thread attempted but SQLite rejected (a locked
+        # file, a full disk): lost rows, counted like dropped_writes.
+        self.failed_writes = 0
+        # False when the file could not be opened and this session runs on
+        # an in-memory database (nothing it writes survives the process).
+        self.persistent = True
         self._writer_stop = False
         self._writer: threading.Thread | None = None
 
@@ -107,6 +139,21 @@ class DataStore:
                     "than quarantining a healthy DB: %s", self.db_path, exc,
                 )
                 raise
+            # Only a failed integrity check or a file that is not a database
+            # is corruption. A full disk, a read-only mount or an I/O error
+            # says nothing about the file: it stays where it is and this
+            # session runs without persistence.
+            if not _is_corruption(exc):
+                logger.error(
+                    "Database at %s could not be opened (%s); it is not quarantined. "
+                    "Running on an in-memory store: nothing is persisted this session.",
+                    self.db_path, exc,
+                )
+                self.persistent = False
+                self._conn = sqlite3.connect(":memory:", check_same_thread=False)
+                self._init_tables()
+                self._start_writer()
+                return
             # Quarantine, never delete: move the corrupted DB (and WAL/SHM)
             # aside with a timestamp so history survives for postmortem and
             # possible `.recover`, then start fresh.
@@ -143,9 +190,13 @@ class DataStore:
                     "Could not recreate database at %s — falling back to an "
                     "in-memory store (NO persistence this session)", self.db_path,
                 )
+                self.persistent = False
                 self._conn = sqlite3.connect(":memory:", check_same_thread=False)
                 self._init_tables()
 
+        self._start_writer()
+
+    def _start_writer(self) -> None:
         self._writer = threading.Thread(
             target=self._writer_loop, name="datastore-writer", daemon=True,
         )
@@ -190,6 +241,7 @@ class DataStore:
             except Exception:
                 # Never let the writer die: a dead writer means every later
                 # event silently queues until the cap and is then dropped.
+                self.failed_writes += len(batch)
                 logger.exception("DataStore writer batch failed (%d writes)", len(batch))
             finally:
                 with self._q_cond:
@@ -216,7 +268,11 @@ class DataStore:
                     self._conn.execute(sql, params)
                     self._event_count += 1
                 except sqlite3.Error:
-                    logger.exception("DataStore write failed: %s", sql[:60])
+                    # The row is lost: count it (surfaced in /v1/health),
+                    # and log the first few and then every 1000th.
+                    self.failed_writes += 1
+                    if self.failed_writes <= 3 or self.failed_writes % 1000 == 0:
+                        logger.exception("DataStore write failed (%d so far): %s", self.failed_writes, sql[:60])
             self._conn.commit()
             self._last_commit_at = time.time()
 
@@ -268,10 +324,16 @@ class DataStore:
         app ran on a broken DB. quick_check skips the index-consistency scan
         so startup on a large DB stays fast.
         """
-        row = conn.execute("PRAGMA quick_check").fetchone()
+        try:
+            row = conn.execute("PRAGMA quick_check").fetchone()
+        except sqlite3.DatabaseError as exc:
+            if "lock" in str(exc).lower() or "busy" in str(exc).lower():
+                raise
+            # Some SQLite builds raise instead of returning a verdict.
+            raise CorruptDatabase(f"quick_check failed: {exc}") from exc
         verdict = row[0] if row else None
         if verdict != "ok":
-            raise sqlite3.DatabaseError(f"quick_check failed: {verdict!r}")
+            raise CorruptDatabase(f"quick_check failed: {verdict!r}")
 
     def _atexit_flush(self) -> None:
         """Best-effort flush registered with atexit; never raises."""
@@ -281,9 +343,28 @@ class DataStore:
             pass
 
     def _init_tables(self):
-        """Create tables if they don't exist."""
+        """Create tables, run migrations, then create indexes.
+
+        Indexes come after the migrations, one at a time: an older table
+        missing a column an index names (a legacy DB) used to fail the whole
+        script with "no such column", which the open path treated as
+        corruption and quarantined a healthy database.
+        """
+        sql = "\n".join(line for line in self._SCHEMA_SQL.splitlines() if not line.strip().startswith("--"))
+        statements = [st.strip() for st in sql.split(";") if st.strip()]
+        tables = [st for st in statements if not st.upper().startswith("CREATE INDEX")]
+        indexes = [st for st in statements if st.upper().startswith("CREATE INDEX")]
         with self._lock:
-            self._conn.executescript("""
+            self._conn.executescript(";\n".join(tables) + ";")
+            self._run_migrations()
+            for st in indexes:
+                try:
+                    self._conn.execute(st)
+                except sqlite3.OperationalError as exc:
+                    logger.warning("Skipped index on a legacy table (%s): %.80s", exc, st)
+            self._conn.commit()
+
+    _SCHEMA_SQL = """
                 CREATE TABLE IF NOT EXISTS liquidations (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     timestamp REAL NOT NULL,
@@ -417,9 +498,7 @@ class DataStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_options_ts ON options_data(timestamp);
                 CREATE INDEX IF NOT EXISTS idx_options_underlying ON options_data(underlying);
-            """)
-            self._run_migrations()
-            self._conn.commit()
+    """
 
     # Bump when adding a migration to _MIGRATIONS below. The schema_version
     # table lets a release tell an old DB from a new one, and _run_migrations
@@ -554,7 +633,11 @@ class DataStore:
     def attach(self, hub) -> None:
         """Attach to a HyperDataHub — automatically persists all events."""
         hub.on_liquidation(self._save_liquidation)
-        hub.on_trade(self._save_trade)
+        # Raw trades only on request (HYPERDATA_PERSIST_TRADES=1): nothing in
+        # the package reads them, and at full Binance plus Hyperliquid rates
+        # they were most of the file (4M rows in a week).
+        if persist_trades_enabled():
+            hub.on_trade(self._save_trade)
         # Attach to smart money engine if available
         if hasattr(hub, "smart_money") and hub.smart_money is not None:
             hub.smart_money.on_signal(self._save_smart_money_signal)
@@ -700,18 +783,20 @@ class DataStore:
             for r in rows
         ]
 
-    def get_liquidation_stats(self, hours: float = 24) -> dict:
-        """Get aggregated liquidation stats for a time window."""
+    def get_liquidation_stats(self, hours: float = 24, include_estimated: bool = False) -> dict:
+        """Aggregated CONFIRMED liquidation stats for a time window
+        (include_estimated=True adds Hyperliquid large prints)."""
         cutoff = time.time() - (hours * 3600)
+        only_confirmed = "" if include_estimated else " AND confirmed = 1"
         self._drain()
         with self._lock:
-            row = self._conn.execute("""
+            row = self._conn.execute(f"""
                 SELECT COUNT(*), COALESCE(SUM(size_usd), 0),
                        SUM(CASE WHEN side='long' THEN 1 ELSE 0 END),
                        SUM(CASE WHEN side='short' THEN 1 ELSE 0 END),
                        COALESCE(SUM(CASE WHEN side='long' THEN size_usd ELSE 0 END), 0),
                        COALESCE(SUM(CASE WHEN side='short' THEN size_usd ELSE 0 END), 0)
-                FROM liquidations WHERE timestamp > ?
+                FROM liquidations WHERE timestamp > ?{only_confirmed}
             """, (cutoff,)).fetchone()
 
         return {
@@ -720,14 +805,15 @@ class DataStore:
             "long_volume": row[4], "short_volume": row[5],
         }
 
-    def get_liquidations_by_exchange(self, hours: float = 24) -> dict[str, dict]:
-        """Get liquidation counts/volume per exchange."""
+    def get_liquidations_by_exchange(self, hours: float = 24, include_estimated: bool = False) -> dict[str, dict]:
+        """CONFIRMED liquidation counts/volume per exchange."""
         cutoff = time.time() - (hours * 3600)
+        only_confirmed = "" if include_estimated else " AND confirmed = 1"
         self._drain()
         with self._lock:
-            rows = self._conn.execute("""
+            rows = self._conn.execute(f"""
                 SELECT exchange, COUNT(*), COALESCE(SUM(size_usd), 0)
-                FROM liquidations WHERE timestamp > ?
+                FROM liquidations WHERE timestamp > ?{only_confirmed}
                 GROUP BY exchange ORDER BY SUM(size_usd) DESC
             """, (cutoff,)).fetchall()
         return {r[0]: {"count": r[1], "volume": r[2]} for r in rows}
@@ -764,6 +850,8 @@ class DataStore:
             "db_path": str(self.db_path),
             "write_queue_pending": pending,
             "dropped_writes": self.dropped_writes,
+            "failed_writes": self.failed_writes,
+            "persistent": self.persistent,
         }
 
     # ── Smart Money Persistence ───────────────────────────────

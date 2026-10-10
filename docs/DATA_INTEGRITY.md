@@ -359,16 +359,37 @@ installs SIGINT/SIGTERM handlers so `kill <pid>` shuts down cleanly.
 Writes never run on the event loop: feed callbacks enqueue rows for a
 dedicated writer thread (bounded queue; overflow is dropped and counted as
 `dropped_writes`), and reads drain the queue first so a query immediately
-after an event still sees it. `/v1/health` → `persistence` carries
-`write_queue_pending` and `dropped_writes` (informational — they do not
+after an event still sees it. A row SQLite rejects (a locked file while
+another process prunes, a full disk) is lost too and counted as
+`failed_writes`. `/v1/health` → `persistence` carries `write_queue_pending`,
+`dropped_writes`, `failed_writes` and `enabled` (informational — they do not
 gate the top-level status). A drain that times out — a read about to miss
 rows, or a shutdown about to abandon queued writes — is logged at ERROR
-with the count, and `DataStore.flush()`/`close()` return `False`. The startup integrity check
-(`PRAGMA quick_check`) is fetched and acted on — anything but `ok` quarantines
-the file and starts fresh.
+with the count, and `DataStore.flush()`/`close()` return `False`.
+
+At startup the integrity check (`PRAGMA quick_check`) is fetched and acted
+on: a file that fails it, or that is not a SQLite database at all, is moved
+to `corrupted/` (never deleted) and a fresh one is created. Nothing else
+quarantines a file: a full disk, a read-only mount or an I/O error leaves it
+where it is, logs an ERROR and runs the session on an in-memory store
+(`enabled: false`); a lock held by another process fails startup instead.
+Schema indexes are created after the migrations, so an old table missing an
+indexed column is migrated in place.
+
+Raw trades are not stored unless `HYPERDATA_PERSIST_TRADES=1`: nothing in
+the package reads them back, and they were most of the file. The
+`get_liquidation_stats()` and `get_liquidations_by_exchange()` queries count
+confirmed liquidations only unless `include_estimated=True`.
 
 Old rows are pruned hourly (`DataStore.prune`, default `RETENTION_DAYS=7`) and
 the WAL is checkpointed, so the DB stays bounded on long-running instances.
+
+Rows written by 1.0.0 and earlier carry known errors that no migration can
+undo, because the inputs needed to recompute them were never stored: Bybit
+liquidations have long and short swapped, OKX sizes from builds before the
+contract value fix are up to 100x too large, and funding rows were all
+divided by 8 (their `interval_hours` is NULL). They are not deleted; the
+seven day retention removes them within a week of upgrading.
 
 ## API exposure
 

@@ -133,6 +133,8 @@ class HubStatus:
     # writer that is not keeping up is visible, not just logged.
     write_queue_pending: int = 0
     dropped_writes: int = 0
+    failed_writes: int = 0          # rows SQLite rejected (locked, disk full): lost, counted
+    persistence_enabled: bool = True  # False: the DB could not be opened, nothing is saved
 
     # Funding rates
     funding_rate_symbols_binance: int = 0
@@ -717,6 +719,8 @@ class HyperDataHub:
                 )
                 self.status.write_queue_pending = db_stats["write_queue_pending"]
                 self.status.dropped_writes = db_stats["dropped_writes"]
+                self.status.failed_writes = db_stats.get("failed_writes", 0)
+                self.status.persistence_enabled = db_stats.get("persistent", True)
             except Exception:
                 logger.exception("Error fetching DB stats")
             try:
