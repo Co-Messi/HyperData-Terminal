@@ -192,3 +192,85 @@ async def test_live_feed() -> None:
     await feed.stop()
 
     assert event_count > 0, "Expected at least one liquidation event in 15s"
+
+
+# ── Window coverage and truncation (H3) ─────────────────────────────────────
+
+
+def _emit_all(feed: LiquidationFeed, events: list[LiquidationEvent]) -> None:
+    async def run() -> None:
+        for ev in events:
+            await feed.emit(ev)
+
+    asyncio.run(run())
+
+
+def test_stats_report_partial_coverage_shortly_after_start() -> None:
+    """A 24h window ten minutes after launch covers ten minutes, and says so."""
+    feed = LiquidationFeed(max_events=100)
+    now = time.time()
+    feed.started_at = now - 600
+    _emit_all(feed, [LiquidationEvent(now - 30, "okx", "BTC", "long", 10_000, 80_000, 0.125)])
+
+    stats = feed.get_stats(window_minutes=1440, include_estimated=False)
+
+    assert stats["truncated"] is False
+    assert stats["covered_since"] == pytest.approx(now - 600, abs=1)
+    assert stats["window_coverage"] == pytest.approx(600 / 86_400, rel=0.01)
+
+
+def test_stats_full_coverage_when_window_is_inside_uptime() -> None:
+    feed = LiquidationFeed(max_events=100)
+    feed.started_at = time.time() - 7200
+    stats = feed.get_stats(window_minutes=60, include_estimated=False)
+    assert stats["window_coverage"] == 1.0
+    assert stats["truncated"] is False
+
+
+def test_stats_flag_truncation_when_the_buffer_overflows() -> None:
+    """The event past the buffer cap evicts the oldest; a window reaching
+    back past the evicted events is partial, not a full total."""
+    feed = LiquidationFeed(max_events=5)
+    now = time.time()
+    feed.started_at = now - 7200
+    _emit_all(feed, [
+        LiquidationEvent(now - 1000 + i * 10, "okx", "BTC", "long", 1_000, 80_000, 0.0125) for i in range(10)
+    ])
+
+    stats = feed.get_stats(window_minutes=60, include_estimated=False)
+
+    assert stats["truncated"] is True
+    # Events up to the newest evicted one (now - 1000 + 40) may be missing.
+    assert stats["covered_since"] == pytest.approx(now - 960, abs=1)
+    assert stats["window_coverage"] < 1.0
+    # A window that starts after the evicted events is complete again.
+    assert feed.get_stats(window_minutes=10, include_estimated=False)["truncated"] is False
+
+
+def test_truncation_uses_the_newest_evicted_timestamp_not_deque_order() -> None:
+    """Hyperliquid confirmed events arrive about two minutes late, so the
+    buffer is not in time order: the evicted event can be newer than what
+    is left at the front."""
+    feed = LiquidationFeed(max_events=2)
+    now = time.time()
+    feed.started_at = now - 7200
+    _emit_all(feed, [
+        LiquidationEvent(now - 100, "okx", "BTC", "long", 1_000, 80_000, 0.0125),
+        LiquidationEvent(now - 300, "hyperliquid", "BTC", "long", 1_000, 80_000, 0.0125),  # late arrival
+        LiquidationEvent(now - 50, "okx", "BTC", "long", 1_000, 80_000, 0.0125),
+    ])
+    stats = feed.get_stats(window_minutes=60, include_estimated=False)
+    assert stats["truncated"] is True
+    assert stats["covered_since"] == pytest.approx(now - 100, abs=1)
+
+
+def test_estimated_overflow_does_not_mark_confirmed_totals_truncated() -> None:
+    feed = LiquidationFeed(max_events=2)
+    now = time.time()
+    feed.started_at = now - 7200
+    _emit_all(feed, [
+        LiquidationEvent(now - 100 + i, "hyperliquid", "BTC", "long", 20_000, 80_000, 0.25, confirmed=False)
+        for i in range(5)
+    ])
+    assert feed.get_stats(60, include_estimated=False)["truncated"] is False
+    assert feed.get_stats(60, include_estimated=True)["truncated"] is True

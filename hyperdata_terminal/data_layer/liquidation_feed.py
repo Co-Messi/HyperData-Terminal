@@ -588,13 +588,27 @@ class _TimeWindow:
 
 
 class LiquidationFeed:
-    def __init__(self, max_events: int = 10_000):
+    # Every window is computed from these in-memory buffers, so the longest
+    # window anyone may ask for is one day; get_stats() reports how much of
+    # it is actually covered (process uptime, buffer evictions).
+    MAX_WINDOW_MINUTES = 1440
+
+    def __init__(self, max_events: int = 50_000):
         # Confirmed liquidations. Estimated events (Hyperliquid large prints)
         # get their own buffer: they arrive far faster, and sharing one deque
-        # let them evict confirmed liquidations after a few hours, silently
-        # truncating every 4h/24h window.
+        # let them evict confirmed liquidations, silently truncating every
+        # long window.
         self.events: deque[LiquidationEvent] = deque(maxlen=max_events)
         self.estimated_events: deque[LiquidationEvent] = deque(maxlen=max_events)
+        # Nothing before this moment was collected. Reset by start().
+        self.started_at: float = time.time()
+        # Newest timestamp among events a full buffer has evicted, per buffer.
+        # Arrival order is not time order (Hyperliquid confirmed events come
+        # in about two minutes late), so this is a running max, not the
+        # timestamp of whatever sits at the front of the deque.
+        self.evicted_through: float = 0.0
+        self.estimated_evicted_through: float = 0.0
+        self.evicted_count: int = 0
         self.callbacks: list[Callable[[LiquidationEvent], Any]] = []
         self._connections: list[ExchangeConnection | HyperliquidConnection] = []
         self._lock = asyncio.Lock()
@@ -624,6 +638,7 @@ class LiquidationFeed:
     async def start(self) -> None:
         logger.info("starting liquidation feed")
         self._running = True
+        self.started_at = time.time()
         self._connections = [
             BinanceConnection(self),       # Sampled: forceOrder feed throttled to ~1/symbol/sec by Binance
             BybitConnection(self),         # Confirmed: allLiquidation v5 feed, top-N symbols only
@@ -659,8 +674,15 @@ class LiquidationFeed:
     async def _dispatch(self, event: LiquidationEvent) -> None:
         async with self._lock:
             if getattr(event, "confirmed", True):
+                if len(self.events) == self.events.maxlen:
+                    self.evicted_through = max(self.evicted_through, self.events[0].timestamp)
+                    self.evicted_count += 1
                 self.events.append(event)
             else:
+                if len(self.estimated_events) == self.estimated_events.maxlen:
+                    self.estimated_evicted_through = max(
+                        self.estimated_evicted_through, self.estimated_events[0].timestamp,
+                    )
                 self.estimated_events.append(event)
         for cb in self.callbacks:
             try:
@@ -670,6 +692,32 @@ class LiquidationFeed:
             except Exception:
                 logger.exception("callback error")
 
+    def window_coverage(
+        self, window_minutes: float, include_estimated: bool = False, now: float | None = None,
+    ) -> dict[str, Any]:
+        """How much of the last ``window_minutes`` the in-memory buffers cover.
+
+        Two things make a window partial: the process has not been running
+        for the whole window, and a full buffer has evicted events inside it.
+        ``covered_since`` is the earliest moment from which every collected
+        event is still held; ``window_coverage`` is the share of the window
+        after it (1.0 means the totals are a full window).
+        """
+        now = time.time() if now is None else now
+        window_s = max(float(window_minutes) * 60, 1e-9)
+        cutoff = now - window_s
+        evicted = self.evicted_through
+        if include_estimated:
+            evicted = max(evicted, self.estimated_evicted_through)
+        truncated = evicted >= cutoff
+        covered_since = max(self.started_at, evicted if truncated else 0.0)
+        coverage = 1.0 if covered_since <= cutoff else max(0.0, (now - covered_since) / window_s)
+        return {
+            "window_coverage": round(min(1.0, coverage), 6),
+            "covered_since": max(covered_since, cutoff),
+            "truncated": truncated,
+        }
+
     def get_stats(
         self, window_minutes: int = 60, include_estimated: bool = True, symbol: str | None = None,
     ) -> dict[str, Any]:
@@ -677,11 +725,14 @@ class LiquidationFeed:
 
         include_estimated=False drops heuristic events (Hyperliquid large
         prints) from every total, side and breakdown; confirmed_* and
-        heuristic_* are reported either way. The terminal always passes
-        False for headline numbers; the API keeps True for compatibility and
-        exposes ``include_estimated`` as a query parameter.
+        heuristic_* are reported either way. Every display, alert and
+        strategy passes False; the API and MCP default to False too.
+
+        ``window_coverage``, ``covered_since`` and ``truncated`` say whether
+        the totals really span the window (see window_coverage()).
         """
-        cutoff = time.time() - (window_minutes * 60)
+        now = time.time()
+        cutoff = now - (window_minutes * 60)
         only = symbol.upper() if symbol else None
         totals = _TimeWindow()
         by_exchange: dict[str, _TimeWindow] = {}
@@ -725,6 +776,8 @@ class LiquidationFeed:
 
         return {
             "window_minutes": window_minutes,
+            "include_estimated": include_estimated,
+            **self.window_coverage(window_minutes, include_estimated, now),
             "total_count": totals.count,
             "total_volume_usd": totals.volume_usd,
             "long_count": totals.long_count,

@@ -66,6 +66,18 @@ def fmt_number(value: int) -> str:
     return f"{value:,}"
 
 
+def coverage_note(stats: dict) -> str:
+    """'' when a window's totals span the whole window, else 'since HH:MM'.
+
+    A 24h row ten minutes after launch, or after the buffer evicted events
+    inside the window, is a partial total and must say from when it counts.
+    """
+    if stats.get("window_coverage", 1.0) >= 0.999:
+        return ""
+    since = datetime.fromtimestamp(stats.get("covered_since", time.time()), tz=timezone.utc).strftime("%H:%M")
+    return f"since {since}" + (" (buffer full)" if stats.get("truncated") else "")
+
+
 # ---------------------------------------------------------------------------
 # Dashboard class
 # ---------------------------------------------------------------------------
@@ -157,8 +169,9 @@ class LiquidationStreamDashboard:
 
         for label, minutes in TIME_WINDOWS:
             stats = self.feed.get_stats(window_minutes=minutes, include_estimated=False)
+            note = coverage_note(stats)
             table.add_row(
-                label,
+                Text(label + (f"\n{note}" if note else ""), style="bold white"),
                 fmt_number(stats["long_count"]),
                 fmt_usd(stats["long_volume_usd"]),
                 fmt_number(stats["short_count"]),
@@ -332,8 +345,9 @@ class LiquidationStreamDashboard:
 
         for label, minutes in TIME_WINDOWS[:3]:  # 10min, 1hr, 4hr
             stats = self.feed.get_stats(window_minutes=minutes, include_estimated=False)
+            note = coverage_note(stats)
             table.add_row(
-                label,
+                Text(label + (f"\n{note}" if note else ""), style="bold white"),
                 fmt_usd(stats["long_volume_usd"]),
                 fmt_usd(stats["short_volume_usd"]),
             )

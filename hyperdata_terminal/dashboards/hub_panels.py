@@ -121,7 +121,12 @@ class HubLiqStream:
         self.cycle = 0
 
     def build_compact(self) -> Panel:
-        from hyperdata_terminal.dashboards.liquidation_stream import EXCHANGE_COLORS, SIDE_LONG, SIDE_SHORT
+        from hyperdata_terminal.dashboards.liquidation_stream import (
+            EXCHANGE_COLORS,
+            SIDE_LONG,
+            SIDE_SHORT,
+            coverage_note,
+        )
 
         feed = self.hub.liquidations
         # Confirmed liquidations only. Hyperliquid large prints (trades >= $10K
@@ -150,7 +155,9 @@ class HubLiqStream:
             summary.append(f"L:{s['long_count']}", style="green")
             summary.append(f"/{fmt_usd(s['long_volume_usd'])}", style="green")
             summary.append(f" S:{s['short_count']}", style="red")
-            summary.append(f"/{fmt_usd(s['short_volume_usd'])}\n", style="red")
+            summary.append(f"/{fmt_usd(s['short_volume_usd'])}", style="red")
+            note = coverage_note(s)
+            summary.append(f" {note}\n" if note else "\n", style="dim yellow")
 
         recent = [ev for ev in feed.get_recent(minutes=60) if getattr(ev, "confirmed", True)][:20]
         lines = Text()

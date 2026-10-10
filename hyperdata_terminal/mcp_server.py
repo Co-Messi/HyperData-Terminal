@@ -80,8 +80,11 @@ class HubTools:
             "warnings": warnings,
         }
 
-    def _with_meta(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return {**payload, "meta": self.meta()}
+    def _with_meta(self, payload: dict[str, Any], warnings: list[str] | None = None) -> dict[str, Any]:
+        meta = self.meta()
+        if warnings:
+            meta["warnings"] = [*warnings, *meta["warnings"]]
+        return {**payload, "meta": meta}
 
     @staticmethod
     def _sym(symbol: str) -> str:
@@ -178,14 +181,25 @@ class HubTools:
     def liquidations(
         self, minutes: int = 60, symbol: str | None = None, include_estimated: bool = False, limit: int = 25,
     ) -> dict[str, Any]:
-        minutes = max(1, min(int(minutes), 1440))
         feed = self.hub.liquidations
+        minutes = max(1, min(int(minutes), feed.MAX_WINDOW_MINUTES))
         sym = self._sym(symbol) if symbol else None
         # Totals, breakdowns and the event list all respect the symbol filter.
         stats = feed.get_stats(window_minutes=minutes, include_estimated=include_estimated, symbol=sym)
         events = feed.get_recent(minutes=minutes, symbol=sym, include_estimated=include_estimated)
+        warnings = []
+        if stats["window_coverage"] < 0.999:
+            since = time.strftime("%H:%M UTC", time.gmtime(stats["covered_since"]))
+            reason = "the event buffer filled up" if stats["truncated"] else "the hub started"
+            warnings.append(
+                f"liquidation totals cover {stats['window_coverage']:.0%} of the {minutes} minute window "
+                f"(since {since}, when {reason}); they are not a full {minutes} minute total"
+            )
         return self._with_meta({
             "window_minutes": minutes,
+            "window_coverage": _num(stats["window_coverage"], 4),
+            "covered_since": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(stats["covered_since"])),
+            "truncated": stats["truncated"],
             "symbol": self._sym(symbol) if symbol else "ALL",
             "totals": {
                 "count": stats["total_count"],
@@ -216,7 +230,7 @@ class HubTools:
                 }
                 for e in events[: max(1, min(limit, 200))]
             ],
-        })
+        }, warnings)
 
     def liquidation_heatmap(self, symbol: str = "BTC", buckets: int = 24, range_pct: float = 10.0) -> dict[str, Any]:
         from hyperdata_terminal.dashboards.liquidation_heatmap import compute_heatmap_buckets

@@ -943,10 +943,12 @@ class HyperDataAPI:
         })
 
     async def handle_liquidations(self, request: web.Request) -> web.Response:
+        feed = self.hub.liquidations
         limit = _int_param(request, "limit", 100, minimum=1, maximum=1000)
         exchange = request.query.get("exchange")
-        minutes = _int_param(request, "minutes", 60, minimum=1, maximum=10080)
-        events = self.hub.liquidations.get_recent(minutes=minutes, exchange=exchange)[:limit]
+        minutes = _int_param(request, "minutes", 60, minimum=1, maximum=feed.MAX_WINDOW_MINUTES)
+        include_estimated = True
+        events = feed.get_recent(minutes=minutes, exchange=exchange, include_estimated=include_estimated)[:limit]
         data = []
         for ev in events:
             data.append({
@@ -955,14 +957,19 @@ class HyperDataAPI:
                 "size_usd": ev.size_usd, "price": ev.price,
                 "quantity": ev.quantity, "confirmed": ev.confirmed,
             })
-        return web.json_response({"count": len(data), "events": data})
+        return web.json_response({
+            "count": len(data),
+            "window_minutes": minutes,
+            "include_estimated": include_estimated,
+            **feed.window_coverage(minutes, include_estimated),
+            "events": data,
+        })
 
     async def handle_liquidation_stats(self, request: web.Request) -> web.Response:
-        minutes = _int_param(request, "minutes", 60, minimum=1, maximum=10080)
-        # ?include_estimated=false drops Hyperliquid large prints (heuristic)
-        # from every total; default true keeps the pre-existing response.
+        feed = self.hub.liquidations
+        minutes = _int_param(request, "minutes", 60, minimum=1, maximum=feed.MAX_WINDOW_MINUTES)
         include_estimated = request.query.get("include_estimated", "true").lower() not in ("0", "false", "no")
-        stats = self.hub.liquidations.get_stats(window_minutes=minutes, include_estimated=include_estimated)
+        stats = feed.get_stats(window_minutes=minutes, include_estimated=include_estimated)
         return web.json_response(stats)
 
     async def handle_funding_rates(self, request: web.Request) -> web.Response:
