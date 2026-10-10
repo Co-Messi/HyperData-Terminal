@@ -107,7 +107,7 @@ Every result carries a `meta` block with uptime and warmup warnings, so an agent
 
 ```bash
 hyperdata api --port 8420
-curl http://localhost:8420/v1/liquidations/stats?include_estimated=false
+curl http://localhost:8420/v1/liquidations/stats?minutes=240
 curl http://localhost:8420/v1/positions/danger-zone
 ```
 
@@ -120,8 +120,8 @@ curl http://localhost:8420/v1/positions/danger-zone
 | `GET /v1/health` | Status, per feed freshness and the data integrity report. `status` is `initializing` until the first self check, then `ok`, `warn` or `degraded`, never `ok` for a terminal that is not. |
 | `GET /v1/market` | All assets: prices, OI, funding |
 | `GET /v1/market/{symbol}` | Single asset detail |
-| `GET /v1/liquidations` | Recent liquidation events (each with `confirmed`) |
-| `GET /v1/liquidations/stats` | Aggregates; `?include_estimated=false` for confirmed only |
+| `GET /v1/liquidations` | Recent confirmed liquidation events; `?include_estimated=true` adds Hyperliquid large prints (each row has `confirmed`) |
+| `GET /v1/liquidations/stats` | Confirmed aggregates over `?minutes=` (max 1440) with `window_coverage`, `covered_since` and `truncated`; `?include_estimated=true` adds large prints |
 | `GET /v1/orderflow/{symbol}` | CVD per timeframe with window `coverage`, per venue CVD |
 | `GET /v1/funding-rates` | Funding across exchanges |
 | `GET /v1/funding-rates/{symbol}` | Single asset funding |

@@ -308,6 +308,23 @@ def _float_param(request: web.Request, name: str, default: float,
     return val
 
 
+_TRUE_WORDS = ("1", "true", "yes", "on")
+_FALSE_WORDS = ("0", "false", "no", "off")
+
+
+def _bool_param(request: web.Request, name: str, default: bool) -> bool:
+    """Parse a boolean query param → 400 on anything but a clear yes/no."""
+    raw = request.query.get(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in _TRUE_WORDS:
+        return True
+    if value in _FALSE_WORDS:
+        return False
+    raise web.HTTPBadRequest(reason=f"'{name}' must be true or false")
+
+
 # ── WebSocket client tracker ─────────────────────────────────────────────
 
 class _WSClient:
@@ -947,7 +964,9 @@ class HyperDataAPI:
         limit = _int_param(request, "limit", 100, minimum=1, maximum=1000)
         exchange = request.query.get("exchange")
         minutes = _int_param(request, "minutes", 60, minimum=1, maximum=feed.MAX_WINDOW_MINUTES)
-        include_estimated = True
+        # Confirmed liquidations only unless the caller opts in: Hyperliquid
+        # large prints are mostly ordinary trades.
+        include_estimated = _bool_param(request, "include_estimated", False)
         events = feed.get_recent(minutes=minutes, exchange=exchange, include_estimated=include_estimated)[:limit]
         data = []
         for ev in events:
@@ -968,7 +987,7 @@ class HyperDataAPI:
     async def handle_liquidation_stats(self, request: web.Request) -> web.Response:
         feed = self.hub.liquidations
         minutes = _int_param(request, "minutes", 60, minimum=1, maximum=feed.MAX_WINDOW_MINUTES)
-        include_estimated = request.query.get("include_estimated", "true").lower() not in ("0", "false", "no")
+        include_estimated = _bool_param(request, "include_estimated", False)
         stats = feed.get_stats(window_minutes=minutes, include_estimated=include_estimated)
         return web.json_response(stats)
 

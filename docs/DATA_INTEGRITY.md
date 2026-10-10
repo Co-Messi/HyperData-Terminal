@@ -24,9 +24,29 @@ run 44 of 50 of these were ordinary trades, so the terminal **never adds them
 to liquidation totals**: every dashboard total, the alert digest, the
 `LiquidationCascade` strategy and the LLM agent prompt use
 `get_stats(include_estimated=False)`, and the panels show large prints on
-their own labelled line. `get_stats()` defaults to `include_estimated=True`
-for API compatibility (`/v1/liquidations/stats?include_estimated=false` for
-confirmed only) and always reports `confirmed_*` and `heuristic_*` separately.
+their own labelled line. `/v1/liquidations`, `/v1/liquidations/stats` and
+the MCP `get_liquidations` tool return confirmed liquidations only unless
+the caller passes `include_estimated=true`; every row carries `confirmed`,
+and the stats always report `confirmed_*` and `heuristic_*` separately.
+
+### Window coverage: a 24h total ten minutes after launch is not a 24h total
+
+Liquidation windows are computed from in-memory buffers (50,000 confirmed
+events, a separate 50,000 for large prints). Nothing before the hub started
+is held, and a buffer that fills up evicts its oldest events. Every
+`get_stats()` result (and so `/v1/liquidations/stats`, `/v1/liquidations`
+and MCP `get_liquidations`) carries:
+
+| field | meaning |
+|---|---|
+| `window_coverage` | share of the window the held events actually span, 0 to 1 |
+| `covered_since` | the moment from which every collected event is still held |
+| `truncated` | the buffer evicted events inside this window |
+
+The panels print `since HH:MM` (UTC) next to any partial window, MCP adds a
+`meta.warnings` line, and the API and MCP accept at most a 1440 minute
+window. Hyperliquid confirmed events reach the feed about two minutes after
+they happen (the HLP fill poll), so the newest two minutes undercount them.
 
 ## Order flow / CVD
 
