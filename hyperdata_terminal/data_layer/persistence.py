@@ -385,7 +385,8 @@ class DataStore:
                     symbol TEXT NOT NULL,
                     funding_rate_hourly REAL NOT NULL,
                     funding_rate_annualized REAL NOT NULL,
-                    created_at REAL NOT NULL
+                    created_at REAL NOT NULL,
+                    interval_hours REAL
                 );
                 CREATE INDEX IF NOT EXISTS idx_fr_ts ON funding_rates(timestamp);
                 CREATE INDEX IF NOT EXISTS idx_fr_exchange_symbol ON funding_rates(exchange, symbol);
@@ -449,7 +450,11 @@ class DataStore:
     #   v7  hlp_snapshots.pnl_known: session_pnl is 0 both when PnL is truly
     #       flat and when it is unknown (no fresh vaultDetails reading); the
     #       flag tells them apart.
-    SCHEMA_VERSION = 7
+    #   v8  funding_rates.interval_hours: the symbol's funding interval the
+    #       hourly and annualized figures were divided by. NULL on rows from
+    #       earlier builds, which divided every Binance and Bybit rate by 8
+    #       (wrong for every 4h or 1h symbol).
+    SCHEMA_VERSION = 8
 
     # Tables that no code path has ever written to, by the version that
     # drops them. A dead table is dropped only when EMPTY; a populated one
@@ -510,7 +515,12 @@ class DataStore:
     def _migrate_v7(self) -> None:
         self._add_column("hlp_snapshots", "pnl_known", "INTEGER NOT NULL DEFAULT 0")
 
-    _MIGRATIONS = {3: _migrate_v3, 4: _migrate_v4, 5: _migrate_v5, 6: _migrate_v6, 7: _migrate_v7}
+    def _migrate_v8(self) -> None:
+        self._add_column("funding_rates", "interval_hours", "REAL")
+
+    _MIGRATIONS = {
+        3: _migrate_v3, 4: _migrate_v4, 5: _migrate_v5, 6: _migrate_v6, 7: _migrate_v7, 8: _migrate_v8,
+    }
 
     def _run_migrations(self) -> None:
         """Versioned migrations. Caller holds the lock.
@@ -911,9 +921,10 @@ class DataStore:
         """Queue a funding rate snapshot."""
         self._enqueue(
             "INSERT INTO funding_rates (timestamp, exchange, symbol, funding_rate_hourly, "
-            "funding_rate_annualized, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            "funding_rate_annualized, created_at, interval_hours) VALUES (?, ?, ?, ?, ?, ?, ?)",
             (snap.timestamp, snap.exchange, snap.symbol,
-             snap.funding_rate_hourly, snap.funding_rate_annualized, time.time()),
+             snap.funding_rate_hourly, snap.funding_rate_annualized, time.time(),
+             getattr(snap, "interval_hours", None)),
         )
 
     def get_funding_rates(self, exchange: str | None = None, symbol: str | None = None,
@@ -921,7 +932,7 @@ class DataStore:
         """Get historical funding rate snapshots."""
         cutoff = time.time() - (hours * 3600)
         query = ("SELECT timestamp, exchange, symbol, funding_rate_hourly, "
-                 "funding_rate_annualized FROM funding_rates WHERE timestamp > ?")
+                 "funding_rate_annualized, interval_hours FROM funding_rates WHERE timestamp > ?")
         params: list = [cutoff]
         if exchange:
             query += " AND exchange = ?"
@@ -936,7 +947,7 @@ class DataStore:
             rows = self._conn.execute(query, params).fetchall()
         return [
             {"timestamp": r[0], "exchange": r[1], "symbol": r[2],
-             "funding_rate_hourly": r[3], "funding_rate_annualized": r[4]}
+             "funding_rate_hourly": r[3], "funding_rate_annualized": r[4], "interval_hours": r[5]}
             for r in rows
         ]
 

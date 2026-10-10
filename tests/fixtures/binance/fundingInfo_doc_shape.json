@@ -1,0 +1,22 @@
+{
+ "_meta": {
+  "source": "GET https://fapi.binance.com/fapi/v1/fundingInfo (\"Query funding rate info for symbols that had FundingRateCap/FundingRateFloor / fundingIntervalHours adjustment\"). The BLZUSDT row is the official doc example verbatim. The WIFUSDT row uses the documented fields with the 4h interval observed live on 2026-10-10: Binance !markPrice@arr gave WIFUSDT next funding 04:00Z at 01:04Z (off the 8h grid) and Bybit tickers gave WIFUSDT fundingIntervalHour 4. fapi.binance.com answers HTTP 451 from the capture machine",
+  "captured": "2026-10-10"
+ },
+ "payload": [
+  {
+   "symbol": "BLZUSDT",
+   "adjustedFundingRateCap": "0.02500000",
+   "adjustedFundingRateFloor": "-0.02500000",
+   "fundingIntervalHours": 8,
+   "disclaimer": false
+  },
+  {
+   "symbol": "WIFUSDT",
+   "adjustedFundingRateCap": "0.02000000",
+   "adjustedFundingRateFloor": "-0.02000000",
+   "fundingIntervalHours": 4,
+   "disclaimer": false
+  }
+ ]
+}

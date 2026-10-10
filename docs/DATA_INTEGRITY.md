@@ -102,6 +102,33 @@ window is half covered (`OrderFlowEngine.display_signal`), and
 `/v1/orderflow/{symbol}` returns `coverage` per timeframe. The raw
 `get_multi_timeframe_signal()` used by strategies is unchanged.
 
+## Funding rates: per symbol intervals
+
+Hyperliquid pays funding every hour. Binance and Bybit set the interval per
+symbol: 8h for most majors, 4h (sometimes 1h) for many alts, and Binance
+shortens it in volatile markets. In a live capture on 2026-10-10, 16 of the
+50 tracked symbols were on a 4h schedule on Binance (WIF, TIA, JUP, ONDO,
+RENDER, HYPE, TAO, PENGU, TRUMP, ENA, W, PYTH, JTO, BONK, IMX, MANTA), and
+Bybit reported `fundingIntervalHour: 4` for WIF, 1000BONK, TIA, JUP and ONDO.
+
+Every rate is divided by its own interval before it is annualized
+(`hourly = rate / interval_hours`, `annualized = hourly × 8760`):
+
+- **Binance:** `/fapi/v1/fundingInfo` lists the symbols with an adjusted
+  interval (or cap and floor); every other symbol uses the standard 8h. It is
+  re-read hourly. Until it has loaded once, Binance rates are not published
+  (a rate with an unknown interval could be off by 2x to 8x); after that a
+  failed refresh keeps the last known intervals.
+- **Bybit:** each tickers row carries `fundingIntervalHour`; a row without it
+  falls back to `instruments-info` `fundingInterval` (minutes), and a row with
+  neither is skipped.
+
+`FundingRateSnapshot` carries `interval_hours` and `rate_per_interval`; the
+API (`/v1/funding-rates/{symbol}`, `<venue>_interval_hours` in
+`/v1/funding-rates`), MCP (`get_asset`, `get_funding_extremes`) and the
+`funding_rates` table report the interval. Rows stored by 1.0.0 and earlier
+have `interval_hours` NULL: they divided every rate by 8.
+
 ## Regional fallbacks (Binance is blocked in some regions)
 
 Binance futures answers HTTP 451 in several regions (the US among them) and

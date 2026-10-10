@@ -992,6 +992,9 @@ class HyperDataAPI:
         return web.json_response(stats)
 
     async def handle_funding_rates(self, request: web.Request) -> web.Response:
+        # Annualized percent per venue. Every venue's rate is first divided by
+        # that symbol's own funding interval (Hyperliquid: 1h; Binance and
+        # Bybit: per symbol, reported as <venue>_interval_hours).
         result: dict[str, dict] = {}
         for sym, asset in self.hub.market.assets.items():
             result[sym] = {"hl": asset.funding_rate * 8760 * 100}
@@ -1000,6 +1003,7 @@ class HyperDataAPI:
                 if sym not in result:
                     result[sym] = {}
                 result[sym][ex_name] = snap.funding_rate_annualized * 100
+                result[sym][f"{ex_name}_interval_hours"] = getattr(snap, "interval_hours", None)
         return web.json_response(result)
 
     async def handle_funding_symbol(self, request: web.Request) -> web.Response:
@@ -1007,13 +1011,18 @@ class HyperDataAPI:
         rates = {}
         asset = self.hub.market.assets.get(sym)
         if asset:
-            rates["hl"] = {"hourly": asset.funding_rate, "annualized_pct": asset.funding_rate * 8760 * 100}
+            rates["hl"] = {
+                "hourly": asset.funding_rate, "annualized_pct": asset.funding_rate * 8760 * 100,
+                "interval_hours": 1, "rate_per_interval": asset.funding_rate,
+            }
         for ex_name, ex_rates in self.hub.funding.rates.items():
             snap = ex_rates.get(sym)
             if snap:
                 rates[ex_name] = {
                     "hourly": snap.funding_rate_hourly,
                     "annualized_pct": snap.funding_rate_annualized * 100,
+                    "interval_hours": getattr(snap, "interval_hours", None),
+                    "rate_per_interval": getattr(snap, "rate_per_interval", None),
                 }
         if not rates:
             return web.json_response({"error": f"No funding data for {sym}"}, status=404)

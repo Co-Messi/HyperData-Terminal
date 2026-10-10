@@ -145,11 +145,12 @@ class HubTools:
         a = hub.market.assets.get(sym)
         if a is None:
             return self._with_meta({"symbol": sym, "error": f"{sym} is not listed on Hyperliquid (or not loaded yet)"})
-        funding = {"hyperliquid_annualized_pct": _num(a.funding_rate * 8760 * 100, 1)}
+        funding = {"hyperliquid_annualized_pct": _num(a.funding_rate * 8760 * 100, 1), "hyperliquid_interval_hours": 1}
         for ex, rates in hub.funding.rates.items():
             snap = rates.get(sym)
             if snap is not None:
                 funding[f"{ex}_annualized_pct"] = _num(snap.funding_rate_annualized * 100, 1)
+                funding[f"{ex}_interval_hours"] = _num(getattr(snap, "interval_hours", None), 2)
         out: dict[str, Any] = {
             "symbol": sym,
             "price": _num(a.price, 6),
@@ -391,10 +392,12 @@ class HubTools:
                 snap = rates.get(a.symbol)
                 if snap is not None:
                     row[f"{ex}_annualized_pct"] = _num(snap.funding_rate_annualized * 100, 1)
+                    row[f"{ex}_interval_hours"] = _num(getattr(snap, "interval_hours", None), 2)
             rows.append(row)
         return self._with_meta({
             "min_annualized_pct": abs(float(min_annualized_pct)),
             "positive_means": "longs pay shorts",
+            "annualized_from": "each venue's rate divided by that symbol's own funding interval, times 8760",
             "assets": rows,
         })
 
