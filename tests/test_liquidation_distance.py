@@ -81,7 +81,8 @@ def test_mcp_near_liquidation_lists_near_and_counts_crossed(positions):
         get_all_positions_sorted=lambda: everything,
         status=SimpleNamespace(started_at=time.time() - 60),
         market=SimpleNamespace(assets={"BTC": object()}),
-        positions=SimpleNamespace(positions=everything),
+        positions=SimpleNamespace(positions=everything, oldest_position_age_seconds=lambda: 0.0,
+                                  as_of=lambda ps: None, is_stale=lambda: False),
         hlp=SimpleNamespace(get_latest_snapshot=lambda: object()),
     )
     out = HubTools(hub).near_liquidation(max_distance_pct=2.0)

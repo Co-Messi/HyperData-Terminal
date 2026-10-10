@@ -4,9 +4,10 @@
                            # Cursor and most MCP clients launch)
 
 The server starts one HyperDataHub (the same live feeds the terminal uses)
-and answers tool calls from its in-memory state, so calls are instant and
-cost no exchange requests. Everything is read-only: there is no trading,
-no keys and no account access.
+and answers tool calls from its in-memory state, so a call is instant and
+makes no exchange request of its own; the hub itself polls in the
+background, within the shared Hyperliquid request budget (see hl_rate).
+Everything is read-only: there is no trading, no keys and no account access.
 
 Data needs a short warmup after launch (markets ~5s, whale positions ~30s,
 order-flow windows fill over their own length). Every result carries a
@@ -26,17 +27,21 @@ from typing import Any
 from hyperdata_terminal import __version__
 
 INSTRUCTIONS = """\
-Live crypto derivatives data from Hyperliquid, Binance, Bybit, OKX and Deribit,
-read from public feeds by a local HyperData hub. Read-only.
+Live crypto derivatives data from Hyperliquid, Binance, Bybit, OKX, Coinbase and
+Deribit, read from public feeds by a local HyperData hub. Read-only. Tool calls
+answer from the hub's memory; the hub polls the exchanges in the background.
 
 Good first calls: get_market_overview (what is moving), get_liquidation_heatmap
 (where leveraged positions get liquidated), get_positions_near_liquidation,
 get_whale_positions, get_order_flow (who is aggressing), get_liquidations.
 
 Every result has `meta`: check meta.warnings before concluding that something is
-absent. Liquidations marked estimated are Hyperliquid large prints, not confirmed
-liquidations. Whale and liquidation-distance data cover the Hyperliquid wallets
-the hub has discovered, not every account.
+absent or quiet. It names data still loading, stale position scans, liquidation
+venues that are down, order flow venues that are out, regional fallbacks and
+Hyperliquid rate limiting. Liquidations marked estimated are Hyperliquid large
+prints, not confirmed liquidations. Whale and liquidation-distance data cover the
+Hyperliquid wallets the hub has discovered, not every account, and each position
+says how long ago it was scanned (scan_age_seconds).
 """
 
 
@@ -49,6 +54,21 @@ def _num(x: Any, digits: int = 2) -> float | None:
     if math.isnan(f) or math.isinf(f):
         return None
     return round(f, digits)
+
+
+def _finite(x: Any, default: float) -> float:
+    """A caller supplied number, or `default` if it is not a finite number."""
+    try:
+        f = float(x)
+    except (TypeError, ValueError):
+        return default
+    return f if math.isfinite(f) else default
+
+
+def _iso(ts: float | None) -> str | None:
+    if not ts:
+        return None
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
 
 
 def _hl_rate_stats() -> dict[str, Any]:
@@ -79,12 +99,71 @@ class HubTools:
             warnings.append("whale/position scan not complete yet (first ~30s)")
         if hub.hlp.get_latest_snapshot() is None:
             warnings.append("HLP vault snapshot pending")
+        warnings.extend(self._health_warnings())
         return {
             "source": f"hyperdata-terminal {__version__}",
             "uptime_seconds": round(uptime, 1),
             "as_of": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "warnings": warnings,
         }
+
+    def _health_warnings(self) -> list[str]:
+        """What is degraded right now, from the hub's own health state, so an
+        empty warnings list really means nothing known is wrong."""
+        hub = self.hub
+        status = getattr(hub, "status", None)
+        out: list[str] = []
+
+        def guard(fn):
+            try:
+                fn()
+            except Exception:  # a partial fake hub or a component mid-start
+                pass
+
+        def positions():
+            scanner = hub.positions
+            if scanner.is_stale():
+                out.append(
+                    f"position scan is stale: the oldest displayed position was scanned "
+                    f"{scanner.oldest_position_age_seconds():.0f}s ago (stale after "
+                    f"{scanner.stale_after_seconds():.0f}s); whale and liquidation distances are old"
+                )
+
+        def liquidations():
+            down = hub.liquidations.venues_down()
+            if down:
+                out.append(f"liquidation venues not receiving: {', '.join(down)}; liquidation totals are partial")
+
+        def order_flow():
+            state = getattr(status, "orderflow_engine", "")
+            if state in ("partial", "stale", "error"):
+                bad = {v: s for v, s in hub.orderflow.venue_coverage().items() if s != "ok"}
+                out.append(f"order flow is {state}: " + ", ".join(f"{v} {s}" for v, s in bad.items()))
+
+        def feeds():
+            for name, label in (("market_data", "market data"), ("hlp_status", "HLP vault"),
+                                ("orderbook_feed", "orderbook")):
+                state = getattr(status, name, "")
+                if state in ("stale", "error"):
+                    out.append(f"{label} is {state}")
+
+        def fallbacks():
+            spot = getattr(hub.spot, "active_source", None)
+            if spot and spot != "binance":
+                out.append(f"spot prices and basis come from {spot} (Binance unavailable here)")
+            lsr = getattr(hub.lsr, "active_source", None)
+            if lsr and lsr != "binance":
+                out.append(f"long/short ratios count {lsr} accounts (Binance unavailable here)")
+
+        def rate_limit():
+            stats = _hl_rate_stats()
+            if stats["paused_for_seconds"] > 0:
+                out.append(f"Hyperliquid is rate limiting this IP: requests paused for "
+                           f"{stats['paused_for_seconds']:.0f}s")
+
+        for check in (positions, liquidations, order_flow, feeds, fallbacks, rate_limit):
+            guard(check)
+        return out
 
     def _with_meta(self, payload: dict[str, Any], warnings: list[str] | None = None) -> dict[str, Any]:
         meta = self.meta()
@@ -111,6 +190,10 @@ class HubTools:
             # Signed: negative means the price has crossed the liquidation price.
             "distance_to_liquidation_pct": _num(p.distance_pct, 3),
             "margin_mode": getattr(p, "margin_mode", "") or None,
+            # Size, entry, liquidation price and PnL are as of this scan;
+            # the mark and distance are recomputed from live prices.
+            "scanned_at": _iso(getattr(p, "scanned_at", 0.0)),
+            "scan_age_seconds": _num(time.time() - p.scanned_at, 0) if getattr(p, "scanned_at", 0.0) else None,
             "leverage": _num(p.leverage, 1),
             "unrealized_pnl_usd": _num(p.unrealized_pnl, 0),
         }
@@ -252,7 +335,7 @@ class HubTools:
         if not price:
             return self._with_meta({"symbol": sym, "error": f"no price for {sym} yet"})
         buckets = max(4, min(int(buckets), 100))
-        range_pct = max(1.0, min(float(range_pct), 50.0))
+        range_pct = max(1.0, min(_finite(range_pct, 10.0), 50.0))
         rows = compute_heatmap_buckets(
             self.hub.positions.positions, price, symbol=sym, n_buckets=buckets, range_pct=range_pct,
         )
@@ -287,7 +370,8 @@ class HubTools:
     def whale_positions(
         self, min_size_usd: float = 1_000_000, symbol: str | None = None, limit: int = 20,
     ) -> dict[str, Any]:
-        positions = self.hub.get_whale_positions(min_size_usd=max(0.0, float(min_size_usd)))
+        min_size_usd = max(0.0, _finite(min_size_usd, 1_000_000.0))
+        positions = self.hub.get_whale_positions(min_size_usd=min_size_usd)
         if symbol:
             positions = [p for p in positions if p.symbol == self._sym(symbol)]
         positions = positions[: max(1, min(limit, 100))]
@@ -299,12 +383,13 @@ class HubTools:
             "short_usd": _num(sum(p.size_usd for p in positions if p.side != "long"), 0),
             "positions": [self._position(p) for p in positions],
             "scan_age_seconds": _num(self.hub.positions.oldest_position_age_seconds(), 0),
+            "as_of": _iso(self.hub.positions.as_of(positions)),
         })
 
     def near_liquidation(
         self, max_distance_pct: float = 2.0, symbol: str | None = None, limit: int = 20,
     ) -> dict[str, Any]:
-        cap = max(0.01, float(max_distance_pct))
+        cap = max(0.01, _finite(max_distance_pct, 2.0))
         everything = self.hub.get_all_positions_sorted()
         if symbol:
             everything = [p for p in everything if p.symbol == self._sym(symbol)]
@@ -317,6 +402,8 @@ class HubTools:
             "venue": "hyperliquid",
             "max_distance_pct": cap,
             "count": len(positions),
+            "scan_age_seconds": _num(self.hub.positions.oldest_position_age_seconds(), 0),
+            "as_of": _iso(self.hub.positions.as_of(positions)),
             "crossed_liquidation_price": {
                 "count": len(crossed),
                 "size_usd": _num(sum(p.size_usd for p in crossed), 0),
@@ -390,7 +477,8 @@ class HubTools:
         })
 
     def funding_extremes(self, min_annualized_pct: float = 50.0, limit: int = 15) -> dict[str, Any]:
-        threshold = abs(float(min_annualized_pct)) / 100
+        min_annualized_pct = abs(_finite(min_annualized_pct, 50.0))
+        threshold = min_annualized_pct / 100
         rows = []
         for a in self.hub.get_extreme_funding(threshold_annualized=threshold)[: max(1, min(limit, 100))]:
             row = {"symbol": a.symbol, "hyperliquid_annualized_pct": _num(a.funding_rate * 8760 * 100, 1)}
@@ -401,7 +489,7 @@ class HubTools:
                     row[f"{ex}_interval_hours"] = _num(getattr(snap, "interval_hours", None), 2)
             rows.append(row)
         return self._with_meta({
-            "min_annualized_pct": abs(float(min_annualized_pct)),
+            "min_annualized_pct": min_annualized_pct,
             "positive_means": "longs pay shorts",
             "annualized_from": "each venue's rate divided by that symbol's own funding interval, times 8760",
             "assets": rows,
