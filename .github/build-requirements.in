@@ -1,0 +1,4 @@
+# Build tooling for the CI package job and the release workflow. The hashed
+# build-requirements.txt next to this file is generated from it with
+#   uv pip compile .github/build-requirements.in --generate-hashes --universal --python-version 3.12 -o .github/build-requirements.txt
+build==1.3.0

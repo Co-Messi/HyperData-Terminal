@@ -2,7 +2,8 @@
 # tests/test_*.py on its own but not conftest.py, tests/__init__.py or the lock.
 graft tests
 include requirements.lock requirements.txt
-# tests/test_dependency_lock.py checks that CI installs with dependencies.
-include .github/workflows/ci.yml
+# tests/test_dependency_lock.py and tests/test_release_workflow.py read these.
+include .github/workflows/ci.yml .github/workflows/release.yml
+include .github/build-requirements.in .github/build-requirements.txt
 global-exclude *.bak *.py[cod]
 prune tests/__pycache__

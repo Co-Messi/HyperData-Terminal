@@ -86,7 +86,7 @@ jobs:
 
       - name: Build sdist and wheel
         run: |
-          pip install build==1.3.0
+          pip install --require-hashes -r .github/build-requirements.txt
           python -m build
 
       - name: Install the wheel into a clean venv and run it
@@ -95,10 +95,15 @@ jobs:
           /tmp/clean/bin/pip install dist/*.whl
           cd /tmp
           /tmp/clean/bin/hyperdata --version
+          /tmp/clean/bin/hyperdata-terminal --version
           /tmp/clean/bin/hyperdata --help > /dev/null
           /tmp/clean/bin/hyperdata paper --help > /dev/null
+          /tmp/clean/bin/hyperdata verify --help > /dev/null
+          /tmp/clean/bin/hyperdata alerts > /dev/null
+          set +e; /tmp/clean/bin/hyperdata alerts --test > /dev/null 2>&1; code=$?; set -e
+          if [ "$code" != "2" ]; then echo "alerts --test without channels exited $code, expected 2"; exit 1; fi
           /tmp/clean/bin/python -m hyperdata_terminal --version
-          /tmp/clean/bin/python -c "import hyperdata_terminal.terminal, hyperdata_terminal.cli, hyperdata_terminal.mcp_server"
+          /tmp/clean/bin/python -c "import hyperdata_terminal.cli, hyperdata_terminal.terminal, hyperdata_terminal.mcp_server, hyperdata_terminal.api_server, hyperdata_terminal.verify_data, hyperdata_terminal.strategies.paper_trader, hyperdata_terminal.strategies.llm_agent, hyperdata_terminal.data_layer.hub"
           site=$(/tmp/clean/bin/python -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")
           for stray in src config; do
             if [ -e "$site/$stray" ]; then echo "wheel installs a top-level '$stray' package"; exit 1; fi
