@@ -47,6 +47,7 @@ from typing import Any
 from aiohttp import WSMsgType, web
 
 from hyperdata_terminal import __version__
+from hyperdata_terminal.data_layer.cascade import CascadeDetector
 from hyperdata_terminal.data_layer.hl_rate import get_governor
 from hyperdata_terminal.data_layer.liquidation_processing import LiquidationProcessor
 
@@ -358,6 +359,10 @@ class _WSClient:
 class HyperDataAPI:
     """REST API v1 + WebSocket streaming, backed by a live HyperDataHub."""
 
+    CASCADE_ALERT_USD = 5_000_000.0
+    CASCADE_ALERT_WINDOW_S = 600.0
+    CASCADE_ALERT_COOLDOWN_S = 300.0
+
     def __init__(self, hub, host: str = "127.0.0.1", port: int = 8420) -> None:
         # Bind to loopback by default. Non-loopback binds are refused in
         # start() unless HYPERDATA_API_KEY is set (auth enforced) or
@@ -373,6 +378,12 @@ class HyperDataAPI:
         # Liquidation dedup / cascade / symbol logic lives in the data layer
         # (M13); the API only broadcasts what it lets through.
         self._liq = LiquidationProcessor()
+        # Market wide cascade alert for WebSocket clients: confirmed volume
+        # over CASCADE_ALERT_WINDOW_S kept incrementally, one alert per
+        # CASCADE_ALERT_COOLDOWN_S.
+        self._cascade = CascadeDetector((self.CASCADE_ALERT_WINDOW_S,))
+        self._cascade_alert_at = 0.0
+        self.cascade_alerts_sent = 0
         self._heartbeat_task: asyncio.Task | None = None
 
     # ── Lifecycle ────────────────────────────────────────────────
@@ -607,17 +618,36 @@ class HyperDataAPI:
             "cascade": cascade,
         })
 
-        # Alert: large liquidation cascade check. Use CONFIRMED volume only —
-        # blended total_volume_usd is inflated by Hyperliquid's large-trade
-        # heuristic, which would fire false cascade alerts.
-        stats = self.hub.liquidations.get_stats(window_minutes=10)
-        confirmed_vol = stats.get("confirmed_volume_usd", 0)
-        if confirmed_vol > 5_000_000:
-            self._broadcast("alert", {
-                "type": "liq_cascade", "asset": ev.symbol,
-                "message": f"Liquidation cascade: ${confirmed_vol:,.0f} in 10min (confirmed)",
-                "severity": "HIGH", "action": "REVIEW_POSITIONS",
-            })
+        self._maybe_cascade_alert(ev)
+
+    def _maybe_cascade_alert(self, ev) -> None:
+        """Market wide cascade alert: confirmed volume across every symbol in
+        the last 10 minutes over the threshold, at most once per cooldown.
+        Running totals are kept incrementally (the old check rescanned the
+        whole liquidation buffer on every event and re-alerted on each one,
+        labelled with whichever symbol happened to arrive)."""
+        if not self._cascade.add(ev):
+            return  # estimated (Hyperliquid large print): never counted
+        now = time.time()
+        totals = self._cascade.totals(self.CASCADE_ALERT_WINDOW_S, now)
+        if totals.volume_usd <= self.CASCADE_ALERT_USD:
+            return
+        if now - self._cascade_alert_at < self.CASCADE_ALERT_COOLDOWN_S:
+            return
+        self._cascade_alert_at = now
+        self.cascade_alerts_sent += 1
+        minutes = self.CASCADE_ALERT_WINDOW_S / 60
+        self._broadcast("alert", {
+            "type": "liq_cascade", "scope": "market", "asset": "ALL",
+            "window_minutes": minutes,
+            "volume_usd": totals.volume_usd,
+            "long_liquidated_usd": totals.long_usd,
+            "short_liquidated_usd": totals.short_usd,
+            "top_symbols": [{"symbol": s, "volume_usd": v} for s, v in totals.top_symbols(5)],
+            "message": f"Liquidation cascade: ${totals.volume_usd:,.0f} confirmed across all symbols "
+                       f"in {minutes:.0f} min",
+            "severity": "HIGH", "action": "REVIEW_POSITIONS",
+        })
 
     def _broadcast(self, event_type: str, data: dict) -> None:
         """Enqueue event for all subscribed WebSocket clients.
