@@ -186,7 +186,7 @@ How fills work, so the paper result means something:
 | **Coinbase** | Spot fallback for basis | REST |
 | **Deribit** | DVOL implied volatility | REST |
 
-Coverage is honest, not a census. Hyperliquid has no public liquidation feed, so its confirmed liquidations are the ones an HLP vault took the other side of (a few an hour, counted once per liquidation even when two vaults filled it); trades of $10K or more are shown separately as estimated large prints and never counted as liquidations. Binance futures is blocked in some regions (the US among them): there the Binance CVD leg reads `silent` and spot, long/short and the price cross check fall back to Coinbase, Bybit or OKX, each value naming its source. Details: [docs/DATA_INTEGRITY.md](docs/DATA_INTEGRITY.md).
+Coverage is honest, not a census. Hyperliquid has no public liquidation feed, so its confirmed liquidations are the ones an HLP vault took the other side of (a few an hour, counted once per liquidation even when two vaults filled it); trades of $10K or more are shown separately as estimated large prints and never counted as liquidations. Binance futures REST is blocked in some regions (the US among them): there spot, long/short and the price cross check fall back to Coinbase, Bybit or OKX, each value naming its source, and a Binance stream that delivers nothing reads `silent` instead of passing for live. Details: [docs/DATA_INTEGRITY.md](docs/DATA_INTEGRITY.md).
 
 ## Configuration
 

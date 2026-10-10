@@ -63,7 +63,7 @@ they happen (the HLP fill poll), so the newest two minutes undercount them.
   | `ok` | trades arriving within 30s (Hyperliquid: and every expected shard socket up) |
   | `partial` | Hyperliquid only: trades arriving, but at least one of its subscription shards is dark — flapping (its last two sockets died within 30s of connecting) or without a socket past the grace — so that shard's symbols are missing from the CVD; `shards_dark` / `dark_symbols` say which |
   | `connecting` | (re)connected under 30s ago, no trade yet |
-  | `silent` | socket open past the grace period, **zero frames received** — the handshake succeeded but the stream delivers nothing (Binance Futures is geo-blocked in some regions and behaves exactly like this) |
+  | `silent` | socket open past the grace period, **zero frames received** — the handshake succeeded but the stream delivers nothing (Binance's legacy `/ws` and `/stream` routes behave exactly like this since its market streams moved to `/market`; a regional block can too) |
   | `frozen` | frames still arriving but none parse into a trade for 30s (schema change); the per-venue `parse_errors` counter says why |
   | `stale` | had trades, socket open, nothing for 30s |
   | `disconnected` | socket not open (never connected, or between reconnects) |
@@ -131,8 +131,10 @@ have `interval_hours` NULL: they divided every rate by 8.
 
 ## Regional fallbacks (Binance is blocked in some regions)
 
-Binance futures answers HTTP 451 in several regions (the US among them) and
-Bybit 403s in others. Sources that would otherwise go dark fall back in
+Binance futures REST answers HTTP 451 in several regions (the US among them)
+and Bybit 403s in others. (Binance's market data websockets under `/market`,
+which the liquidation feed and the CVD leg use, answered from a region where
+its REST API is blocked; the legacy `/ws` route answered nothing anywhere.) Sources that would otherwise go dark fall back in
 order, and every value says which venue it came from:
 
 | Data | Order | Field |

@@ -4,7 +4,7 @@ from __future__ import annotations
 HYPERLIQUID_API_URL = "https://api.hyperliquid.xyz"
 HYPERLIQUID_INFO_URL = f"{HYPERLIQUID_API_URL}/info"
 HYPERLIQUID_WS_URL = "wss://api.hyperliquid.xyz/ws"
-BINANCE_FUTURES_WS = "wss://fstream.binance.com/ws"
+BINANCE_FUTURES_WS = "wss://fstream.binance.com/market/ws"
 BYBIT_WS = "wss://stream.bybit.com/v5/public/linear"
 OKX_WS = "wss://ws.okx.com:8443/ws/v5/public"
 

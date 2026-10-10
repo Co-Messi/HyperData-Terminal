@@ -241,11 +241,19 @@ class ExchangeConnection:
         pass
 
 
+# Binance USD-M market streams are served under /market ("Connect to
+# wss://fstream.binance.com/market/stream", USD-M WebSocket Market Streams
+# docs). The legacy /ws and /stream paths still accept the handshake but,
+# probed on 2026-10-10, deliver no frames at all.
+BINANCE_MARKET_WS = "wss://fstream.binance.com/market/ws"
+BINANCE_MARKET_STREAM = "wss://fstream.binance.com/market/stream"
+
+
 class BinanceConnection(ExchangeConnection):
     def __init__(self, feed: LiquidationFeed):
         super().__init__(
             name="binance",
-            ws_url="wss://fstream.binance.com/ws/!forceOrder@arr",
+            ws_url=f"{BINANCE_MARKET_WS}/!forceOrder@arr",
             feed=feed,
         )
 

@@ -1026,6 +1026,14 @@ class OrderFlowEngine:
         "PEPEUSDT": "PEPE", "WIFUSDT": "WIF", "INJUSDT": "INJ",
     }
 
+    def binance_stream_url(self) -> str:
+        """Combined aggTrade stream on Binance's /market route (the legacy
+        /stream path connects but delivers nothing)."""
+        from hyperdata_terminal.data_layer.liquidation_feed import BINANCE_MARKET_STREAM
+
+        streams = [f"{sym.lower()}@aggTrade" for sym in self._BINANCE_SYMBOL_MAP]
+        return f"{BINANCE_MARKET_STREAM}?streams={'/'.join(streams)}"
+
     async def _binance_trade_loop(self) -> None:
         """Connect to Binance Futures aggTrade stream and feed into CVD engine.
 
@@ -1034,9 +1042,8 @@ class OrderFlowEngine:
         """
         import json as _json
 
-        # Build combined stream URL for top symbols
-        streams = [f"{sym.lower()}@aggTrade" for sym in self._BINANCE_SYMBOL_MAP]
-        url = f"wss://fstream.binance.com/stream?streams={'/'.join(streams)}"
+        url = self.binance_stream_url()
+        streams = list(self._BINANCE_SYMBOL_MAP)
 
         backoff = 1.0
         while self._running:
