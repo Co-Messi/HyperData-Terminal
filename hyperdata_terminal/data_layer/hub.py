@@ -38,6 +38,7 @@ from hyperdata_terminal.data_layer.hl_rate import get_governor
 from hyperdata_terminal.data_layer.hlp_tracker import HLPPosition, HLPTracker, HLPTrade
 from hyperdata_terminal.data_layer.liquidation_feed import LiquidationEvent, LiquidationFeed
 from hyperdata_terminal.data_layer.long_short_ratio import LongShortCollector, LongShortSnapshot
+from hyperdata_terminal.data_layer.market_data import REFRESH_SECONDS as MARKET_REFRESH_SECONDS
 from hyperdata_terminal.data_layer.market_data import AssetInfo, MarketData
 from hyperdata_terminal.data_layer.orderbook import OrderBookEngine, OrderBookSnapshot
 from hyperdata_terminal.data_layer.orderflow_engine import (
@@ -161,7 +162,7 @@ class HyperDataHub:
         symbols: list[str] | None = None,
         demo: bool = False,
         scan_interval: float = SCAN_INTERVAL_SECONDS,
-        market_refresh_interval: float = 5.0,
+        market_refresh_interval: float = MARKET_REFRESH_SECONDS,
         api_port: int | None = None,
         smart_money: bool = True,
     ) -> None:
@@ -229,6 +230,8 @@ class HyperDataHub:
         # Wire up internal callbacks
         self.liquidations.on_liquidation(self._handle_liquidation)
         self.orderflow.on_trade(self._handle_trade)
+        self.orderflow.on_hl_trade(self._handle_hl_trade)
+        self.orderbook.on_mids(self.market.apply_mids)
         self.smart_money.on_signal(self._handle_signal)
         self.hlp.on_hlp_trade(self._handle_hlp_trade)
         self.hlp.on_hlp_absorption(self._handle_hlp_absorption)
@@ -279,6 +282,25 @@ class HyperDataHub:
             except Exception:
                 logger.exception("Trade callback error")
 
+    def _handle_hl_trade(self, trade: Trade, raw: dict) -> None:
+        """One new Hyperliquid trade from the order flow socket: the large
+        print heuristic and smart money discovery read it here instead of
+        holding sockets of their own (Hyperliquid allows 10 per IP)."""
+        event = self.liquidations.hyperliquid_large_print(trade)
+        if event is not None:
+            self._schedule_emit(event)
+        if self.smart_money_enabled:
+            self.smart_money.observe_users(raw.get("users") if isinstance(raw, dict) else None)
+
+    def _schedule_emit(self, event: LiquidationEvent) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = loop.create_task(self.liquidations.emit(event))
+        self._emit_tasks.add(task)
+        task.add_done_callback(self._emit_tasks.discard)
+
     def _handle_hlp_trade(self, trade: HLPTrade) -> None:
         self.status.hlp_trades += 1
         for cb in self._on_hlp_trade_cbs:
@@ -315,13 +337,7 @@ class HyperDataHub:
             quantity=trade.size,
             confirmed=True,
         )
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return
-        task = loop.create_task(self.liquidations.emit(event))
-        self._emit_tasks.add(task)
-        task.add_done_callback(self._emit_tasks.discard)
+        self._schedule_emit(event)
 
     # ── Lifecycle ─────────────────────────────────────────────────
 

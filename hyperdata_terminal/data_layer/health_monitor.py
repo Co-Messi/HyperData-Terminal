@@ -40,7 +40,7 @@ LSR_TOLERANCE_PCT = 20.0  # different venues, generous tolerance
 
 # Freshness thresholds (seconds). Order flow / orderbook delegate to the engines'
 # own is_stale() (set in the data layer) so the threshold lives in one place.
-MARKET_FRESH_SECONDS = 30.0
+MARKET_FRESH_SECONDS = 90.0  # REST refresh every 30s; prices in between are live mids
 DERIBIT_FRESH_SECONDS = 180.0
 
 

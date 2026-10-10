@@ -113,10 +113,15 @@ class CVDDashboard:
         market_data: MarketData | None = None,
         symbol: str = "BTC",
         demo: bool = False,
+        owns_feed: bool = False,
     ) -> None:
         self.console = Console()
         self.engine = engine
         self.market_data = market_data
+        # owns_feed: a standalone run (python -m ...) drives the market data
+        # itself. Under the hub (the default) the hub already refreshes it,
+        # and a second caller doubled the Hyperliquid weight.
+        self.owns_feed = owns_feed
         self.symbol = symbol.upper()
         self.demo = demo
         self.cycle: int = 0
@@ -497,7 +502,10 @@ class CVDDashboard:
         if self.market_data is None:
             return
         try:
-            asset = await self.market_data.get_asset(self.symbol)
+            # Under the hub, read what it already holds: get_asset() refetched
+            # metaAndAssetCtxs (weight 20) on every 1s redraw.
+            asset = (await self.market_data.get_asset(self.symbol) if self.owns_feed
+                     else self.market_data.assets[self.symbol])
             self._cached_price = asset.price
             self._cached_pct = asset.price_change_24h_pct * 100.0
         except Exception:
@@ -549,7 +557,7 @@ async def _main(live: bool = False) -> None:
     engine = OrderFlowEngine(symbols=["BTC"])
     market_data = MarketData()
 
-    dashboard = CVDDashboard(engine=engine, market_data=market_data, symbol="BTC")
+    dashboard = CVDDashboard(engine=engine, market_data=market_data, symbol="BTC", owns_feed=True)
 
     if live:
         # Real data from Hyperliquid WebSocket.

@@ -160,6 +160,10 @@ class HLPTracker:
     # starts this far past the watermark, the fills in between are gone.
     GAP_WARN_SECONDS = 2 * FILLS_INTERVAL
     FIRST_POLL_LOOKBACK = 86_400  # seed 24h of absorptions from the quiet Liquidator vaults
+    # Most child vaults (the Liquidators, Strategy X) go days without a fill:
+    # each empty poll doubles that vault's interval up to this cap, and a
+    # poll with fills resets it to FILLS_INTERVAL. Every poll weighs 20+.
+    QUIET_VAULT_MAX_INTERVAL = 600
     ZSCORE_WINDOW = 100         # Use last 100 snapshots for Z-score
     MAX_ABSORPTIONS = 2000
 
@@ -180,6 +184,8 @@ class HLPTracker:
         # exact time. Fills at or before the watermark are never processed
         # again, and an empty or short response changes nothing.
         self._fill_watermark: dict[str, int] = {}
+        self._vault_interval: dict[str, float] = {}
+        self._vault_next_poll: dict[str, float] = {}
         self._tids_at_watermark: dict[str, set[int]] = {}
         self._callbacks: list = []
         self._absorption_callbacks: list = []
@@ -447,8 +453,18 @@ class HLPTracker:
         """Periodically fetch fills of every child vault to catch liquidation absorptions."""
         while self._running:
             try:
+                now = time.time()
                 for address in self.child_vaults:
+                    if now < self._vault_next_poll.get(address, 0.0):
+                        continue
+                    before = len(self.trades)
                     await self._fetch_fills(address)
+                    got_fills = len(self.trades) != before
+                    interval = self._vault_interval.get(address, self.FILLS_INTERVAL)
+                    interval = (self.FILLS_INTERVAL if got_fills
+                                else min(self.QUIET_VAULT_MAX_INTERVAL, interval * 2))
+                    self._vault_interval[address] = interval
+                    self._vault_next_poll[address] = time.time() + interval - 1
                 # After every vault was polled, so A's and B's fills of one
                 # liquidation are reported as one absorption.
                 self.flush_absorptions()

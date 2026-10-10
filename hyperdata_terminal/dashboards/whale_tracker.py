@@ -127,9 +127,14 @@ class WhaleTrackerDashboard:
         scanner: PositionScanner | None = None,
         demo: bool = False,
         refresh_rate: int = 15,
+        owns_feed: bool = False,
     ) -> None:
         self.console = Console()
         self.scanner = scanner
+        # owns_feed: a standalone run (python -m ...) drives the scanner
+        # itself. Under the hub (the default) the hub already refreshes it,
+        # and a second caller doubled the Hyperliquid weight.
+        self.owns_feed = owns_feed
         self.demo = demo
         self.cycle = 0
         self.refresh_rate = refresh_rate
@@ -448,7 +453,7 @@ class WhaleTrackerDashboard:
 
         try:
             self.scan_error = None
-            all_positions = await self.scanner.scan()
+            all_positions = await self.scanner.scan() if self.owns_feed else list(self.scanner.positions)
             # Filter to whale-sized positions (> $100K) and sort by size
             whales = [p for p in all_positions if p.size_usd >= 100_000]
             self.positions = sorted(whales, key=lambda p: p.size_usd, reverse=True)
@@ -504,6 +509,7 @@ def main() -> None:
         scanner=scanner,
         demo=demo,
         refresh_rate=args.refresh,
+        owns_feed=True,
     )
 
     try:

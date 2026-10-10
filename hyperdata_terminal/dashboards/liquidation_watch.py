@@ -133,9 +133,14 @@ class LiquidationWatchDashboard:
         scanner: PositionScanner | None = None,
         demo: bool = False,
         refresh_rate: int = DASHBOARD_REFRESH_RATE,
+        owns_feed: bool = False,
     ) -> None:
         self.console = Console()
         self.scanner = scanner
+        # owns_feed: a standalone run (python -m ...) drives the scanner
+        # itself. Under the hub (the default) the hub already refreshes it,
+        # and a second caller doubled the Hyperliquid weight.
+        self.owns_feed = owns_feed
         self.demo = demo
         self.cycle = 0
         self.refresh_rate = refresh_rate
@@ -432,7 +437,7 @@ class LiquidationWatchDashboard:
 
         try:
             self.scan_error = None
-            all_positions = await self.scanner.scan()
+            all_positions = await self.scanner.scan() if self.owns_feed else list(self.scanner.positions)
             # Filter to BTC only for this dashboard
             btc_positions = [p for p in all_positions if p.symbol == "BTC"]
             self.positions = sorted(btc_positions, key=lambda p: p.distance_pct)
@@ -493,6 +498,7 @@ def main() -> None:
         scanner=scanner,
         demo=demo,
         refresh_rate=args.refresh,
+        owns_feed=True,
     )
 
     try:

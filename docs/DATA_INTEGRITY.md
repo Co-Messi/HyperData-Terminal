@@ -82,8 +82,8 @@ they happen (the HLP fill poll), so the newest two minutes undercount them.
   are therefore filtered against the live `meta` universe (refreshed hourly);
   an unlisted default symbol is skipped with one WARNING naming it and the
   alias Hyperliquid uses (`PEPE` → `kPEPE`). Symbols are also spread across
-  sockets of at most 8 subscriptions so a coin delisted between refreshes
-  takes down one shard, not the venue. A socket the server closes shortly
+  sockets of at most 25 subscriptions (two for the default list) so a coin
+  delisted between refreshes takes down one shard, not the venue. A socket the server closes shortly
   after connecting is retried with backoff (1s doubling to 15s), never in a
   tight loop. Shard liveness is tracked individually: `/v1/health` →
   `orderflow_venues.hyperliquid` carries `sockets_open` vs
@@ -224,6 +224,20 @@ governor (`data_layer/hl_rate.py`):
   share, the weight used in the last minute, the 429 count and any pause;
   the `hyperliquid_rate_limit` health check warns when 429s happened since
   the previous check.
+
+Hyperliquid also allows only 10 websocket connections per IP (and 30 new
+ones a minute). A process now opens three: two order flow sockets (25
+`trades` subscriptions each) and the orderbook socket, which also carries
+`allMids`. The Hyperliquid large print heuristic and smart money wallet
+discovery read the order flow socket's trades instead of opening sockets of
+their own, and market data takes live prices from `allMids` and refreshes
+funding, open interest and volume over REST every 30 seconds (it polled
+`metaAndAssetCtxs`, weight 20, every 5 seconds). The dashboards read what
+the hub already holds: the CVD dashboard used to refetch
+`metaAndAssetCtxs` on every one second redraw, and the liquidation watch and
+whale dashboards ran a second position scan alongside the hub's. Quiet HLP
+child vaults (most go days without a fill) are polled every 2 minutes
+backing off to 10 while they stay empty.
 
 Smart money runs only where it is read: the menu and `hyperdata all`, and
 `hyperdata paper` when a strategy sets `uses_smart_money = True`. The API,

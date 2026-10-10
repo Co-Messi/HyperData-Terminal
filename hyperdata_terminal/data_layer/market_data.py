@@ -30,6 +30,18 @@ class AssetInfo:
     mark_price: float
     index_price: float
     premium_pct: float = 0.0  # (mark - index) / index * 100
+    # Previous day's price (prevDayPx), so a live price can update the 24h change.
+    prev_day_price: float = 0.0
+    # "mid" (live, from the allMids websocket) or "mark" (last REST refresh).
+    price_source: str = "mark"
+
+
+# metaAndAssetCtxs (funding, OI, volume, mark, oracle) weighs 20 and is
+# refreshed this often by the hub; live prices arrive in between from the
+# allMids websocket (apply_mids), which costs no request weight.
+REFRESH_SECONDS = 30.0
+# A mid older than this is not "live" any more: price falls back to the mark.
+MID_FRESH_SECONDS = 15.0
 
 
 class MarketData:
@@ -38,7 +50,9 @@ class MarketData:
     def __init__(self) -> None:
         self.assets: dict[str, AssetInfo] = {}
         self.last_update: float = 0.0
-        self._cache_ttl: float = 1.0  # 1 second (was 5 — too stale for trading)
+        self._cache_ttl: float = REFRESH_SECONDS
+        self._mids: dict[str, float] = {}
+        self._mids_at: float = 0.0
         self._semaphore = asyncio.Semaphore(MAX_REQUESTS_PER_SECOND)
         self._session: aiohttp.ClientSession | None = None
 
@@ -95,13 +109,31 @@ class MarketData:
                     mark_price=mark_px,
                     index_price=oracle_px,
                     premium_pct=premium_pct,
+                    prev_day_price=prev_day_px,
                 )
             except (ValueError, TypeError) as exc:
                 logger.debug("Skipping %s: %s", symbol, exc)
 
         self.assets = assets
         self.last_update = time.monotonic()
+        if time.time() - self._mids_at <= MID_FRESH_SECONDS:
+            self.apply_mids(self._mids, stamp=False)
         logger.info("Refreshed market data for %d assets", len(assets))
+
+    def apply_mids(self, mids: dict[str, float], stamp: bool = True) -> None:
+        """Live prices from the allMids websocket: update each asset's price
+        (and 24h change) in place between REST refreshes."""
+        if stamp:
+            self._mids.update(mids)
+            self._mids_at = time.time()
+        for symbol, mid in mids.items():
+            asset = self.assets.get(symbol)
+            if asset is None or not mid > 0:
+                continue
+            asset.price = mid
+            asset.price_source = "mid"
+            if asset.prev_day_price > 0:
+                asset.price_change_24h_pct = (mid - asset.prev_day_price) / asset.prev_day_price
 
     async def get_asset(self, symbol: str) -> AssetInfo:
         """Get data for a single asset, refreshing if cache is stale."""

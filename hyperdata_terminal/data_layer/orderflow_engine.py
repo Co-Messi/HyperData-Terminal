@@ -18,7 +18,7 @@ from typing import Callable
 import aiohttp
 
 from hyperdata_terminal.config.settings import DEFAULT_SYMBOLS
-from hyperdata_terminal.data_layer.hl_rate import hl_info
+from hyperdata_terminal.data_layer.hl_rate import get_governor, hl_info
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +55,15 @@ VENUES = ("hyperliquid", "binance")
 # (HL_UNIVERSE_TTL), and symbols are still sharded across sockets so that a
 # coin delisted BETWEEN universe refreshes takes down at most one shard —
 # not the whole venue — until the next refresh.
-HL_SUBSCRIPTIONS_PER_SOCKET = 8
+#
+# Hyperliquid allows 10 websocket connections per IP (and 30 new ones a
+# minute). Shards of 8 took 7 sockets for the 50 default symbols, and with
+# the liquidation feed, smart money and orderbook sockets one process used
+# all 10, so a second process on the same machine went over. Shards of 25
+# need 2 sockets, and this engine's trade stream now also feeds the
+# Hyperliquid large prints and smart money discovery (on_hl_trade), which
+# used to open sockets of their own.
+HL_SUBSCRIPTIONS_PER_SOCKET = 25
 HL_UNIVERSE_TTL = 3600.0
 
 # Backoff ceiling after a short-lived clean close (server dropped us right
@@ -321,6 +329,9 @@ class OrderFlowEngine:
         self.synthetic: bool = False
 
         self._callbacks: list[Callable[[Trade], None]] = []
+        # (trade, raw Hyperliquid trade dict) for every new HL trade: the
+        # raw dict carries `users`, which smart money discovery reads.
+        self._hl_trade_callbacks: list[Callable[[Trade, dict], None]] = []
         self._running: bool = False
         # Hyperliquid: one socket per shard of HL_SUBSCRIPTIONS_PER_SOCKET
         # symbols (see that constant). shard index -> open socket / session.
@@ -689,6 +700,10 @@ class OrderFlowEngine:
         """Register a callback invoked for every incoming trade."""
         self._callbacks.append(callback)
 
+    def on_hl_trade(self, callback: Callable[[Trade, dict], None]) -> None:
+        """Register callback(trade, raw) for every new Hyperliquid trade."""
+        self._hl_trade_callbacks.append(callback)
+
     def get_snapshot(self, symbol: str, timeframe: str) -> CVDSnapshot:
         """Current CVD snapshot for *symbol* at *timeframe*."""
         return self.buckets[symbol][timeframe].get_snapshot()
@@ -894,6 +909,7 @@ class OrderFlowEngine:
             # heartbeat=20 so a half-open HL socket raises instead of silently
             # freezing the CVD buckets (the other venue/socket already does this).
             ws = await session.ws_connect(WS_URL, heartbeat=20)
+            get_governor().ws_opened()
             self._hl_sockets[shard] = ws
             state.connected_at = time.time()
             state.down_since = 0.0
@@ -919,6 +935,8 @@ class OrderFlowEngine:
                 ):
                     break
         finally:
+            if ws is not None:
+                get_governor().ws_closed()
             self._hl_sockets.pop(shard, None)
             self._hl_sessions.pop(shard, None)
             if state.connected_at > 0:
@@ -989,6 +1007,11 @@ class OrderFlowEngine:
                 )
                 self._process_trade(trade, venue="hyperliquid")
                 self._venue_trade("hyperliquid")
+                for cb in self._hl_trade_callbacks:
+                    try:
+                        cb(trade, t)
+                    except Exception:
+                        logger.exception("Hyperliquid trade callback error")
             except (KeyError, ValueError, TypeError) as exc:
                 self._venue_parse_error("hyperliquid", exc, t)
 

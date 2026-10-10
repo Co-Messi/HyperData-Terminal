@@ -169,11 +169,10 @@ class SmartMoneyEngine:
     # ── Lifecycle ──────────────────────────────────────────────────────
 
     async def start(self) -> None:
-        """Start discovery and analysis loops."""
+        """Start the analysis loop and seeding (wallets arrive via observe_users)."""
         self._running = True
         self._session = aiohttp.ClientSession()
         self._tasks = [
-            asyncio.create_task(self._discovery_loop(), name="sm-discovery"),
             asyncio.create_task(self._analysis_loop(), name="sm-analysis"),
             asyncio.create_task(self.seed_from_leaderboard(), name="sm-seed"),
         ]
@@ -356,91 +355,27 @@ class SmartMoneyEngine:
 
     # ── Discovery ─────────────────────────────────────────────────────
 
-    async def _discovery_loop(self) -> None:
-        """Watch trade WebSocket and collect addresses."""
-        coins = ["BTC", "ETH", "SOL", "DOGE", "XRP", "AVAX", "LINK", "ARB"]
-        while self._running:
-            try:
-                async with self._session.ws_connect(
-                    "wss://api.hyperliquid.xyz/ws", heartbeat=20
-                ) as ws:
-                    for coin in coins:
-                        await ws.send_json({
-                            "method": "subscribe",
-                            "subscription": {"type": "trades", "coin": coin},
-                        })
+    def observe_users(self, users) -> None:
+        """Add the wallets on one Hyperliquid trade (its `users` field).
 
-                    async for msg in ws:
-                        if not self._running:
-                            break
-                        if msg.type == aiohttp.WSMsgType.TEXT:
-                            data = json.loads(msg.data)
-                            if data.get("channel") == "trades":
-                                for trade in data.get("data", []):
-                                    for addr in trade.get("users", []):
-                                        # Untrusted payload: only well-formed
-                                        # wallet addresses become profiles.
-                                        if not address_store.is_valid_address(addr):
-                                            continue
-                                        addr = address_store.normalize_address(addr)
-                                        if addr not in self.wallets:
-                                            self.wallets[addr] = WalletProfile(
-                                                address=addr,
-                                                discovered_at=time.time(),
-                                                last_seen=time.time(),
-                                                last_analyzed=0,
-                                            )
-                                        else:
-                                            self.wallets[addr].last_seen = time.time()
-            except asyncio.CancelledError:
-                return
-            except Exception:
-                logger.exception("[smart_money] Discovery WS error")
-                await asyncio.sleep(5)
-
-    async def discover_from_trades(self, symbols: list[str] | None = None, duration: float = 10) -> int:
-        """One-shot discovery: watch trades for N seconds, collect addresses."""
-        symbols = symbols or ["BTC", "ETH", "SOL"]
-        before = len(self.wallets)
-        session = self._session or aiohttp.ClientSession()
-        own_session = self._session is None
-
-        try:
-            async with session.ws_connect("wss://api.hyperliquid.xyz/ws", heartbeat=20) as ws:
-                for coin in symbols:
-                    await ws.send_json({
-                        "method": "subscribe",
-                        "subscription": {"type": "trades", "coin": coin},
-                    })
-
-                end_time = time.time() + duration
-                async for msg in ws:
-                    if time.time() >= end_time:
-                        break
-                    if msg.type == aiohttp.WSMsgType.TEXT:
-                        data = json.loads(msg.data)
-                        if data.get("channel") == "trades":
-                            for trade in data.get("data", []):
-                                for addr in trade.get("users", []):
-                                    if not address_store.is_valid_address(addr):
-                                        continue
-                                    addr = address_store.normalize_address(addr)
-                                    if addr not in self.wallets:
-                                        self.wallets[addr] = WalletProfile(
-                                            address=addr,
-                                            discovered_at=time.time(),
-                                            last_seen=time.time(),
-                                            last_analyzed=0,
-                                        )
-        except Exception:
-            logger.exception("[smart_money] One-shot discovery error")
-        finally:
-            if own_session and not session.closed:
-                await session.close()
-
-        discovered = len(self.wallets) - before
-        logger.info("[smart_money] Discovered %d new addresses in %.0fs", discovered, duration)
-        return discovered
+        Fed by the order flow engine's trade stream (hub wiring): discovery
+        used to hold a websocket of its own, and Hyperliquid allows 10 per IP.
+        """
+        if not isinstance(users, list):
+            return
+        now = time.time()
+        for addr in users:
+            # Untrusted payload: only well-formed wallet addresses become profiles.
+            if not address_store.is_valid_address(addr):
+                continue
+            addr = address_store.normalize_address(addr)
+            wallet = self.wallets.get(addr)
+            if wallet is None:
+                self.wallets[addr] = WalletProfile(
+                    address=addr, discovered_at=now, last_seen=now, last_analyzed=0,
+                )
+            else:
+                wallet.last_seen = now
 
     # ── Analysis ──────────────────────────────────────────────────────
 

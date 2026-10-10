@@ -116,9 +116,14 @@ class MarketOverviewDashboard:
         market_data: MarketData | None = None,
         demo: bool = False,
         refresh_rate: int = 10,
+        owns_feed: bool = False,
     ) -> None:
         self.console = Console()
         self.market_data = market_data
+        # owns_feed: a standalone run (python -m ...) drives the market data
+        # itself. Under the hub (the default) the hub already refreshes it,
+        # and a second caller doubled the Hyperliquid weight.
+        self.owns_feed = owns_feed
         self.demo = demo
         self.cycle = 0
         self.refresh_rate = refresh_rate
@@ -418,7 +423,10 @@ class MarketOverviewDashboard:
 
         try:
             self.update_error = None
-            self.assets = await self.market_data.get_all()
+            if self.owns_feed:
+                self.assets = await self.market_data.get_all()
+            else:
+                self.assets = sorted(self.market_data.assets.values(), key=lambda a: a.volume_24h, reverse=True)
             self.last_update = time.time()
         except Exception as exc:
             self.update_error = str(exc)[:60]
@@ -471,6 +479,7 @@ def main() -> None:
         market_data=market_data,
         demo=demo,
         refresh_rate=args.refresh,
+        owns_feed=True,
     )
 
     try:

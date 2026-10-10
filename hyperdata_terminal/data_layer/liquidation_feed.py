@@ -6,14 +6,13 @@ import json
 import logging
 import math
 import time
-from collections import OrderedDict, deque
+from collections import deque
 from dataclasses import dataclass
 from typing import Any, Callable
 
 import aiohttp
 
 from hyperdata_terminal.config.settings import DEFAULT_SYMBOLS
-from hyperdata_terminal.data_layer.hl_rate import hl_info
 
 logger = logging.getLogger(__name__)
 
@@ -92,7 +91,8 @@ def exchange_coverage() -> dict[str, dict[str, str]]:
                 "Hyperliquid has no public liquidation feed. Confirmed events are "
                 "liquidations an HLP vault absorbed (Hyperliquid flags those fills; "
                 "polled every ~2 min), so liquidations filled by other traders are "
-                f"missed. Separately, trades >= ${HL_LIQUIDATION_MIN_USD:,.0f} are "
+                f"missed. Separately, trades >= ${HL_LIQUIDATION_MIN_USD:,.0f} on the "
+                "streamed symbols are "
                 "reported as estimated 'large prints' (confirmed=false): most are "
                 "ordinary trades, so they are excluded from confirmed totals."
             ),
@@ -422,138 +422,6 @@ class OKXConnection(ExchangeConnection):
         self._maybe_reload_contracts()
 
 
-class HyperliquidConnection:
-    """Hyperliquid doesn't have a dedicated liquidation feed.
-    We detect liquidations by monitoring trades on the WebSocket and checking
-    for trades where addresses close to liquidation (from position scanner)
-    appear as counterparties. Also uses large trade heuristics.
-    """
-    API_URL = "https://api.hyperliquid.xyz/info"
-    LARGE_TRADE_USD = HL_LIQUIDATION_MIN_USD  # Min size to flag as potential liquidation
-    POLL_INTERVAL = 5.0
-
-    def __init__(self, feed: LiquidationFeed):
-        self.name = "hyperliquid"
-        self.feed = feed
-        self._task: asyncio.Task | None = None
-        self._session: aiohttp.ClientSession | None = None
-        self._running = False
-        self._ws_task: asyncio.Task | None = None
-        self._seen_tids: OrderedDict = OrderedDict()
-
-    async def start(self) -> None:
-        self._running = True
-        self._session = aiohttp.ClientSession()
-        self._ws_task = asyncio.create_task(self._ws_loop(), name="ws-hyperliquid")
-
-    async def stop(self) -> None:
-        self._running = False
-        for t in [self._ws_task, self._task]:
-            if t:
-                t.cancel()
-                try:
-                    await t
-                except asyncio.CancelledError:
-                    pass
-        if self._session and not self._session.closed:
-            await self._session.close()
-
-    # Default symbols Hyperliquid lists under another name (kPEPE, kBONK, kFLOKI).
-    # Subscribing to an unlisted coin makes Hyperliquid close the socket, which
-    # turned this connection into a reconnect loop every ~2 seconds.
-    UNLISTED_DEFAULTS = frozenset({"PEPE", "BONK", "FLOKI"})
-    MAX_COINS = 16
-
-    async def _listed_coins(self) -> list[str]:
-        """The first MAX_COINS default symbols that Hyperliquid actually lists."""
-        listed: set[str] | None = None
-        try:
-            data = await hl_info(self._session, {"type": "meta"}, component="liquidation_feed", timeout=HTTP_TIMEOUT)
-            if isinstance(data, dict):
-                listed = {a["name"] for a in data.get("universe", []) if not a.get("isDelisted")}
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.warning("[hyperliquid] meta fetch failed; using the static unlisted filter", exc_info=True)
-        if listed:
-            coins = [c for c in DEFAULT_SYMBOLS if c in listed]
-        else:
-            coins = [c for c in DEFAULT_SYMBOLS if c not in self.UNLISTED_DEFAULTS]
-        return coins[: self.MAX_COINS]
-
-    async def _ws_loop(self) -> None:
-        """Connect to trades WS and detect liquidation-like events."""
-        coins = await self._listed_coins()
-        backoff = 1.0
-
-        while self._running:
-            try:
-                async with self._session.ws_connect("wss://api.hyperliquid.xyz/ws", heartbeat=20) as ws:
-                    backoff = 1.0
-                    for coin in coins:
-                        await ws.send_json({
-                            "method": "subscribe",
-                            "subscription": {"type": "trades", "coin": coin}
-                        })
-                    logger.info("[hyperliquid] subscribed to %d trade feeds", len(coins))
-
-                    async for msg in ws:
-                        if msg.type == aiohttp.WSMsgType.TEXT:
-                            data = json.loads(msg.data)
-                            if data.get("channel") == "trades":
-                                await self._process_trades(data.get("data", []))
-                        elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                            break
-            except asyncio.CancelledError:
-                return
-            except Exception:
-                logger.exception("[hyperliquid] WS error")
-            if self._running:
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 60.0)
-
-    async def _process_trades(self, trades: list[dict]) -> None:
-        """Detect liquidation-like trades from the HL trade stream.
-        Heuristic: Large trades that move price aggressively are likely liquidations.
-        """
-        for t in trades:
-            try:
-                tid = t.get("tid", 0)
-                if tid in self._seen_tids:
-                    continue
-                self._seen_tids[tid] = None
-                while len(self._seen_tids) > 100_000:
-                    self._seen_tids.popitem(last=False)  # Remove oldest
-
-                coin = t.get("coin", "")
-                price = float(t.get("px", 0) or 0)
-                qty = float(t.get("sz", 0) or 0)
-                ts_ms = int(t.get("time", 0) or 0)
-                side = t.get("side", "")  # "B" = buyer taker, "A" = seller taker
-            except (TypeError, ValueError, AttributeError):
-                self.feed.record_parse_error("hyperliquid", t)
-                continue
-            size_usd = price * qty
-
-            # Only flag large trades as potential liquidations
-            if size_usd < self.LARGE_TRADE_USD:
-                continue
-
-            # Side logic: "A" (ask/sell taker) = someone is aggressively selling = long liquidation
-            # "B" (bid/buy taker) = someone aggressively buying = short liquidation
-            event = LiquidationEvent(
-                timestamp=ts_ms / 1000.0,
-                exchange="hyperliquid",
-                symbol=coin,
-                side="long" if side == "A" else "short",
-                size_usd=size_usd,
-                price=price,
-                quantity=qty,
-                confirmed=False,
-            )
-            await self.feed.emit(event)
-
-
 @dataclass
 class _TimeWindow:
     count: int = 0
@@ -587,7 +455,7 @@ class LiquidationFeed:
         self.estimated_evicted_through: float = 0.0
         self.evicted_count: int = 0
         self.callbacks: list[Callable[[LiquidationEvent], Any]] = []
-        self._connections: list[ExchangeConnection | HyperliquidConnection] = []
+        self._connections: list[ExchangeConnection] = []
         self._lock = asyncio.Lock()
         self._running = False
         # Per-exchange count of records dropped at the parse boundary.
@@ -620,8 +488,10 @@ class LiquidationFeed:
             BinanceConnection(self),       # Sampled: forceOrder feed throttled to ~1/symbol/sec by Binance
             BybitConnection(self),         # Confirmed: allLiquidation v5 feed, top-N symbols only
             OKXConnection(self),           # Confirmed: liquidation-orders feed, all SWAP
-            HyperliquidConnection(self),   # Heuristic: inferred from large trades (not confirmed)
         ]
+        # Hyperliquid: confirmed events come from the HLP tracker and
+        # estimated large prints from the order flow engine's trade stream
+        # (hyperliquid_large_print), both wired by the hub.
         for conn in self._connections:
             await conn.start()
         logger.info("all exchange connections started")
@@ -636,6 +506,26 @@ class LiquidationFeed:
 
     def on_liquidation(self, callback: Callable[[LiquidationEvent], Any]) -> None:
         self.callbacks.append(callback)
+
+    @staticmethod
+    def hyperliquid_large_print(trade) -> LiquidationEvent | None:
+        """An ESTIMATED event for a Hyperliquid trade of at least
+        HL_LIQUIDATION_MIN_USD (Hyperliquid has no liquidation feed; most
+        such trades are ordinary). `trade` is the order flow engine's parsed
+        Trade, already deduplicated by (coin, tid). A taker sell is read as a
+        long being closed, a taker buy as a short."""
+        if trade.size_usd < HL_LIQUIDATION_MIN_USD:
+            return None
+        return LiquidationEvent(
+            timestamp=trade.timestamp,
+            exchange="hyperliquid",
+            symbol=trade.symbol,
+            side="long" if trade.side == "sell" else "short",
+            size_usd=trade.size_usd,
+            price=trade.price,
+            quantity=trade.size,
+            confirmed=False,
+        )
 
     async def emit(self, event: LiquidationEvent) -> None:
         """Public method to inject a liquidation event into the feed."""

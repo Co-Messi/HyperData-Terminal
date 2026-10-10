@@ -1985,6 +1985,13 @@ class TestHLSharding:
     universe; shard so a mid-session delisting takes down one shard, not the
     venue."""
 
+    @pytest.fixture(autouse=True)
+    def _shards_of_8(self, monkeypatch):
+        """These tests pin the shard mechanics with 8 subscriptions per
+        socket (the size they were written for); production uses 25."""
+        from hyperdata_terminal.data_layer import orderflow_engine
+        monkeypatch.setattr(orderflow_engine, "HL_SUBSCRIPTIONS_PER_SOCKET", 8)
+
     def test_unlisted_symbols_are_skipped_and_named_once(self, caplog):
         from hyperdata_terminal.data_layer.orderflow_engine import OrderFlowEngine
         e = OrderFlowEngine(symbols=["BTC", "PEPE", "ETH", "BONK"])
@@ -2167,6 +2174,13 @@ class TestS1ShardLiveness:
     venue only went 'disconnected' when `not self._hl_sockets`, so with one
     shard alive Hyperliquid read `ok` no matter how many were dark, and
     hl_sockets_open reached nothing but a log line."""
+
+    @pytest.fixture(autouse=True)
+    def _shards_of_8(self, monkeypatch):
+        """These tests pin the shard mechanics with 8 subscriptions per
+        socket (the size they were written for); production uses 25."""
+        from hyperdata_terminal.data_layer import orderflow_engine
+        monkeypatch.setattr(orderflow_engine, "HL_SUBSCRIPTIONS_PER_SOCKET", 8)
 
     def test_one_live_shard_no_longer_hides_a_dead_one(self):
         import time as _t
@@ -2376,6 +2390,14 @@ class TestS1ShardLiveness:
 # ── S7: the shard plan is fixed at start(); add_symbol() cannot grow it ──
 
 class TestS7ShardPlanFixed:
+
+    @pytest.fixture(autouse=True)
+    def _shards_of_8(self, monkeypatch):
+        """These tests pin the shard mechanics with 8 subscriptions per
+        socket (the size they were written for); production uses 25."""
+        from hyperdata_terminal.data_layer import orderflow_engine
+        monkeypatch.setattr(orderflow_engine, "HL_SUBSCRIPTIONS_PER_SOCKET", 8)
+
     @pytest.mark.asyncio
     async def test_add_symbol_while_running_does_not_repartition_shards(self, monkeypatch, caplog):
         import asyncio

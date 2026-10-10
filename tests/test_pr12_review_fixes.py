@@ -59,32 +59,22 @@ async def test_get_recent_merges_newest_first_and_can_exclude_estimates():
     assert [e.exchange for e in feed.get_recent(1, include_estimated=False)] == ["okx", "bybit"]
 
 
-def test_hl_large_print_socket_skips_unlisted_coins():
-    from hyperdata_terminal.data_layer.liquidation_feed import HyperliquidConnection
-
-    conn = HyperliquidConnection(LiquidationFeed())
-
-    class _Resp:
-        status = 200
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *a):
-            return False
-
-        async def json(self):
-            return {"universe": [{"name": n} for n in ("BTC", "ETH", "SOL", "kPEPE")]}
-
-    class _Session:
-        def post(self, *a, **k):
-            return _Resp()
-
-    conn._session = _Session()
+def test_hl_large_prints_ride_the_order_flow_socket():
+    """The liquidation feed used to open its own Hyperliquid trades socket
+    (with its own unlisted coin filter); Hyperliquid allows 10 websockets
+    per IP, so large prints now come from the order flow engine's stream,
+    which already skips unlisted coins."""
     import asyncio
+    from unittest.mock import AsyncMock, patch
 
-    coins = asyncio.run(conn._listed_coins())
-    assert coins == ["BTC", "ETH", "SOL"] and "PEPE" not in coins
+    from hyperdata_terminal.data_layer import liquidation_feed as lf
+
+    feed = LiquidationFeed()
+    with patch.object(lf.ExchangeConnection, "start", AsyncMock()), \
+            patch.object(lf.ExchangeConnection, "stop", AsyncMock()):
+        asyncio.run(feed.start())
+        assert [c.name for c in feed._connections] == ["binance", "bybit", "okx"]
+        asyncio.run(feed.stop())
 
 
 # ── HLP ──────────────────────────────────────────────────────────────────

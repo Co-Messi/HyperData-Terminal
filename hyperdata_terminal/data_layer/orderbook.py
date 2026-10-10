@@ -19,6 +19,8 @@ from dataclasses import dataclass
 
 import aiohttp
 
+from hyperdata_terminal.data_layer.hl_rate import get_governor
+
 logger = logging.getLogger(__name__)
 
 WS_URL = "wss://api.hyperliquid.xyz/ws"
@@ -83,6 +85,13 @@ class OrderBookEngine:
         # Wall-clock time the last valid l2Book message was processed. Used by
         # the hub's staleness watchdog; 0.0 means "no data received yet".
         self.last_message_at: float = 0.0
+
+        # Live mid prices for every Hyperliquid coin from the allMids
+        # subscription on this socket (no REST weight); mids_at is when the
+        # last update arrived. on_mids callbacks get each update.
+        self.mids: dict[str, float] = {}
+        self.mids_at: float = 0.0
+        self._mids_callbacks: list = []
 
         self._task: asyncio.Task | None = None
         self._snapshot_task: asyncio.Task | None = None
@@ -193,7 +202,36 @@ class OrderBookEngine:
             stale=False,
         )
 
+    def on_mids(self, callback) -> None:
+        """Register callback(mids: dict[str, float]) for every allMids update."""
+        self._mids_callbacks.append(callback)
+
+    def _handle_mids(self, data) -> None:
+        raw = data.get("mids") if isinstance(data, dict) else None
+        if not isinstance(raw, dict):
+            return
+        mids: dict[str, float] = {}
+        for coin, px in raw.items():
+            try:
+                value = float(px)
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                mids[str(coin)] = value
+        if not mids:
+            return
+        self.mids.update(mids)
+        self.mids_at = time.time()
+        for cb in self._mids_callbacks:
+            try:
+                cb(mids)
+            except Exception:
+                logger.exception("[orderbook] mids callback error")
+
     def _handle_message(self, data: dict) -> None:
+        if data.get("channel") == "allMids":
+            self._handle_mids(data.get("data"))
+            return
         if data.get("channel") != "l2Book":
             return
         book_data = data.get("data", {})
@@ -218,11 +256,17 @@ class OrderBookEngine:
 
     async def _connect_and_listen(self) -> None:
         self._session = aiohttp.ClientSession()
+        counted = False
         try:
             # heartbeat=20 makes aiohttp ping the server and raise on a missing
             # pong, so a half-open TCP connection triggers reconnect instead of
             # silently serving a frozen orderbook.
             self._ws = await self._session.ws_connect(WS_URL, heartbeat=20)
+            get_governor().ws_opened()
+            counted = True
+            # Every coin's mid on this same socket: market data reads live
+            # prices from it instead of polling metaAndAssetCtxs every 5s.
+            await self._ws.send_json({"method": "subscribe", "subscription": {"type": "allMids"}})
             for sym in self.symbols:
                 await self._ws.send_json({
                     "method": "subscribe",
@@ -238,6 +282,8 @@ class OrderBookEngine:
                 elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                     break
         finally:
+            if counted:
+                get_governor().ws_closed()
             if self._ws and not self._ws.closed:
                 await self._ws.close()
             if self._session and not self._session.closed:
