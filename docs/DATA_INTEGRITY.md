@@ -16,7 +16,7 @@ report a `coverage` block plus a per-exchange `method` tag:
 | **OKX** | `confirmed` | Real `liquidation-orders` feed across all SWAP instruments. OKX reports size in contracts (BTC-USDT-SWAP is 0.01 BTC, DOGE-USDT-SWAP 1000 DOGE, inverse BTC-USD-SWAP $100), converted with each swap's contract value from OKX's instrument list; a swap not in the list is dropped (counted in `unsized_drops`), not guessed. Builds before this fix multiplied contracts by price, so OKX rows stored by them are wrong (BTC 100x too large). |
 | **Bybit** | `confirmed` | Real `allLiquidation` v5 feed across the tracked symbols Bybit lists, under Bybit's names (PEPE, BONK and FLOKI are `1000PEPEUSDT` and so on). Each topic is its own subscribe request: Bybit fails a whole request when one of its topics does not exist, which used to drop every symbol batched with PEPE, BONK or FLOKI; rejected topics are listed in `/v1/health` → `liquidation_venues.bybit.rejected_topics`. `S` is the side of the liquidated position (`Buy` = a long was liquidated); 1.0.0 and earlier read it the other way round, so their stored Bybit rows have long and short swapped. |
 | **Binance** | `sampled` | The `!forceOrder` stream is **throttled by Binance to ~1 liquidation per symbol per second**. Large cascades are undercounted *at the source* — this cannot be fixed client-side, only disclosed. |
-| **Hyperliquid** | `partial` | Hyperliquid has **no public liquidation feed**. *Confirmed* events are liquidations an HLP vault took the other side of: Hyperliquid marks those fills with a `liquidation` object (`method: market` or `backstop`), and the HLP tracker polls every child vault's fills (~2 min delay). In practice most are `market` fills by Strategy A/B when HLP happened to be the book counterparty (several per hour in a live check), grouped by transaction hash so a liquidation both vaults filled counts once; Liquidator backstops are rarer. Liquidations filled by other traders are invisible. |
+| **Hyperliquid** | `partial` | Hyperliquid has **no public liquidation feed**. *Confirmed* events are liquidations an HLP vault took the other side of: Hyperliquid marks those fills with a `liquidation` object (`method: market` or `backstop`), and the HLP tracker polls every child vault's fills (~2 min delay). In practice most are `market` fills by Strategy A/B when HLP happened to be the book counterparty (several per hour in a live check), grouped by transaction hash, coin and side so a liquidation both vaults filled counts once; Liquidator backstops are rarer. Liquidations filled by other traders are invisible. |
 
 Separately, Hyperliquid trades ≥ `HL_LIQUIDATION_MIN_USD` (default $10k) are
 reported as **large prints**: `confirmed=False`, shown with `~`. In a test
@@ -206,9 +206,11 @@ several Liquidators) that hold the positions.
   10,000 fills per vault, so after a long gap (a laptop asleep) the oldest
   missed fills can be gone; the tracker logs a warning naming the lost
   span. One liquidation is often filled by both Strategy A and B: fills are
-  grouped by transaction hash (all zero hashes are ignored) into one
-  absorption with the sizes summed, emitted once as a confirmed Hyperliquid
-  liquidation, and stored as one `hlp_trades` row, upserted by hash and only
+  grouped by transaction hash, coin and side (all zero hashes are ignored;
+  one transaction can carry several coins, and a captured one held GMT
+  liquidation fills next to unrelated STRK fills) into one absorption with
+  the sizes summed, emitted once as a confirmed Hyperliquid liquidation, and
+  stored as one `hlp_trades` row, upserted by that key and only
   ever grown, so a restart or a later share of the same liquidation never
   adds a row or shrinks one. The first poll seeds 24 hours of absorptions
   from the quiet Liquidator vaults; the busy strategy vaults resume one poll

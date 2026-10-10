@@ -146,7 +146,7 @@ class TestHlp:
         tracker.process_fills("0xB", [dict(liq, px="2", sz="20", tid=3)])
         tracker.flush_absorptions()
         assert len(tracker.absorptions) == 1 and absorbed == [(70.0, True)]
-        group = tracker.absorptions["0x69fa"]
+        (group,) = [a for a in tracker.absorptions.values() if a.fill_hash == "0x69fa"]
         assert group.size == 35 and group.vault == "0xA,0xB"
         # A later poll adds a third vault's share: same absorption, reported as an update.
         tracker.process_fills("0xC", [dict(liq, px="2", sz="1", tid=4)])
@@ -173,7 +173,7 @@ class TestHlp:
         tracker._post = fake_post
         await tracker._fetch_fills("0xbusy")
         assert pages[:3] == [2000, 2000, 502]  # inclusive start time: one overlap fill per page
-        assert "0xspike" in tracker.absorptions
+        assert any(a.fill_hash == "0xspike" for a in tracker.absorptions.values())
 
     def test_absorption_upsert_survives_restart_and_growth(self, tmp_path):
         from hyperdata_terminal.data_layer.hlp_tracker import HLPTrade

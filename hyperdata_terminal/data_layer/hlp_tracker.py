@@ -16,8 +16,8 @@ clearinghouseState, so AUM includes it but the visible positions do not.
 Liquidation absorptions are read from the ``liquidation`` object Hyperliquid
 attaches to a fill that took the other side of a liquidation. Most are
 ``"market"`` fills by Strategy A/B when HLP was the book counterparty (often
-both vaults fill the same liquidation: one transaction hash, one
-absorption); ``"backstop"`` takeovers by a Liquidator vault are rarer.
+both vaults fill the same liquidation: one transaction hash, coin and side,
+one absorption); ``"backstop"`` takeovers by a Liquidator vault are rarer.
 Liquidations filled entirely by other traders never show up here.
 
 Session PnL comes from Hyperliquid's own cumulative PnL series
@@ -103,6 +103,19 @@ class HLPTrade:
     # several HLP vaults (Strategy A and B both): same hash, one absorption.
     fill_hash: str = ""
     is_history: bool = False       # happened before this session started
+
+    @property
+    def absorption_key(self) -> str:
+        """What identifies one absorbed liquidation: the transaction hash
+        AND the coin and side. One Hyperliquid transaction can carry fills
+        in several coins (a captured hash held GMT liquidation fills next to
+        unrelated STRK fills), so a hash alone could merge two coins' sizes
+        under the first one's symbol. Fills without a usable hash keep their
+        vault:tid key."""
+        h = self.fill_hash
+        if h.startswith("0x") and ":" not in h:
+            return f"{h}|{self.symbol}|{self.side}"
+        return h
 
     @property
     def liquidated_side(self) -> str:
@@ -573,8 +586,9 @@ class HLPTracker:
         return new_trades
 
     def _add_absorption(self, trade: HLPTrade) -> None:
-        """Merge a liquidation fill into its absorption (one per transaction hash)."""
-        key = trade.fill_hash
+        """Merge a liquidation fill into its absorption (one per transaction
+        hash, coin and side; see HLPTrade.absorption_key)."""
+        key = trade.absorption_key
         group = self.absorptions.get(key)
         if group is None:
             self.absorptions[key] = dataclasses.replace(trade)

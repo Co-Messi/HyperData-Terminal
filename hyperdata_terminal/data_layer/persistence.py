@@ -533,7 +533,11 @@ class DataStore:
     #       hourly and annualized figures were divided by. NULL on rows from
     #       earlier builds, which divided every Binance and Bybit rate by 8
     #       (wrong for every 4h or 1h symbol).
-    SCHEMA_VERSION = 8
+    #   v9  hlp_trades.fill_hash holds the absorption key (hash|coin|side):
+    #       one transaction can carry several coins. Stored plain hashes are
+    #       rewritten to that form so a re-read upserts instead of
+    #       duplicating; rows that already merged two coins cannot be split.
+    SCHEMA_VERSION = 9
 
     # Tables that no code path has ever written to, by the version that
     # drops them. A dead table is dropped only when EMPTY; a populated one
@@ -597,8 +601,15 @@ class DataStore:
     def _migrate_v8(self) -> None:
         self._add_column("funding_rates", "interval_hours", "REAL")
 
+    def _migrate_v9(self) -> None:
+        self._conn.execute(
+            "UPDATE hlp_trades SET fill_hash = fill_hash || '|' || symbol || '|' || side "
+            "WHERE fill_hash LIKE '0x%' AND instr(fill_hash, ':') = 0 AND instr(fill_hash, '|') = 0"
+        )
+
     _MIGRATIONS = {
         3: _migrate_v3, 4: _migrate_v4, 5: _migrate_v5, 6: _migrate_v6, 7: _migrate_v7, 8: _migrate_v8,
+        9: _migrate_v9,
     }
 
     def _run_migrations(self) -> None:
@@ -909,7 +920,8 @@ class DataStore:
         """
         if not getattr(absorption, "is_liquidation", False):
             return
-        fill_hash = getattr(absorption, "fill_hash", "") or None
+        # Keyed by transaction hash, coin and side (HLPTrade.absorption_key).
+        fill_hash = getattr(absorption, "absorption_key", None) or getattr(absorption, "fill_hash", "") or None
         self._enqueue(
             """INSERT INTO hlp_trades
                (timestamp, symbol, side, price, size, size_usd, direction,
