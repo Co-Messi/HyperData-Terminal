@@ -594,7 +594,7 @@ class TestAlertRedaction:
             await mgr._send(message)
         log_text = caplog.text
         assert secret_wallet not in log_text
-        assert "ALERT sent" in log_text
+        assert "ALERT not delivered (no channel configured)" in log_text
         await mgr.stop()
 
 
@@ -863,7 +863,7 @@ class TestAlertsRound2:
         with caplog.at_level("WARNING", logger="hyperdata_terminal.data_layer.alerts"):
             await mgr._send(f"whale {wallet} near liquidation")
         assert wallet not in caplog.text
-        assert "ALERT sent" in caplog.text
+        assert "ALERT not delivered (no channel configured)" in caplog.text
         await mgr.stop()
 
 

@@ -608,10 +608,6 @@ class HyperDataHub:
         while self._running:
             try:
                 _db_tick = await self._status_update_tick(_db_tick)
-                # NOTE: HLP z-score alert dispatch was removed here — the
-                # AlertManager z-score/cascade sends are deliberately disabled
-                # (too noisy), so scheduling tasks for them was dead work.
-                # Re-add scheduling here if those alerts are re-enabled.
             except asyncio.CancelledError:
                 break
             except Exception:

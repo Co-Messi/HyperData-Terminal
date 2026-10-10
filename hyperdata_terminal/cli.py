@@ -7,6 +7,7 @@
     hyperdata paper -s NAME|FILE   paper trade strategies on live data
     hyperdata verify [--wait]      one-shot data integrity report
     hyperdata mcp                  MCP server (stdio) for AI agents
+    hyperdata alerts [--test]      alert settings; --test sends a test alert
 """
 from __future__ import annotations
 
@@ -136,6 +137,13 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument("--wait", type=int, default=15, help="seconds to collect before checking")
 
     sub.add_parser("mcp", help="serve live market data to AI agents over MCP (stdio)")
+
+    alerts = sub.add_parser(
+        "alerts", help="show what alerts fire and where, or send a test alert",
+        description="Liquidation cascade alerts go to Telegram (TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID) "
+                    "and/or Discord (DISCORD_WEBHOOK_URL) while any hyperdata command is running.",
+    )
+    alerts.add_argument("--test", action="store_true", help="send one test message to every configured channel")
     return parser
 
 
@@ -216,6 +224,31 @@ async def _run_paper(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _run_alerts(args: argparse.Namespace) -> int:
+    from hyperdata_terminal.data_layer.alerts import AlertManager, fmt_usd
+
+    mgr = AlertManager()
+    print("Liquidation cascade alerts (confirmed liquidations, all symbols):")
+    for rule in mgr.rules:
+        print(f"  {fmt_usd(rule.threshold_usd)} or more in {rule.label}, "
+              f"at most once every {rule.cooldown_seconds / 60:.0f} minutes")
+    channels = mgr.channels()
+    print(f"Channels: {', '.join(channels) if channels else 'none configured'}")
+    if not args.test:
+        return 0
+    if not channels:
+        print("hyperdata: no alert channel configured. Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID, "
+              "or DISCORD_WEBHOOK_URL (see .env.example).", file=sys.stderr)
+        return 2
+    try:
+        results = await mgr.send_test()
+    finally:
+        await mgr.stop()
+    for channel, ok in results.items():
+        print(f"  {channel}: {'delivered' if ok else 'FAILED (see the log)'}")
+    return 0 if results and all(results.values()) else 1
+
+
 def main(argv: list[str] | None = None) -> None:
     _load_env()
     args = build_parser().parse_args(argv)
@@ -252,6 +285,8 @@ def main(argv: list[str] | None = None) -> None:
             from hyperdata_terminal.mcp_server import serve
 
             serve()
+        elif command == "alerts":
+            sys.exit(asyncio.run(_run_alerts(args)))
     except KeyboardInterrupt:
         if command not in ("mcp", "paper", "api"):
             from rich.console import Console

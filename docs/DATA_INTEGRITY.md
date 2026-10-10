@@ -21,7 +21,7 @@ report a `coverage` block plus a per-exchange `method` tag:
 Separately, Hyperliquid trades ≥ `HL_LIQUIDATION_MIN_USD` (default $10k) are
 reported as **large prints**: `confirmed=False`, shown with `~`. In a test
 run 44 of 50 of these were ordinary trades, so the terminal **never adds them
-to liquidation totals**: every dashboard total, the alert digest, the
+to liquidation totals**: every dashboard total, the cascade alert, the
 `LiquidationCascade` strategy and the LLM agent prompt use
 `get_stats(include_estimated=False)`, and the panels show large prints on
 their own labelled line. `/v1/liquidations`, `/v1/liquidations/stats` and

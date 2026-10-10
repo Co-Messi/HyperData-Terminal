@@ -186,7 +186,7 @@ Everything works without configuration. Optional settings go in a `.env` in the 
 | Variable | Used for |
 |---|---|
 | `LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY` | The `llm_agent` strategy |
-| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `DISCORD_WEBHOOK_URL` | Alert notifications |
+| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `DISCORD_WEBHOOK_URL` | Liquidation cascade alerts: one message when confirmed liquidations reach $10M in 5 minutes or $50M in an hour (`HYPERDATA_ALERT_CASCADE_5M_USD`, `HYPERDATA_ALERT_CASCADE_1H_USD`), at most once per 15 or 60 minutes. `hyperdata alerts --test` checks the setup. |
 | `HYPERDATA_API_HOST`, `HYPERDATA_API_KEY`, `HYPERDATA_CORS_ORIGINS` | API exposure (see the security note above) |
 | `HYPERDATA_DATA_DIR` | Where SQLite stores and logs live. Default: the per user data directory (`~/Library/Application Support/hyperdata`, `~/.local/share/hyperdata`, `%LOCALAPPDATA%\hyperdata`), or `./data` in an existing source checkout |
 

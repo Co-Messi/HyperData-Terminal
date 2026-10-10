@@ -1,19 +1,35 @@
 """
-Alert system — sends notifications for significant market events.
-Supports Telegram and Discord webhooks.
+Telegram and Discord alerts.
+
+One alert fires: the liquidation cascade. When CONFIRMED liquidations
+(Binance, Bybit, OKX, and Hyperliquid liquidations an HLP vault absorbed;
+never Hyperliquid large prints) across all symbols reach a threshold
+inside a window, one message goes to every configured channel. Each window
+has its own cooldown, so a cascade produces one message per window per
+cooldown, not one per liquidation.
+
+    window      default threshold   cooldown   env override
+    5 minutes   $10M                15 min     HYPERDATA_ALERT_CASCADE_5M_USD
+    1 hour      $50M                60 min     HYPERDATA_ALERT_CASCADE_1H_USD
+
+Channels (any or both):
+    TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID
+    DISCORD_WEBHOOK_URL
+
+``hyperdata alerts --test`` sends one test message to verify the setup.
 
 Usage:
     alerts = AlertManager()
-    alerts.attach(hub)  # Automatically monitors for alert conditions
-
-Environment variables:
-    TELEGRAM_BOT_TOKEN - Telegram bot token
-    TELEGRAM_CHAT_ID - Chat/channel ID to send to
-    DISCORD_WEBHOOK_URL - Discord webhook URL
+    await alerts.start()
+    alerts.attach(hub)
 """
 
+from __future__ import annotations
+
 import asyncio
+import html
 import logging
+import math
 import os
 import re
 import time
@@ -22,400 +38,236 @@ from dataclasses import dataclass
 import aiohttp
 from dotenv import load_dotenv
 
+from hyperdata_terminal.data_layer.cascade import CascadeDetector, WindowTotals
+
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class AlertConfig:
-    """Thresholds for triggering alerts."""
-    min_liquidation_usd: float = 500_000      # Alert on liqs > $500K
-    min_whale_position_usd: float = 5_000_000  # Alert on whale positions > $5M
-    extreme_funding_annual: float = 1.0        # Alert on >100% annualized funding
-    liquidation_cascade_count: int = 50        # Alert if >50 liqs in 5 minutes
-    liquidation_cascade_volume_usd: float = 500_000  # Alert if >$500K volume in 5 minutes
-    liquidation_cascade_window: int = 300      # 5 minutes
-    smart_money_max_rank: int = 5              # Alert on top N smart money wallets
-    hlp_zscore_threshold: float = 2.0          # Alert on HLP Z-score extremes
-    cooldown_seconds: float = 300.0            # 5 min cooldown between similar alerts (was 60s — too noisy)
+@dataclass(frozen=True)
+class CascadeRule:
+    """Alert when confirmed liquidations in `window_seconds` reach `threshold_usd`."""
+    window_seconds: float
+    threshold_usd: float
+    cooldown_seconds: float
+    label: str
+
+
+DEFAULT_CASCADE_5M_USD = 10_000_000.0
+DEFAULT_CASCADE_1H_USD = 50_000_000.0
+
+
+def _env_usd(name: str, default: float) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("%s=%r is not a number; using %.0f", name, raw, default)
+        return default
+    if not (math.isfinite(value) and value > 0):
+        logger.warning("%s must be a positive number; using %.0f", name, default)
+        return default
+    return value
+
+
+def cascade_rules_from_env() -> tuple[CascadeRule, ...]:
+    return (
+        CascadeRule(300.0, _env_usd("HYPERDATA_ALERT_CASCADE_5M_USD", DEFAULT_CASCADE_5M_USD), 900.0, "5 minutes"),
+        CascadeRule(3600.0, _env_usd("HYPERDATA_ALERT_CASCADE_1H_USD", DEFAULT_CASCADE_1H_USD), 3600.0, "1 hour"),
+    )
+
+
+def fmt_usd(v: float) -> str:
+    """$1.2B / $3.4M / $5.6K / $789."""
+    if abs(v) >= 1_000_000_000:
+        return f"${v / 1_000_000_000:,.1f}B"
+    if abs(v) >= 1_000_000:
+        return f"${v / 1_000_000:,.1f}M"
+    if abs(v) >= 1_000:
+        return f"${v / 1_000:,.1f}K"
+    return f"${v:,.0f}"
 
 
 class AlertManager:
-    INTEL_INTERVAL = 4 * 3600  # 4 hours
-
-    def __init__(self, config: AlertConfig | None = None):
-        self.config = config or AlertConfig()
-        self.telegram_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
-        self.telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
-        self.discord_webhook = os.getenv("DISCORD_WEBHOOK_URL", "")
-        self._session: aiohttp.ClientSession | None = None
-        self._last_alert_times: dict[str, float] = {}
-        self._recent_liq_count = 0
-        self._recent_liq_volume = 0.0
-        self._recent_liq_long_count = 0
-        self._recent_liq_long_volume = 0.0
-        self._recent_liq_short_count = 0
-        self._recent_liq_short_volume = 0.0
-        self._recent_liq_top_event = None  # largest single liq in the window
-        self._recent_liq_reset = time.time()
-        self.enabled = bool(self.telegram_token and self.telegram_chat_id) or bool(self.discord_webhook)
-        self.alerts_sent = 0
-
-        # Market intelligence summaries
-        self._hub = None
-        self._intel_task: asyncio.Task | None = None
-
-        if not self.enabled:
-            logger.info("AlertManager: No TELEGRAM_BOT_TOKEN/CHAT_ID or DISCORD_WEBHOOK_URL set. Alerts disabled.")
-            logger.info("AlertManager: Set env vars to enable. See .env.example")
-
-    async def start(self) -> None:
-        self._session = aiohttp.ClientSession()
-        if self._hub:
-            self._intel_task = asyncio.create_task(self._intel_loop())
-
-    async def stop(self) -> None:
-        if self._intel_task:
-            self._intel_task.cancel()
-            try:
-                await self._intel_task
-            except asyncio.CancelledError:
-                pass
-        self._intel_task = None
-        if self._session and not self._session.closed:
-            await self._session.close()
-
-    def attach(self, hub) -> None:
-        """Attach to hub event bus."""
-        self._hub = hub
-        hub.on_liquidation(self._check_liquidation)
-        hub.on_signal(self._check_smart_money)
-        # Start loops if we're already running (attach called after start)
-        if self._session and not self._intel_task:
-            self._intel_task = asyncio.create_task(self._intel_loop())
-
-    # Per-key cooldown overrides (seconds)
-    _COOLDOWN_OVERRIDES = {
-        "cascade_alert": 600,   # 10 minutes between cascade alerts
-    }
-
-    def _should_alert(self, key: str) -> bool:
-        """Check cooldown for a specific alert type."""
-        now = time.time()
-        last = self._last_alert_times.get(key, 0)
-        cooldown = self._COOLDOWN_OVERRIDES.get(key, self.config.cooldown_seconds)
-        if now - last < cooldown:
-            return False
-        self._last_alert_times[key] = now
-        return True
-
-    def _reset_cascade_window(self) -> None:
-        """Reset all cascade tracking counters."""
-        self._recent_liq_count = 0
-        self._recent_liq_volume = 0.0
-        self._recent_liq_long_count = 0
-        self._recent_liq_long_volume = 0.0
-        self._recent_liq_short_count = 0
-        self._recent_liq_short_volume = 0.0
-        self._recent_liq_top_event = None
-        self._recent_liq_reset = time.time()
-
-    def _check_liquidation(self, event) -> None:
-        """Check if a liquidation event warrants an alert."""
-        # Track cascade window — reset if window expired
-        now = time.time()
-        if now - self._recent_liq_reset > self.config.liquidation_cascade_window:
-            self._reset_cascade_window()
-
-        # Accumulate cascade stats
-        self._recent_liq_count += 1
-        self._recent_liq_volume += event.size_usd
-
-        if event.side == "long":
-            self._recent_liq_long_count += 1
-            self._recent_liq_long_volume += event.size_usd
-        else:
-            self._recent_liq_short_count += 1
-            self._recent_liq_short_volume += event.size_usd
-
-        # Track top liquidation in the window
-        if self._recent_liq_top_event is None or event.size_usd > self._recent_liq_top_event.size_usd:
-            self._recent_liq_top_event = event
-
-        # Large single liquidation — DISABLED (too noisy, use trade alerts instead)
-        # if event.size_usd >= self.config.min_liquidation_usd:
-        #     if self._should_alert(f"large_liq_{event.symbol}"):
-        #         ...
-        pass
-
-        # Liquidation cascade — trigger on count OR volume threshold
-        cascade_triggered = (
-            self._recent_liq_count >= self.config.liquidation_cascade_count
-            or self._recent_liq_volume >= self.config.liquidation_cascade_volume_usd
-        )
-        # Liquidation cascade — DISABLED (too noisy, use trade alerts instead)
-        # if cascade_triggered:
-        #     ...
-        if cascade_triggered:
-            self._reset_cascade_window()  # still reset the window, just don't send
-
-    def _check_smart_money(self, signal) -> None:
-        """Check if a smart money signal warrants an alert (top-5 ranked, follow type)."""
-        if signal.wallet_rank > self.config.smart_money_max_rank or signal.wallet_rank <= 0:
-            return
-        if signal.signal_type != "follow":
-            return
-        if not self._should_alert(f"smart_money_{signal.address[:10]}"):
-            return
-
-        # Smart money alerts — DISABLED (use trade alerts instead)
-        pass
-
-    async def _check_hlp_zscore(self, hlp_stats: dict) -> None:
-        """Check if HLP Z-score is at an extreme (>2.0 or <-2.0)."""
-        zscore = hlp_stats.get("delta_zscore", 0)
-        if abs(zscore) <= self.config.hlp_zscore_threshold:
-            return
-        if not self._should_alert("hlp_zscore"):
-            return
-
-        # HLP Z-score alerts — DISABLED (too noisy)
-        pass
-
-    # ── Market Intelligence ─────────────────────────────────────────
-
-    async def _intel_loop(self) -> None:
-        """Market intelligence summary — DISABLED (use daily trade summary instead)."""
-        while True:
-            await asyncio.sleep(self.INTEL_INTERVAL)
-            # Disabled — trade alerts handle notifications now
-            pass
-
-    async def send_intel_now(self) -> bool:
-        """Send an immediate market intelligence report (for testing)."""
-        if not self.enabled or not self._hub:
-            return False
-        report = self._build_intel_report()
-        await self._send(report)
-        return True
-
-    @staticmethod
-    def _fmt_usd(v: float) -> str:
-        """Format a USD value with appropriate suffix."""
-        if abs(v) >= 1_000_000_000:
-            return f"${v / 1_000_000_000:,.1f}B"
-        if abs(v) >= 1_000_000:
-            return f"${v / 1_000_000:,.1f}M"
-        if abs(v) >= 1_000:
-            return f"${v / 1_000:,.1f}K"
-        return f"${v:,.0f}"
-
-    @staticmethod
-    def _fmt_usd_signed(v: float) -> str:
-        """Format a signed USD value with appropriate suffix."""
-        sign = "+" if v >= 0 else ""
-        if abs(v) >= 1_000_000_000:
-            return f"{sign}${v / 1_000_000_000:,.1f}B"
-        if abs(v) >= 1_000_000:
-            return f"{sign}${v / 1_000_000:,.1f}M"
-        if abs(v) >= 1_000:
-            return f"{sign}${v / 1_000:,.1f}K"
-        return f"{sign}${v:,.0f}"
-
-    def _build_intel_report(self) -> str:
-        """Build the 4-hour market intelligence summary."""
-        hub = self._hub
-        lines = []
-        lines.append("📊 HYPERDATA MARKET INTELLIGENCE")
-        lines.append("━" * 30)
-        lines.append("")
-
-        # ── 1. Top 3 CVD Momentum ──────────────────────────────────
-        lines.append("⚡ TOP 3 CVD MOMENTUM")
-        try:
-            cvd_data = []
-            for sym in hub.orderflow.symbols:
-                if sym not in hub.orderflow.buckets:
-                    continue
-                snap = hub.orderflow.get_snapshot(sym, "4h")
-                cvd_data.append((sym, snap.cvd, snap.ofi, snap.signal))
-            # Sort by absolute OFI descending
-            cvd_data.sort(key=lambda x: abs(x[2]), reverse=True)
-            for i, (sym, cvd, ofi, signal) in enumerate(cvd_data[:3], 1):
-                cvd_str = self._fmt_usd_signed(cvd)
-                lines.append(f"{i}. {sym} — CVD: {cvd_str} | OFI: {ofi:+.2f} | {signal}")
-            if not cvd_data:
-                lines.append("   No data available")
-        except Exception:
-            lines.append("   Data unavailable")
-        lines.append("")
-
-        # ── 2. Liquidations (4h window) ────────────────────────────
-        lines.append("💥 LIQUIDATIONS (4h)")
-        try:
-            liq_stats = hub.liquidations.get_stats(window_minutes=240, include_estimated=False)
-            total_count = liq_stats["total_count"]
-            total_vol = liq_stats["total_volume_usd"]
-            long_c = liq_stats["long_count"]
-            long_v = liq_stats["long_volume_usd"]
-            short_c = liq_stats["short_count"]
-            short_v = liq_stats["short_volume_usd"]
-
-            lines.append(f"Total: {total_count:,} events | {self._fmt_usd(total_vol)} volume")
-            lines.append(
-                f"Long: {long_c:,} ({self._fmt_usd(long_v)}) | "
-                f"Short: {short_c:,} ({self._fmt_usd(short_v)})"
-            )
-
-            # Find the top single liquidation in the window
-            cutoff = time.time() - 240 * 60
-            top_liq = None
-            for ev in hub.liquidations.events:
-                if ev.timestamp < cutoff or not getattr(ev, "confirmed", True):
-                    continue
-                if top_liq is None or ev.size_usd > top_liq.size_usd:
-                    top_liq = ev
-            if top_liq:
-                lines.append(
-                    f"Top: {top_liq.symbol} {top_liq.side.upper()} "
-                    f"{self._fmt_usd(top_liq.size_usd)} on {top_liq.exchange.capitalize()}"
-                )
-
-            # Exchange breakdown (abbreviated)
-            by_ex = liq_stats.get("by_exchange", {})
-            if by_ex:
-                ex_abbrev = {"binance": "BIN", "bybit": "BYB", "okx": "OKX", "hyperliquid": "HYP"}
-                ex_parts = []
-                for ex_name, ex_data in sorted(by_ex.items(), key=lambda x: -x[1]["count"]):
-                    abbr = ex_abbrev.get(ex_name, ex_name[:3].upper())
-                    ex_parts.append(f"{abbr}:{ex_data['count']}")
-                lines.append(f"By exchange: {' '.join(ex_parts)}")
-        except Exception:
-            lines.append("   Data unavailable")
-        lines.append("")
-
-        # ── 3. Smart Money ─────────────────────────────────────────
-        lines.append("🧠 SMART MONEY")
-        try:
-            sm_stats = hub.smart_money.get_stats()
-            total_wallets = sm_stats["total_wallets"]
-            ranked_wallets = sm_stats["ranked_wallets"]
-            lines.append(f"Tracked: {total_wallets:,} wallets | Ranked: {ranked_wallets:,}")
-
-            # Top signal from a ranked wallet recently
-            recent_signals = hub.smart_money.get_recent_signals(50)
-            follow_signals = [s for s in recent_signals if s.signal_type == "follow" and s.wallet_rank > 0]
-            if follow_signals:
-                # Get the most notable one (lowest rank = best wallet)
-                top_sig = min(follow_signals, key=lambda s: s.wallet_rank)
-                action_str = top_sig.action.replace("_", " ")
-                lines.append(
-                    f"Top signal: #{top_sig.wallet_rank} {action_str} "
-                    f"{top_sig.symbol} {self._fmt_usd(top_sig.size_usd)}"
-                )
-
-            # Compute sentiment: % of follow signals that are bullish
-            if follow_signals:
-                bullish = sum(1 for s in follow_signals if s.action in ("OPEN_LONG", "CLOSE_SHORT"))
-                pct_bull = bullish / len(follow_signals) * 100 if follow_signals else 50
-                if pct_bull >= 60:
-                    sentiment = "bullish (smart money net long)"
-                elif pct_bull <= 40:
-                    sentiment = "bearish (smart money net short)"
-                else:
-                    sentiment = "neutral"
-                lines.append(f"Sentiment: {pct_bull:.0f}% bullish ({sentiment})")
-            else:
-                lines.append("No recent follow signals")
-        except Exception:
-            lines.append("   Data unavailable")
-        lines.append("")
-
-        # ── 4. HLP Vault ──────────────────────────────────────────
-        lines.append("🏛️ HLP VAULT")
-        try:
-            hlp_stats = hub.hlp.get_stats()
-            aum = hlp_stats["account_value"]
-            delta = hlp_stats["net_delta"]
-            zscore = hlp_stats["delta_zscore"]
-            session_pnl = hlp_stats["session_pnl"]
-            partial = " (partial)" if hlp_stats.get("aum_source") != "vaultDetails" else ""
-
-            lines.append(
-                f"AUM: {self._fmt_usd(aum)}{partial} | Delta: {self._fmt_usd_signed(delta)} | Z: {zscore:+.1f}"
-            )
-            # Unknown is not zero: say so rather than report "+$0".
-            pnl_text = self._fmt_usd_signed(session_pnl) if hlp_stats.get("pnl_known") else "unknown"
-            lines.append(f"Session PnL: {pnl_text}")
-
-            # Count absorptions in the 4h window
-            recent_absorptions = hub.hlp.get_liquidation_absorptions(minutes=240)
-            lines.append(f"Absorptions: {len(recent_absorptions)} in 4h")
-        except Exception:
-            lines.append("   Data unavailable")
-
-        # ── Footer ─────────────────────────────────────────────────
-        lines.append("")
-        lines.append("━" * 30)
-        lines.append("🤖 HyperData Terminal | hyperdata.dev")
-
-        return "\n".join(lines)
-
     # Deadline for webhook posts: a stalled Telegram/Discord endpoint must
     # not wedge whatever task is delivering the alert.
     _SEND_TIMEOUT = aiohttp.ClientTimeout(total=10, connect=3, sock_connect=3, sock_read=5)
 
-    async def _send(self, message: str) -> None:
-        """Send alert to all configured channels."""
-        if not self._session:
+    def __init__(self, rules: tuple[CascadeRule, ...] | None = None):
+        self.telegram_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+        self.telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
+        self.discord_webhook = os.getenv("DISCORD_WEBHOOK_URL", "")
+        self.rules = rules if rules is not None else cascade_rules_from_env()
+        self.detector = CascadeDetector(tuple(r.window_seconds for r in self.rules))
+        self._last_fired: dict[float, float] = {}
+        self._session: aiohttp.ClientSession | None = None
+        self._tasks: set[asyncio.Task] = set()
+        self._hub = None
+        self.alerts_sent = 0      # delivered to at least one channel
+        self.alerts_failed = 0    # fired, but no channel accepted it
+        self.cascades_detected = 0
+        if not self.enabled:
+            logger.info(
+                "AlertManager: no TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID or DISCORD_WEBHOOK_URL set; "
+                "cascades are detected and logged but not sent"
+            )
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.telegram_token and self.telegram_chat_id) or bool(self.discord_webhook)
+
+    def channels(self) -> list[str]:
+        out = []
+        if self.telegram_token and self.telegram_chat_id:
+            out.append("telegram")
+        if self.discord_webhook:
+            out.append("discord")
+        return out
+
+    async def start(self) -> None:
+        if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession()
 
-        self.alerts_sent += 1
+    async def stop(self) -> None:
+        tasks = [t for t in self._tasks if not t.done()]
+        for t in tasks:
+            t.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._tasks.clear()
+        if self._session and not self._session.closed:
+            await self._session.close()
+        self._session = None
 
-        # Telegram
+    def attach(self, hub) -> None:
+        """Watch the hub's liquidation stream for cascades."""
+        self._hub = hub
+        hub.on_liquidation(self._check_liquidation)
+
+    # ── Cascade detection ────────────────────────────────────────
+
+    def _check_liquidation(self, event, now: float | None = None) -> None:
+        if not self.detector.add(event, now):
+            return  # estimated (Hyperliquid large print): never counted
+        now = time.time() if now is None else now
+        for rule in self.rules:
+            totals = self.detector.totals(rule.window_seconds, now)
+            if totals.volume_usd < rule.threshold_usd:
+                continue
+            if now - self._last_fired.get(rule.window_seconds, -math.inf) < rule.cooldown_seconds:
+                continue
+            self._last_fired[rule.window_seconds] = now
+            self.cascades_detected += 1
+            text, html_text = self.format_cascade(rule, totals)
+            self._spawn(self._send(text, html_text))
+
+    def _spawn(self, coro) -> None:
+        try:
+            task = asyncio.get_running_loop().create_task(coro)
+        except RuntimeError:
+            coro.close()  # no loop (a synchronous caller): nothing can be sent
+            return
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    def format_cascade(self, rule: CascadeRule, totals: WindowTotals) -> tuple[str, str]:
+        """(plain text for Discord and logs, HTML for Telegram). Every value
+        interpolated into the HTML is escaped: symbols come from exchanges."""
+        top = ", ".join(f"{sym} {fmt_usd(v)}" for sym, v in totals.top_symbols(3)) or "n/a"
+        venues = ", ".join(f"{ex} {fmt_usd(v)}" for ex, v in sorted(totals.by_exchange.items()))
+        lines = [
+            f"Liquidation cascade: {fmt_usd(totals.volume_usd)} confirmed in {rule.label} "
+            f"(threshold {fmt_usd(rule.threshold_usd)})",
+            f"Longs liquidated {fmt_usd(totals.long_usd)}, shorts {fmt_usd(totals.short_usd)}, "
+            f"{totals.count} events",
+            f"Top: {top}",
+            f"By venue: {venues}",
+            "Confirmed liquidations only. Binance is throttled at the source; Hyperliquid "
+            "counts only liquidations an HLP vault absorbed.",
+        ]
+        down = self._venues_down()
+        if down:
+            lines.append(f"Not receiving: {', '.join(down)} (totals are partial)")
+        plain = "\n".join(lines)
+        esc = html.escape
+        html_lines = [f"<b>{esc(lines[0])}</b>", *(esc(line) for line in lines[1:])]
+        return plain, "\n".join(html_lines)
+
+    def _venues_down(self) -> list[str]:
+        feed = getattr(self._hub, "liquidations", None)
+        fn = getattr(feed, "venues_down", None)
+        try:
+            return list(fn()) if callable(fn) else []
+        except Exception:
+            return []
+
+    # ── Delivery ─────────────────────────────────────────────────
+
+    async def _deliver(self, text: str, html_text: str | None) -> dict[str, bool]:
+        """Post to every configured channel; {channel: delivered}."""
+        if self._session is None or getattr(self._session, "closed", False) is True:
+            self._session = aiohttp.ClientSession()
+        results: dict[str, bool] = {}
         if self.telegram_token and self.telegram_chat_id:
+            payload = {"chat_id": self.telegram_chat_id, "text": html_text or html.escape(text),
+                       "parse_mode": "HTML"}
             try:
                 url = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
-                async with self._session.post(url, json={
-                    "chat_id": self.telegram_chat_id,
-                    "text": message,
-                    "parse_mode": "HTML",
-                }, timeout=self._SEND_TIMEOUT) as resp:
-                    if resp.status == 200:
-                        logger.info("Telegram alert sent")
-                    else:
+                async with self._session.post(url, json=payload, timeout=self._SEND_TIMEOUT) as resp:
+                    results["telegram"] = resp.status == 200
+                    if resp.status != 200:
                         logger.warning("Telegram send returned %d", resp.status)
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:
-                # Exception type only — aiohttp error messages can embed the
+                # Exception type only: aiohttp error messages can embed the
                 # request URL, which contains the bot token.
+                results["telegram"] = False
                 logger.warning("Telegram send failed: %s", type(exc).__name__)
-
-        # Discord
         if self.discord_webhook:
             try:
-                async with self._session.post(self.discord_webhook, json={
-                    "content": message,
-                }, timeout=self._SEND_TIMEOUT) as resp:
-                    if resp.status in (200, 204):
-                        logger.info("Discord alert sent")
-                    else:
+                async with self._session.post(
+                    self.discord_webhook, json={"content": text}, timeout=self._SEND_TIMEOUT,
+                ) as resp:
+                    results["discord"] = resp.status in (200, 204)
+                    if not results["discord"]:
                         logger.warning("Discord send returned %d", resp.status)
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:
-                # Exception type only — error messages can embed the webhook URL.
+                # Exception type only: error messages can embed the webhook URL.
+                results["discord"] = False
                 logger.warning("Discord send failed: %s", type(exc).__name__)
+        return results
 
-        # Log that an alert fired, not its payload — alert bodies can contain
-        # wallet addresses and position intelligence that must not sit in
-        # rotating plaintext logs. Wallet addresses are masked even on the
-        # first line in case a future alert format leads with one.
+    async def _send(self, message: str, html_message: str | None = None) -> bool:
+        """Send one alert to every configured channel. True if any accepted it."""
+        results = await self._deliver(message, html_message)
+        delivered = any(results.values())
+        if delivered:
+            self.alerts_sent += 1
+        else:
+            self.alerts_failed += 1
+        # Log that an alert fired, never its payload: alert bodies can carry
+        # wallet addresses, which must not sit in rotating plaintext logs.
         first_line = message.strip().splitlines()[0] if message.strip() else ""
         redacted = re.sub(r"0x[0-9a-fA-F]{40}", "0x…[redacted]", first_line)
-        logger.warning("ALERT sent (%d total): %.80s", self.alerts_sent, redacted)
+        if delivered:
+            logger.warning("ALERT sent via %s (%d total): %.80s",
+                           ", ".join(c for c, ok in results.items() if ok), self.alerts_sent, redacted)
+        elif results:
+            logger.warning("ALERT not delivered (every channel failed): %.80s", redacted)
+        else:
+            logger.warning("ALERT not delivered (no channel configured): %.80s", redacted)
+        return delivered
 
-    async def send_test(self) -> bool:
-        """Send a test alert to verify configuration."""
-        if not self.enabled:
-            return False
-        await self._send("🧪 HyperData Alert Test — Connection verified!")
-        return True
+    async def send_test(self) -> dict[str, bool]:
+        """Send one test message to every configured channel; {channel: delivered}."""
+        text = "HyperData Terminal: test alert. If you can read this, cascade alerts reach this channel."
+        results = await self._deliver(text, html.escape(text))
+        if any(results.values()):
+            self.alerts_sent += 1
+        return results
