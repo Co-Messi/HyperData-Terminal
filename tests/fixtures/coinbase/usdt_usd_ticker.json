@@ -1,0 +1,16 @@
+{
+ "_meta": {
+  "source": "GET https://api.exchange.coinbase.com/products/USDT-USD/ticker",
+  "captured": "2026-10-10"
+ },
+ "payload": {
+  "ask": "0.99908",
+  "bid": "0.99907",
+  "volume": "187205379.68",
+  "trade_id": 149127264,
+  "price": "0.99908",
+  "size": "237.34",
+  "time": "2026-10-10T00:58:21.433095856Z",
+  "rfq_volume": "1205661.878779"
+ }
+}

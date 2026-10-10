@@ -30,6 +30,7 @@ def test_collector_parse_ticker_response():
         {"symbol": "DOGEUSDT", "price": "0.165"},  # Not in default symbols, should be ignored
     ]
     perp_prices = {"BTC": 83500.0, "ETH": 3450.0, "SOL": 178.0}
+    collector.set_usdt_usd(1.0)  # Binance quotes USDT: converting needs a USDT/USD rate
     collector._parse_response(raw, perp_prices)
 
     assert "BTC" in collector.prices
@@ -46,6 +47,7 @@ def test_collector_parse_no_perp_price():
     """If perp price is unavailable, basis_pct defaults to 0."""
     collector = SpotPriceCollector()
     raw = [{"symbol": "BTCUSDT", "price": "83000.00"}]
+    collector.set_usdt_usd(1.0)
     collector._parse_response(raw, perp_prices={})
     assert collector.prices["BTC"].basis_pct == pytest.approx(0.0)
     assert collector.prices["BTC"].perp_price == pytest.approx(0.0)
@@ -73,3 +75,72 @@ def test_collector_symbol_map():
     assert SYMBOL_TO_BINANCE["BTC"] == "BTCUSDT"
     assert SYMBOL_TO_BINANCE["ETH"] == "ETHUSDT"
     assert SYMBOL_TO_BINANCE["SOL"] == "SOLUSDT"
+
+
+# ── USD versus USDT (M12) ────────────────────────────────────────────────
+
+
+def test_usdt_spot_is_converted_with_the_live_usdt_usd_rate():
+    """Hyperliquid perps are quoted in USD; Binance and OKX spot in USDT. The
+    USDT/USD premium (0.09% in the captured Coinbase ticker) is the size of
+    the basis being measured, so it must not be ignored."""
+    from tests.fixture_data import load_fixture
+
+    rate = float(load_fixture("coinbase/usdt_usd_ticker.json")["price"])
+    assert rate == pytest.approx(0.99908)
+    collector = SpotPriceCollector()
+    collector.set_usdt_usd(rate)
+    collector._parse_response([{"symbol": "BTCUSDT", "price": "82600.00"}], {"BTC": 82_550.0})
+    snap = collector.prices["BTC"]
+    assert snap.quote == "USDT" and snap.native_price == 82_600.0 and snap.usdt_usd == rate
+    assert snap.spot_price == pytest.approx(82_600.0 * rate)
+    expected = (82_550.0 - 82_600.0 * rate) / (82_600.0 * rate) * 100
+    assert snap.basis_pct == pytest.approx(expected)
+    # Unconverted, the same prices read as a -0.06% basis instead of +0.03%.
+    assert expected > 0 > (82_550.0 - 82_600.0) / 82_600.0 * 100
+
+
+def test_no_usdt_rate_means_no_usdt_basis():
+    collector = SpotPriceCollector()
+    assert collector._store({"BTC": 82_600.0}, {"BTC": 82_550.0}, "binance") is False
+    assert collector.get_latest("BTC") is None
+    assert collector._store({"BTC": 82_600.0}, {"BTC": 82_550.0}, "coinbase") is True
+    assert collector.get_latest("BTC").quote == "USD"
+
+
+def test_a_usd_venue_is_preferred():
+    from hyperdata_terminal.data_layer.spot_prices import SOURCE_QUOTE, SPOT_SOURCES
+
+    assert SOURCE_QUOTE[SPOT_SOURCES[0]] == "USD"
+
+
+@pytest.mark.asyncio
+async def test_usdt_rate_falls_back_to_kraken():
+    from tests.fixture_data import load_fixture
+
+    kraken = load_fixture("kraken/usdt_usd_ticker.json")
+
+    class _Resp:
+        def __init__(self, status, body):
+            self.status, self._body = status, body
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        def raise_for_status(self):
+            if self.status >= 400:
+                raise RuntimeError(f"HTTP {self.status}")
+
+        async def json(self):
+            return self._body
+
+    class _Session:
+        def get(self, url, **kw):
+            return _Resp(503, {}) if "coinbase" in url else _Resp(200, kraken)
+
+    collector = SpotPriceCollector()
+    await collector._fetch_usdt_usd(_Session())
+    assert collector.fresh_usdt_usd() == pytest.approx(0.99908)

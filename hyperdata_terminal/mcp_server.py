@@ -260,7 +260,9 @@ class HubTools:
             out["basis"] = {
                 "basis_pct": _num(spot.basis_pct, 4),
                 "spot_price": _num(spot.spot_price, 6),
-                "spot_venue": getattr(spot, "source", "binance"),
+                "spot_venue": getattr(spot, "source", "coinbase"),
+                "spot_quote": getattr(spot, "quote", "USD"),
+                "usdt_usd_applied": _num(getattr(spot, "usdt_usd", None), 5),
             }
         if sym in hub.orderflow.buckets:
             out["order_flow"] = self._order_flow_frames(sym)

@@ -1091,7 +1091,12 @@ class HyperDataAPI:
                 data[sym] = {
                     "spot_price": snap.spot_price, "perp_price": snap.perp_price,
                     "basis_pct": snap.basis_pct, "timestamp": snap.timestamp,
-                    "source": getattr(snap, "source", "binance"),  # spot venue (USD on Coinbase, USDT elsewhere)
+                    "source": getattr(snap, "source", "coinbase"),
+                    # The spot price is in USD; a USDT venue's price was
+                    # converted at usdt_usd (native_price is the original).
+                    "quote": getattr(snap, "quote", "USD"),
+                    "native_price": getattr(snap, "native_price", None),
+                    "usdt_usd": getattr(snap, "usdt_usd", None),
                 }
         return web.json_response(data)
 

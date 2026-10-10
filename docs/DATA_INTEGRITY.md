@@ -139,9 +139,13 @@ order, and every value says which venue it came from:
 
 | Data | Order | Field |
 |---|---|---|
-| Spot price (basis) | Binance (USDT) → Coinbase (USD) → OKX (USDT) | `SpotPriceSnapshot.source`, `hub.spot.active_source` |
+| Spot price (basis) | Coinbase (USD) → Binance (USDT) → OKX (USDT), USDT prices converted to USD at a live USDT/USD rate (Coinbase, else Kraken; a USDT source is skipped without a fresh rate) | `SpotPriceSnapshot.source`, `.quote`, `.usdt_usd`, `hub.spot.active_source` |
 | Long/short account ratio | Binance → Bybit → OKX | `LongShortSnapshot.source`, `hub.lsr.active_source` |
 | BTC price cross-check | Binance perp mark → OKX perp mark | named in the health check detail |
+
+The basis compares Hyperliquid's USD perp with a USD spot price: the USDT/USD
+premium (0.09% in a capture on 2026-10-10) is as large as the basis itself,
+so an unconverted USDT price would mostly measure the stablecoin.
 
 A source that answers 401, 403 or 451 (forbidden or geoblocked) is skipped
 for 10 minutes; any other failure (timeout, reset, 5xx) for 30 seconds, so a

@@ -304,17 +304,19 @@ async def test_spot_falls_back_and_cools_down_a_blocked_source(monkeypatch):
 
     async def fake_fetch(session, source, symbols):
         calls.append(source)
-        if source == "binance":
-            raise RuntimeError("451")
+        if source == "coinbase":
+            raise RuntimeError("403")
         return {s: {"BTC": 80_000.0, "ETH": 2_000.0, "SOL": 100.0}[s] for s in symbols}
 
     monkeypatch.setattr(collector, "_fetch_source", fake_fetch)
+    collector.set_usdt_usd(1.0)  # a USDT source needs a USDT/USD rate to compare with the USD perp
+    collector._usdt_attempt_at = 1e18  # no network refresh in this test
     await collector._fetch(session=None)
     await collector._fetch(session=None)
-    assert calls == ["binance", "coinbase", "coinbase"]  # binance skipped while cooling down
+    assert calls == ["coinbase", "binance", "binance"]  # coinbase skipped while cooling down
     snap = collector.get_latest("BTC")
-    assert snap.source == "coinbase" and snap.basis_pct == pytest.approx(0.1)
-    assert collector.active_source == "coinbase"
+    assert snap.source == "binance" and snap.quote == "USDT" and snap.basis_pct == pytest.approx(0.1)
+    assert collector.active_source == "binance"
 
 
 async def test_long_short_falls_back_to_okx(monkeypatch):
