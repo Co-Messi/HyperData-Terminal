@@ -51,6 +51,12 @@ def _num(x: Any, digits: int = 2) -> float | None:
     return round(f, digits)
 
 
+def _hl_rate_stats() -> dict[str, Any]:
+    from hyperdata_terminal.data_layer.hl_rate import get_governor
+
+    return get_governor().stats()
+
+
 class HubTools:
     """Tool implementations over a running hub; return plain JSON-able dicts.
 
@@ -411,8 +417,17 @@ class HubTools:
             ],
             "order_flow_venues": self.hub.orderflow.venue_coverage(),
             "spot_source": getattr(self.hub.spot, "active_source", None),
+            "hyperliquid_rate": _hl_rate_stats(),
             "long_short_source": getattr(self.hub.lsr, "active_source", None),
         })
+
+
+def default_hub():
+    """The hub `hyperdata mcp` runs. No tool reads smart money, so the engine
+    (the heaviest Hyperliquid caller) does not run under MCP."""
+    from hyperdata_terminal.data_layer.hub import HyperDataHub
+
+    return HyperDataHub(smart_money=False)
 
 
 def build_server(hub_factory=None):
@@ -421,9 +436,7 @@ def build_server(hub_factory=None):
     from mcp.types import ToolAnnotations
 
     if hub_factory is None:
-        from hyperdata_terminal.data_layer.hub import HyperDataHub
-
-        hub_factory = HyperDataHub
+        hub_factory = default_hub
 
     state: dict[str, HubTools] = {}
 

@@ -661,27 +661,22 @@ def test_demo_hlp_runs_without_errors(caplog):
 
 
 async def test_smart_money_keeps_to_its_weight_budget(monkeypatch):
-    """A batch of active wallets' userFills (~120 weight each) drew HTTP 429s."""
-    import asyncio
-
+    """A batch of active wallets' userFills (~120 weight each) drew HTTP 429s.
+    Smart money now goes through the process-wide governor as an elastic
+    caller and waits once its allocation of the minute is spent."""
+    from hyperdata_terminal.data_layer import hl_rate
     from hyperdata_terminal.data_layer.smart_money import SmartMoneyEngine
+    from tests.test_hl_rate import FakeTime, _Resp, _Session
 
+    t = FakeTime()
+    gov = hl_rate.reset_governor(hl_rate.HLRateGovernor(budget_per_min=1000.0, clock=t.clock, sleep=t.sleep))
     engine = SmartMoneyEngine()
-    engine._record_weight("userFills", [{}] * 2000)
-    assert engine._weight_log[-1][1] == 120
-    engine._record_weight("clearinghouseState", {})
-    assert engine._weight_log[-1][1] == 2
-    for _ in range(3):
-        engine._record_weight("userFills", [{}] * 2000)  # now 482 weight in the last minute
-    slept = []
-
-    async def fake_sleep(seconds):
-        slept.append(seconds)
-        engine._weight_log.clear()  # time passes; the window empties
-
-    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
-    await engine._rate_limit()
-    assert slept and slept[-1] >= 0.5  # waited instead of firing over budget
+    engine._session = _Session(_Resp(200, [{}] * 2000))
+    for _ in range(6):
+        assert len(await engine._post({"type": "userFills", "user": "0x" + "a" * 40})) == 2000
+    assert gov.weight_by_component["smart_money"] == 6 * 120
+    assert t.slept  # waited instead of firing over budget
+    assert gov.used_last_minute("smart_money") <= gov.allocation("smart_money") + 120
 
 
 def test_mcp_hlp_vault_reports_aum_source_and_pnl_validity(tmp_path, monkeypatch):

@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 import aiohttp
 
 from hyperdata_terminal.data_layer import address_store
+from hyperdata_terminal.data_layer.hl_rate import ELASTIC_MAX_PER_MIN, get_governor, hl_info
 
 logger = logging.getLogger(__name__)
 
@@ -67,33 +68,45 @@ MAX_TRACKED_ADDRESSES_IN_MEMORY = address_store.MAX_TRACKED_ADDRESSES + (
 # Safety factor between the worst-case healthy full pass and "stale".
 STALE_MARGIN_FACTOR = 1.5
 
+# Hyperliquid weight of one clearinghouseState request, and the weight a
+# minute the governor grants the scanner when this is the only hyperdata
+# process on the machine. With several processes sharing the per-IP budget
+# it grants less, and the threshold below stretches with it.
+WEIGHT_PER_ADDRESS = 2
+DEFAULT_SCANNER_WEIGHT_PER_MIN = ELASTIC_MAX_PER_MIN["position_scanner"]
+
 
 def scan_cycle_seconds_worst_case(
     budget: int = SCAN_ADDRESS_BUDGET, scan_interval: float = SCAN_INTERVAL_SECONDS,
+    weight_per_min: float = DEFAULT_SCANNER_WEIGHT_PER_MIN,
 ) -> float:
     """Wall-clock seconds one hub scan cycle takes when every request is
-    answered within its latency allowance: the batches, the sleeps between
-    them, the price refresh and the hub's idle interval."""
+    answered within its latency allowance: the batches and the sleeps
+    between them, or the time the weight governor needs to admit the
+    cycle's weight at `weight_per_min` (whichever is longer), plus the price
+    refresh and the hub's idle interval."""
     batches = -(-budget // RATE_LIMIT_PER_SEC)
-    return (
-        batches * BATCH_LATENCY_ALLOWANCE_SECONDS
-        + max(0, batches - 1) * BATCH_SLEEP_SECONDS
-        + CYCLE_OVERHEAD_ALLOWANCE_SECONDS
-        + scan_interval
-    )
+    batch_phase = batches * BATCH_LATENCY_ALLOWANCE_SECONDS + max(0, batches - 1) * BATCH_SLEEP_SECONDS
+    governed = (budget * WEIGHT_PER_ADDRESS + WEIGHT_PER_ADDRESS) / (max(weight_per_min, 1e-9) / 60.0)
+    return max(batch_phase, governed) + CYCLE_OVERHEAD_ALLOWANCE_SECONDS + scan_interval
 
 
 def full_pass_seconds_worst_case(
     tracked: int = MAX_TRACKED_ADDRESSES_IN_MEMORY,
     budget: int = SCAN_ADDRESS_BUDGET,
     scan_interval: float = SCAN_INTERVAL_SECONDS,
+    weight_per_min: float = DEFAULT_SCANNER_WEIGHT_PER_MIN,
 ) -> float:
     """Longest a healthy scanner can take to re-fetch EVERY tracked address
     once: the cycles a round-robin pass over `tracked` needs, plus one
     discovery run (a pass of this length always contains at most one)."""
     cycles = -(-tracked // budget)
     discovery = len(DISCOVERY_SYMBOLS) * BATCH_LATENCY_ALLOWANCE_SECONDS
-    return cycles * scan_cycle_seconds_worst_case(budget, scan_interval) + discovery
+    return cycles * scan_cycle_seconds_worst_case(budget, scan_interval, weight_per_min) + discovery
+
+
+def stale_after_seconds_for(weight_per_min: float) -> float:
+    return float(math.ceil(full_pass_seconds_worst_case(weight_per_min=weight_per_min) * STALE_MARGIN_FACTOR))
 
 
 # A position whose last real scan is older than this — or a scanner whose
@@ -103,7 +116,7 @@ def full_pass_seconds_worst_case(
 # never hand-tuned: the previous hardcoded 600s was 20s above the
 # zero-latency pass time, so any real install read "stale" forever.
 # tests/test_review_fixes.py::TestB1StalenessBudget pins the relationship.
-POSITION_STALE_AFTER_SECONDS = float(math.ceil(full_pass_seconds_worst_case() * STALE_MARGIN_FACTOR))
+POSITION_STALE_AFTER_SECONDS = stale_after_seconds_for(DEFAULT_SCANNER_WEIGHT_PER_MIN)
 
 # Explicit deadline on every request so a hung endpoint fails the scan cycle
 # instead of blocking the hub's position-scan loop indefinitely. Split
@@ -297,8 +310,22 @@ class PositionScanner:
         'starting', not 'stale')."""
         if self.last_scan_at <= 0:
             return False
-        return (self.scan_age_seconds(now) > POSITION_STALE_AFTER_SECONDS
-                or self.oldest_position_age_seconds(now) > POSITION_STALE_AFTER_SECONDS)
+        limit = self.stale_after_seconds()
+        return (self.scan_age_seconds(now) > limit
+                or self.oldest_position_age_seconds(now) > limit)
+
+    @staticmethod
+    def stale_after_seconds() -> float:
+        """The staleness threshold for the weight the scanner is granted now.
+
+        POSITION_STALE_AFTER_SECONDS when this process has the scanner's
+        full allocation; longer while other hyperdata processes share the
+        per-IP budget (each then re-fetches positions less often, and a
+        healthy but slower scanner must not read as stale)."""
+        granted = get_governor().allocation("position_scanner")
+        if granted >= DEFAULT_SCANNER_WEIGHT_PER_MIN:
+            return POSITION_STALE_AFTER_SECONDS
+        return max(POSITION_STALE_AFTER_SECONDS, stale_after_seconds_for(granted))
 
     @staticmethod
     def as_of(positions: list[TrackedPosition]) -> float | None:
@@ -317,8 +344,11 @@ class PositionScanner:
             "last_full_pass_at": self.last_full_pass_at or None,
             "tracked_addresses": len(self.discovered_addresses),
             "scan_budget_per_cycle": self.scan_budget,
-            "stale_after_seconds": POSITION_STALE_AFTER_SECONDS,
-            "full_pass_worst_case_seconds": full_pass_seconds_worst_case(),
+            "stale_after_seconds": self.stale_after_seconds(),
+            "full_pass_worst_case_seconds": full_pass_seconds_worst_case(
+                weight_per_min=min(DEFAULT_SCANNER_WEIGHT_PER_MIN, get_governor().allocation("position_scanner")),
+            ),
+            "weight_per_min_granted": round(get_governor().allocation("position_scanner"), 1),
             "stale": self.is_stale(now),
         }
 
@@ -493,14 +523,9 @@ class PositionScanner:
     async def _post(self, payload: dict) -> dict | list | None:
         if self._session is None:
             raise RuntimeError("No active aiohttp session — use scan() or create one manually")
-        async with self._session.post(
-            API_URL,
-            json=payload,
-            headers={"Content-Type": "application/json"},
-            timeout=HTTP_TIMEOUT,
-        ) as resp:
-            resp.raise_for_status()
-            return await resp.json()
+        # Through the process-wide Hyperliquid weight governor: the scanner
+        # is an elastic caller and slows down when the budget is shared.
+        return await hl_info(self._session, payload, component="position_scanner", timeout=HTTP_TIMEOUT)
 
     # ── Address persistence (SQLite-backed) ──────────────────────
 

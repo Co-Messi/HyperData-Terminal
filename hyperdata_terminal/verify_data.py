@@ -34,7 +34,7 @@ async def run_audit(wait_secs: int) -> int:
     console.print("[bold bright_cyan]═══════════════════════════════════════════[/]\n")
     console.print(f"[dim]Starting hub and collecting data for {wait_secs}s...[/]")
 
-    hub = HyperDataHub()
+    hub = HyperDataHub(smart_money=False)
     await hub.start()
     try:
         await asyncio.sleep(wait_secs)

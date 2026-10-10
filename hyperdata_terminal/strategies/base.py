@@ -58,6 +58,11 @@ class Strategy(ABC):
                 return None
     """
 
+    # Set to True in a strategy that reads hub.smart_money: the paper trader
+    # then starts the smart money engine, which is off by default because it
+    # is the most expensive Hyperliquid caller.
+    uses_smart_money: bool = False
+
     @property
     @abstractmethod
     def name(self) -> str:

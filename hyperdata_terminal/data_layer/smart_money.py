@@ -28,6 +28,7 @@ import aiohttp
 import numpy as np
 
 from hyperdata_terminal.data_layer import address_store
+from hyperdata_terminal.data_layer.hl_rate import hl_info
 from hyperdata_terminal.paths import DATA_DIR
 
 logger = logging.getLogger(__name__)
@@ -164,9 +165,6 @@ class SmartMoneyEngine:
         self._session: aiohttp.ClientSession | None = None
         self._running = False
         self._tasks: list[asyncio.Task] = []
-        # Rate limiting
-        self._request_times: deque = deque(maxlen=8)
-        self._weight_log: deque[tuple[float, int]] = deque()  # (time, request weight), last 60s
 
     # ── Lifecycle ──────────────────────────────────────────────────────
 
@@ -321,60 +319,29 @@ class SmartMoneyEngine:
         )
         return added
 
-    # ── Rate limiting ─────────────────────────────────────────────────
-
-    # Hyperliquid limits each IP to 1200 request weight per minute, shared by
-    # every component (measured: the rest of the app uses about 750). A
-    # userFills call costs 20 plus 1 per 20 fills returned: an active wallet
-    # returns 2000 fills, so ~120 weight. A batch of 20 wallets at 8 requests a
-    # second spent ~2400 weight in seconds and drew HTTP 429s, and going over a
-    # shared limit puts the scanner and HLP tracker at risk too. Smart money
-    # now keeps to its own budget.
-    WEIGHT_BUDGET_PER_MIN = 360
-
-    async def _rate_limit(self) -> None:
-        """Max 8 requests per second, and at most WEIGHT_BUDGET_PER_MIN weight a minute."""
-        now = time.time()
-        self._request_times.append(now)
-        if len(self._request_times) >= 8:
-            oldest = self._request_times[0]
-            elapsed = now - oldest
-            if elapsed < 1.0:
-                await asyncio.sleep(1.0 - elapsed)
-        while True:
-            now = time.time()
-            while self._weight_log and now - self._weight_log[0][0] > 60:
-                self._weight_log.popleft()
-            if sum(w for _, w in self._weight_log) < self.WEIGHT_BUDGET_PER_MIN:
-                return
-            await asyncio.sleep(max(0.5, 60 - (now - self._weight_log[0][0])))
-
-    def _record_weight(self, request_type: str, data: Any) -> None:
-        weight = 2 if request_type in ("clearinghouseState", "allMids", "l2Book") else 20
-        if request_type in ("userFills", "userFillsByTime") and isinstance(data, list):
-            weight += len(data) // 20
-        self._weight_log.append((time.time(), weight))
-
     # ── API helpers ───────────────────────────────────────────────────
 
     async def _post(self, payload: dict) -> Any:
-        """POST to Hyperliquid info endpoint with rate limiting."""
+        """POST to the Hyperliquid info endpoint through the weight governor.
+
+        Smart money is an elastic caller: a userFills call costs 20 plus 1
+        per 20 fills (an active wallet returns 2000, so ~120), and the
+        governor holds it to its allocation of this process's share of the
+        per-IP budget, so it can never starve the scanner or HLP tracker.
+        """
         if self._session is None or self._session.closed:
             return None
-        await self._rate_limit()
-        data = None
         try:
-            async with self._session.post(self.API_URL, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return data
-                logger.warning("[smart_money] API %d for %s", resp.status, payload.get("type"))
-                return None
+            return await hl_info(self._session, payload, component="smart_money",
+                                 timeout=aiohttp.ClientTimeout(total=10))
+        except asyncio.CancelledError:
+            raise
+        except aiohttp.ClientResponseError as exc:
+            logger.warning("[smart_money] API %d for %s", exc.status, payload.get("type"))
+            return None
         except Exception:
             logger.debug("[smart_money] API request failed for %s", payload.get("type"))
             return None
-        finally:
-            self._record_weight(str(payload.get("type", "")), data)
 
     async def _fetch_fills(self, address: str) -> list[dict]:
         """Fetch recent trade fills for a wallet."""

@@ -47,6 +47,7 @@ from typing import Any
 from aiohttp import WSMsgType, web
 
 from hyperdata_terminal import __version__
+from hyperdata_terminal.data_layer.hl_rate import get_governor
 from hyperdata_terminal.data_layer.liquidation_processing import LiquidationProcessor
 
 logger = logging.getLogger(__name__)
@@ -872,6 +873,8 @@ class HyperDataAPI:
             "orderflow_venues": orderflow_venues,
             # H4: how old the whale/danger-zone data actually is.
             "position_scan": self.hub.positions.freshness(),
+            # Hyperliquid weight budget: this process's share, use, 429s.
+            "hyperliquid_rate": get_governor().stats(),
             "version": __version__,
             "mode": s.mode,
             "uptime": f"{h}h {m}m",

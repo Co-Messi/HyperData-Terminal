@@ -34,6 +34,7 @@ from hyperdata_terminal.data_layer.alerts import AlertManager
 from hyperdata_terminal.data_layer.deribit import DeribitFeed, DeribitIVSnapshot
 from hyperdata_terminal.data_layer.funding_rates import FundingRateCollector, FundingRateSnapshot
 from hyperdata_terminal.data_layer.health_monitor import DataHealthMonitor
+from hyperdata_terminal.data_layer.hl_rate import get_governor
 from hyperdata_terminal.data_layer.hlp_tracker import HLPPosition, HLPTracker, HLPTrade
 from hyperdata_terminal.data_layer.liquidation_feed import LiquidationEvent, LiquidationFeed
 from hyperdata_terminal.data_layer.long_short_ratio import LongShortCollector, LongShortSnapshot
@@ -111,6 +112,7 @@ class HubStatus:
     tracked_wallets: int = 0
     ranked_wallets: int = 0
     smart_money_signals: int = 0
+    smart_money_status: str = "off"   # 'off' when this mode does not run the engine
 
     # HLP
     hlp_status: str = "offline"
@@ -161,8 +163,14 @@ class HyperDataHub:
         scan_interval: float = SCAN_INTERVAL_SECONDS,
         market_refresh_interval: float = 5.0,
         api_port: int | None = None,
+        smart_money: bool = True,
     ) -> None:
         self.demo = demo
+        # The smart money engine is the most expensive Hyperliquid caller
+        # (userFills for every wallet it ranks). Only the combined dashboard
+        # and paper strategies that declare uses_smart_money read it, so the
+        # CLI turns it off for the API, MCP, verify and the other dashboards.
+        self.smart_money_enabled = smart_money
         self._api_port = api_port
         self._api_server: HyperDataAPI | None = None
         self.symbols = symbols or list(DEFAULT_SYMBOLS)
@@ -415,6 +423,15 @@ class HyperDataHub:
         log) instead of being silently swallowed.
         """
         s = self.status
+        # One Hyperliquid weight budget for the process, shared with every
+        # other hyperdata process on the machine (see hl_rate).
+        governor = get_governor()
+        governor.set_active_elastic({"position_scanner", *(["smart_money"] if self.smart_money_enabled else [])})
+        try:
+            await governor.start()
+            self._governor_started = True
+        except Exception:
+            logger.exception("Could not start the Hyperliquid rate governor registry (continuing)")
         # WS-driven components: start() only creates tasks and returns before
         # any handshake, so a successful start() means 'connecting', not
         # 'connected'. The staleness watchdog promotes to 'connected' on the
@@ -429,7 +446,12 @@ class HyperDataHub:
             on_ok=lambda: setattr(s, "orderflow_engine", "connecting"),
             on_fail=lambda: setattr(s, "orderflow_engine", "error"),
         )
-        await self._start_component("smart_money", self.smart_money.start())
+        if self.smart_money_enabled:
+            await self._start_component(
+                "smart_money", self.smart_money.start(),
+                on_ok=lambda: setattr(s, "smart_money_status", "connected"),
+                on_fail=lambda: setattr(s, "smart_money_status", "error"),
+            )
         await self._start_component(
             "hlp_tracker", self.hlp.start(),
             on_ok=lambda: setattr(s, "hlp_status", "connecting"),
@@ -505,7 +527,7 @@ class HyperDataHub:
             components = (
                 ("liquidation_feed", self.liquidations),
                 ("orderflow_engine", self.orderflow),
-                ("smart_money", self.smart_money),
+                *((("smart_money", self.smart_money),) if self.smart_money_enabled else ()),
                 ("hlp_tracker", self.hlp),
                 ("funding_rates", self.funding),
                 ("long_short_ratio", self.lsr),
@@ -518,6 +540,13 @@ class HyperDataHub:
                     await component.stop()
                 except Exception:
                     logger.exception("Error stopping %s (continuing shutdown)", name)
+
+        if getattr(self, "_governor_started", False):
+            self._governor_started = False
+            try:
+                await get_governor().stop()
+            except Exception:
+                logger.exception("Error stopping the Hyperliquid rate governor (continuing shutdown)")
 
         # Stop API server
         if self._api_server:

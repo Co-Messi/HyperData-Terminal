@@ -36,6 +36,8 @@ from dataclasses import dataclass
 
 import aiohttp
 
+from hyperdata_terminal.data_layer.hl_rate import HyperliquidRateLimited, hl_info
+
 logger = logging.getLogger(__name__)
 
 
@@ -236,15 +238,15 @@ class HLPTracker:
         if self._session is None or self._session.closed:
             return None
         try:
-            async with self._session.post(
-                self.API_URL, json=payload, timeout=aiohttp.ClientTimeout(total=10),
-            ) as resp:
-                if resp.status != 200:
-                    logger.warning("[hlp] %s HTTP %d", payload.get("type"), resp.status)
-                    return None
-                return await resp.json()
+            return await hl_info(self._session, payload, component="hlp",
+                                 timeout=aiohttp.ClientTimeout(total=10))
         except asyncio.CancelledError:
             raise
+        except HyperliquidRateLimited:
+            return None  # logged by the governor, which pauses every caller
+        except aiohttp.ClientResponseError as exc:
+            logger.warning("[hlp] %s HTTP %d", payload.get("type"), exc.status)
+            return None
         except Exception:
             logger.exception("[hlp] %s request failed", payload.get("type"))
             return None

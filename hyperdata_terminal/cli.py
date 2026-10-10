@@ -165,7 +165,8 @@ def build_parser() -> argparse.ArgumentParser:
 async def _run_api(port: int) -> int:
     from hyperdata_terminal.data_layer.hub import HyperDataHub
 
-    hub = HyperDataHub(demo=False, api_port=port)
+    # The API serves no smart money endpoint, so the engine does not run.
+    hub = HyperDataHub(demo=False, api_port=port, smart_money=False)
     await hub.start()
     if "api_server" in hub.status.failed_components:
         await hub.stop()
@@ -207,7 +208,8 @@ async def _run_paper(args: argparse.Namespace) -> int:
         console.print(f"[bold red]error:[/] {exc}")
         return 2
 
-    hub = HyperDataHub(demo=False)
+    # Smart money runs only if a strategy says it reads it.
+    hub = HyperDataHub(demo=False, smart_money=any(getattr(s, "uses_smart_money", False) for s in strategies))
     console.print("[bright_cyan]Connecting to exchanges... strategies run every "
                   f"{args.interval}s once data arrives. Ctrl+C prints the portfolio and exits.[/]")
     await hub.start()

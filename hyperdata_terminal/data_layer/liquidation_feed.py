@@ -13,6 +13,7 @@ from typing import Any, Callable
 import aiohttp
 
 from hyperdata_terminal.config.settings import DEFAULT_SYMBOLS
+from hyperdata_terminal.data_layer.hl_rate import hl_info
 
 logger = logging.getLogger(__name__)
 
@@ -438,16 +439,12 @@ class HyperliquidConnection:
         self._session: aiohttp.ClientSession | None = None
         self._running = False
         self._ws_task: asyncio.Task | None = None
-        # Track mid prices to detect aggressive fills
-        self._mid_prices: dict[str, float] = {}
         self._seen_tids: OrderedDict = OrderedDict()
 
     async def start(self) -> None:
         self._running = True
         self._session = aiohttp.ClientSession()
-        # Run both: WS for trade monitoring + REST poll for price context
         self._ws_task = asyncio.create_task(self._ws_loop(), name="ws-hyperliquid")
-        self._task = asyncio.create_task(self._price_poll(), name="poll-hl-prices")
 
     async def stop(self) -> None:
         self._running = False
@@ -461,29 +458,6 @@ class HyperliquidConnection:
         if self._session and not self._session.closed:
             await self._session.close()
 
-    async def _price_poll(self) -> None:
-        """Poll mid prices to have context for liquidation detection."""
-        consecutive_failures = 0
-        while self._running:
-            try:
-                async with self._session.post(
-                    self.API_URL, json={"type": "allMids"}, timeout=HTTP_TIMEOUT
-                ) as resp:
-                    if resp.status == 200:
-                        self._mid_prices = {k: float(v) for k, v in (await resp.json()).items()}
-                        consecutive_failures = 0
-            except asyncio.CancelledError:
-                return
-            except Exception:
-                consecutive_failures += 1
-                # Silent-pass hid outages for hours; warn once it looks real.
-                if consecutive_failures in (3, 10) or consecutive_failures % 100 == 0:
-                    logger.warning(
-                        "[hyperliquid] price poll failing (%d consecutive)",
-                        consecutive_failures, exc_info=True,
-                    )
-            await asyncio.sleep(self.POLL_INTERVAL)
-
     # Default symbols Hyperliquid lists under another name (kPEPE, kBONK, kFLOKI).
     # Subscribing to an unlisted coin makes Hyperliquid close the socket, which
     # turned this connection into a reconnect loop every ~2 seconds.
@@ -494,10 +468,9 @@ class HyperliquidConnection:
         """The first MAX_COINS default symbols that Hyperliquid actually lists."""
         listed: set[str] | None = None
         try:
-            async with self._session.post(self.API_URL, json={"type": "meta"}, timeout=HTTP_TIMEOUT) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    listed = {a["name"] for a in data.get("universe", []) if not a.get("isDelisted")}
+            data = await hl_info(self._session, {"type": "meta"}, component="liquidation_feed", timeout=HTTP_TIMEOUT)
+            if isinstance(data, dict):
+                listed = {a["name"] for a in data.get("universe", []) if not a.get("isDelisted")}
         except asyncio.CancelledError:
             raise
         except Exception:

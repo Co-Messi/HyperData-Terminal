@@ -18,6 +18,7 @@ from typing import Callable
 import aiohttp
 
 from hyperdata_terminal.config.settings import DEFAULT_SYMBOLS
+from hyperdata_terminal.data_layer.hl_rate import hl_info
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +56,6 @@ VENUES = ("hyperliquid", "binance")
 # coin delisted BETWEEN universe refreshes takes down at most one shard —
 # not the whole venue — until the next refresh.
 HL_SUBSCRIPTIONS_PER_SOCKET = 8
-HL_INFO_URL = "https://api.hyperliquid.xyz/info"
 HL_UNIVERSE_TTL = 3600.0
 
 # Backoff ceiling after a short-lived clean close (server dropped us right
@@ -408,10 +408,8 @@ class OrderFlowEngine:
             if self._hl_universe is not None and time.time() - self._hl_universe_at < HL_UNIVERSE_TTL:
                 return self._hl_universe
             try:
-                async with session.post(
-                    HL_INFO_URL, json={"type": "meta"}, timeout=aiohttp.ClientTimeout(total=10),
-                ) as resp:
-                    data = await resp.json()
+                data = await hl_info(session, {"type": "meta"}, component="orderflow",
+                                     timeout=aiohttp.ClientTimeout(total=10))
                 names = {
                     a["name"] for a in data.get("universe", [])
                     if isinstance(a, dict) and isinstance(a.get("name"), str)

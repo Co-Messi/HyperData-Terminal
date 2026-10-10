@@ -170,7 +170,9 @@ async def run_single(
 ) -> None:
     """Open one dashboard directly (``hyperdata heatmap``); Ctrl+C exits."""
     console = Console()
-    hub = HyperDataHub(demo=False, api_port=api_port)
+    # Only the combined view shows smart money; the other dashboards skip
+    # the engine (and its Hyperliquid weight).
+    hub = HyperDataHub(demo=False, api_port=api_port, smart_money=(key == "all"))
     try:
         await _start_hub(console, hub, [key] if key in DASHBOARD_INFO else list(DASHBOARD_INFO), boot)
         console.clear()

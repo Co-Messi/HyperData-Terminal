@@ -7,7 +7,8 @@ from dataclasses import dataclass
 
 import aiohttp
 
-from hyperdata_terminal.config.settings import HYPERLIQUID_INFO_URL, MAX_REQUESTS_PER_SECOND
+from hyperdata_terminal.config.settings import MAX_REQUESTS_PER_SECOND
+from hyperdata_terminal.data_layer.hl_rate import hl_info
 
 logger = logging.getLogger(__name__)
 
@@ -231,14 +232,7 @@ class MarketData:
 
     async def _post(self, session: aiohttp.ClientSession, payload: dict) -> dict | list | None:
         async with self._semaphore:
-            async with session.post(
-                HYPERLIQUID_INFO_URL,
-                json=payload,
-                headers={"Content-Type": "application/json"},
-                timeout=HTTP_TIMEOUT,
-            ) as resp:
-                resp.raise_for_status()
-                return await resp.json()
+            return await hl_info(session, payload, component="market_data", timeout=HTTP_TIMEOUT)
 
 
 class _SessionCtx:

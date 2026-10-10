@@ -84,6 +84,7 @@ class DataHealthMonitor:
     def __init__(self, hub) -> None:
         self.hub = hub
         self._result: dict | None = None
+        self._last_429_total = 0
 
     def latest(self) -> dict | None:
         """Most recent cached result (None until run_checks() has run once)."""
@@ -100,7 +101,8 @@ class DataHealthMonitor:
         except Exception:
             logger.exception("health monitor: cross-reference checks errored")
 
-        for fn in (self._check_freshness, self._check_completeness, self._check_consistency):
+        for fn in (self._check_freshness, self._check_completeness, self._check_consistency,
+                   self._check_rate_limit):
             try:
                 checks.extend(fn())
             except Exception:
@@ -308,6 +310,19 @@ class DataHealthMonitor:
                     f"{'longs' if lsr_long_dom else 'shorts'} dominant",
                 ))
         return out
+
+    def _check_rate_limit(self) -> list[HealthCheck]:
+        """Hyperliquid HTTP 429s since the previous run (warn: data slows
+        down while every caller backs off, it is not wrong)."""
+        from hyperdata_terminal.data_layer.hl_rate import get_governor
+
+        stats = get_governor().stats()
+        new_429 = stats["http_429_total"] - self._last_429_total
+        self._last_429_total = stats["http_429_total"]
+        detail = (f"{stats['used_last_60s']:.0f}/{stats['share_per_min']:.0f} weight in the last minute "
+                  f"({stats['processes_sharing']} process(es) share {stats['budget_per_min']:.0f}); "
+                  f"{new_429} HTTP 429 since the last check, {stats['http_429_total']} total")
+        return [HealthCheck("consistency", "hyperliquid_rate_limit", "warn" if new_429 > 0 else "pass", detail)]
 
     # ── Summary ───────────────────────────────────────────────────
 

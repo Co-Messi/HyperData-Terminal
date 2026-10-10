@@ -195,16 +195,47 @@ several Liquidators) that hold the positions.
   absorptions read when the app stops are still stored. Ordinary market
   making fills (~300 a minute) are not stored.
 
+## Hyperliquid request budget
+
+Hyperliquid allows 1200 request weight a minute per IP address (2 for
+`clearinghouseState`, `allMids` and `l2Book`, 20 for most other info
+requests, plus 1 per 20 items returned by `userFills`, `userFillsByTime` and
+`recentTrades`). Every Hyperliquid request in the package goes through one
+governor (`data_layer/hl_rate.py`):
+
+- It keeps a sliding 60 second window of the weight this process spent,
+  charging the documented weight before each request and the per-item
+  weight after the response, and makes a caller wait for room.
+- The budget is 1000 a minute by default (`HYPERDATA_HL_WEIGHT_PER_MIN`,
+  at most 1200), leaving headroom for anything else on the same IP.
+- Every live hyperdata process on the machine registers in a per-user
+  directory (`HYPERDATA_HL_REGISTRY_DIR` overrides it; it does not follow
+  `HYPERDATA_DATA_DIR`, because a dashboard and `hyperdata mcp` often use
+  different data dirs but always share one IP) and takes an equal share. A
+  newcomer only takes what the others are not using until their windows
+  drain, so the machine stays under the budget while processes come and go.
+- On HTTP 429 every Hyperliquid caller in the process pauses for the
+  server's `Retry-After`, or an exponential backoff (2s doubling to 60s)
+  when there is none; other processes see the pause and wait too.
+- The position scanner and the smart money engine are "elastic": they
+  share what is left after a reserve for the fixed cadence callers (market
+  data, the HLP tracker), so those always get through.
+- `/v1/health` → `hyperliquid_rate` and MCP `get_data_health` report the
+  share, the weight used in the last minute, the 429 count and any pause;
+  the `hyperliquid_rate_limit` health check warns when 429s happened since
+  the previous check.
+
+Smart money runs only where it is read: the menu and `hyperdata all`, and
+`hyperdata paper` when a strategy sets `uses_smart_money = True`. The API,
+MCP server, `verify` and the single dashboards do not start it.
+
 ## Smart money warmup
 
 Wallets are ranked from their own fill history (`userFills`, about 120
-request weight for an active wallet). Hyperliquid allows 1200 weight a minute
-per IP, shared by every component, and the rest of the app uses about 750
-(measured), so smart money keeps to 360 a minute: a few wallets a minute.
-Tiers need 10 ranked wallets, so the smart and dumb money tables fill in over
-the first few minutes, and the panel says so while they do. Without the
-budget, a batch of wallets drew HTTP 429s, and because the limit is shared,
-going over it puts the scanner and the HLP tracker at risk too.
+request weight for an active wallet), within the smart money share of the
+budget above: a few wallets a minute. Tiers need 10 ranked wallets, so the
+smart and dumb money tables fill in over the first few minutes, and the
+panel says so while they do.
 
 ## Liquidation prices and distances
 
@@ -253,7 +284,8 @@ raises and reconnects instead of silently freezing. On top of that:
   is capped (3,000 in the store, re-synced into the scanner after every
   hourly prune, plus at most what discovery adds in between), and the
   staleness threshold is **derived** from the worst-case healthy full pass
-  over that cap with a 1.5× margin — about 25 minutes — rather than
+  over that cap at the scanner's share of the Hyperliquid budget with a 1.5× margin (about 31 minutes for one
+  process; longer while several processes share the IP, and `/v1/health` reports the value in force) rather than
   hand-picked. A scanner that has not re-fetched a displayed position within
   that window reads `stale` (feed status, health check, whales panel) —
   never `connected`; a healthy one never does.
@@ -277,7 +309,7 @@ only) and caches the result; the dashboard badge and `/v1/health` read it.
 | Order flow freshness (blended) | engine `is_stale()` | some venue delivering trades |
 | Order flow freshness per venue | engine `venue_freshness()` | `ok` (warn if this venue is out, fail if all are) |
 | Orderbook freshness | engine `is_stale()` | not stale |
-| Position scanner freshness | scanner `is_stale()` | last cycle and every displayed position younger than `POSITION_STALE_AFTER_SECONDS` (~25 min, derived from the tracked-set cap) (warn before the first cycle) |
+| Position scanner freshness | scanner `is_stale()` | last cycle and every displayed position younger than `stale_after_seconds` (~31 min alone, derived from the tracked-set cap and the scanner's weight share) (warn before the first cycle) |
 | Market data freshness | hub refresh stamp | < 30s |
 | Funding/consistency | hub | sane bands, funding sign vs L/S agree |
 
