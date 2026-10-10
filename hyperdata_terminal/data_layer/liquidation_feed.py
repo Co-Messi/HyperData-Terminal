@@ -13,6 +13,7 @@ from typing import Any, Callable
 import aiohttp
 
 from hyperdata_terminal.config.settings import DEFAULT_SYMBOLS
+from hyperdata_terminal.symbols import canonical, venue_contract
 
 logger = logging.getLogger(__name__)
 
@@ -39,11 +40,12 @@ def normalize_symbol(raw: str, exchange: str) -> str:
     return raw
 
 
-# Tracked symbols we subscribe to on Bybit's allLiquidation feed. Bybit caps the
-# number of args per subscribe request, so we batch (see BYBIT_MAX_ARGS) rather
-# than truncate the list.
+# Tracked symbols we subscribe to on Bybit's allLiquidation feed, under
+# Bybit's own contract names (PEPE is 1000PEPEUSDT; see symbols.py). Each
+# topic goes in its own subscribe request: Bybit fails a whole request when
+# any one of its topics does not exist, which silently dropped every symbol
+# batched with PEPE, BONK or FLOKI.
 BYBIT_SYMBOL_LIMIT = 50
-BYBIT_MAX_ARGS = 10
 # Heuristic threshold: HL has no liquidation feed, so we infer liquidations from
 # trades at least this large (USD). These are estimates, not confirmed events.
 HL_LIQUIDATION_MIN_USD = 10_000
@@ -73,8 +75,9 @@ def exchange_coverage() -> dict[str, dict[str, str]]:
         "bybit": {
             "method": "confirmed",
             "note": (
-                f"Real allLiquidation v5 feed across the {BYBIT_SYMBOL_LIMIT} "
-                f"tracked symbols (those with a Bybit linear perp)."
+                "Real allLiquidation v5 feed across the tracked symbols Bybit "
+                "lists (1000-unit contracts such as 1000PEPEUSDT mapped to PEPE); "
+                "topics Bybit rejects are counted in the venue health."
             ),
         },
         "okx": {
@@ -294,14 +297,17 @@ class BinanceConnection(ExchangeConnection):
                 price = float(o["p"])
                 qty = float(o["q"])
                 side_raw = str(o["S"]).upper()
+                # 1000PEPEUSDT quotes per 1000 PEPE: notional unchanged,
+                # per-coin price and coin quantity scaled (symbols.py).
+                symbol, mult = canonical("binance", str(o["s"]))
                 event = LiquidationEvent(
                     timestamp=float(o["T"]) / 1000.0,
                     exchange="binance",
-                    symbol=normalize_symbol(str(o["s"]), "binance"),
+                    symbol=symbol,
                     side="long" if side_raw == "SELL" else "short",
                     size_usd=price * qty,
-                    price=price,
-                    quantity=qty,
+                    price=price / mult,
+                    quantity=qty * mult,
                 )
             except (KeyError, TypeError, ValueError, AttributeError):
                 self.feed.record_parse_error("binance", rec)
@@ -319,16 +325,34 @@ class BybitConnection(ExchangeConnection):
             feed=feed,
         )
 
+    @staticmethod
+    def topics() -> list[str]:
+        return [f"allLiquidation.{venue_contract('bybit', s)[0]}" for s in DEFAULT_SYMBOLS[:BYBIT_SYMBOL_LIMIT]]
+
     async def _on_connected(self, ws: aiohttp.ClientWebSocketResponse) -> None:
-        topics = [f"allLiquidation.{s}USDT" for s in DEFAULT_SYMBOLS[:BYBIT_SYMBOL_LIMIT]]
-        # Bybit v5 limits args per subscribe request — send in chunks so we can
-        # cover the full tracked set instead of only the first handful. Topics
-        # for symbols without a Bybit linear perp just get a harmless error reply.
-        for i in range(0, len(topics), BYBIT_MAX_ARGS):
-            await ws.send_json({"op": "subscribe", "args": topics[i:i + BYBIT_MAX_ARGS]})
-        logger.info("[bybit] subscribed to %d allLiquidation topics", len(topics))
+        self.rejected_topics: list[str] = []
+        topics = self.topics()
+        # One topic per request (req_id = topic) so a topic Bybit does not
+        # list fails alone and is reported, instead of taking the others in
+        # its request down with it.
+        for topic in topics:
+            await ws.send_json({"op": "subscribe", "req_id": topic, "args": [topic]})
+        logger.info("[bybit] requested %d allLiquidation topics", len(topics))
+
+    def _on_ack(self, data: dict) -> None:
+        if data.get("op") != "subscribe" or data.get("success") is not False:
+            return
+        topic = str(data.get("req_id") or data.get("ret_msg") or "?")
+        rejected = getattr(self, "rejected_topics", [])
+        if topic not in rejected:
+            rejected.append(topic)
+            self.rejected_topics = rejected
+            logger.warning("[bybit] subscription rejected: %s (%s)", topic, data.get("ret_msg"))
 
     async def _on_message(self, data: Any) -> None:
+        if isinstance(data, dict) and data.get("op") == "subscribe":
+            self._on_ack(data)
+            return
         if not isinstance(data, dict) or "data" not in data:
             return
         if not str(data.get("topic", "")).startswith("allLiquidation."):
@@ -351,14 +375,15 @@ class BybitConnection(ExchangeConnection):
                     raise ValueError(f"unknown side {side_raw!r}")
                 price = float(d["p"])
                 qty = float(d["v"])
+                symbol, mult = canonical("bybit", str(d["s"]))
                 event = LiquidationEvent(
                     timestamp=int(d["T"]) / 1000.0,
                     exchange="bybit",
-                    symbol=normalize_symbol(str(d["s"]), "bybit"),
+                    symbol=symbol,
                     side="long" if side_raw == "Buy" else "short",
                     size_usd=price * qty,
-                    price=price,
-                    quantity=qty,
+                    price=price / mult,
+                    quantity=qty * mult,
                     confirmed=True,
                 )
             except (KeyError, TypeError, ValueError, AttributeError):
@@ -566,6 +591,7 @@ class LiquidationFeed:
             out[conn.name] = {
                 "status": status,
                 "reason": reason,
+                "rejected_topics": list(getattr(conn, "rejected_topics", []) or []) or None,
                 "connected": conn.connected,
                 "connects": conn.connects,
                 "frames": conn.frames,

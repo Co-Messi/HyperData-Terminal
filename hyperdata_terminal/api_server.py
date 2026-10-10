@@ -50,6 +50,7 @@ from hyperdata_terminal import __version__
 from hyperdata_terminal.data_layer.cascade import CascadeDetector
 from hyperdata_terminal.data_layer.hl_rate import get_governor
 from hyperdata_terminal.data_layer.liquidation_processing import LiquidationProcessor
+from hyperdata_terminal.symbols import canonical, venue_contract
 
 logger = logging.getLogger(__name__)
 
@@ -1039,7 +1040,8 @@ class HyperDataAPI:
         # Bybit: per symbol, reported as <venue>_interval_hours).
         result: dict[str, dict] = {}
         for sym, asset in self.hub.market.assets.items():
-            result[sym] = {"hl": asset.funding_rate * 8760 * 100}
+            # One row per coin across venues: Hyperliquid's kPEPE is PEPE.
+            result[canonical("hyperliquid", sym)[0]] = {"hl": asset.funding_rate * 8760 * 100}
         for ex_name, ex_rates in self.hub.funding.rates.items():
             for sym, snap in ex_rates.items():
                 if sym not in result:
@@ -1051,7 +1053,7 @@ class HyperDataAPI:
     async def handle_funding_symbol(self, request: web.Request) -> web.Response:
         sym = request.match_info["symbol"].upper()
         rates = {}
-        asset = self.hub.market.assets.get(sym)
+        asset = self.hub.market.assets.get(sym) or self.hub.market.assets.get(venue_contract("hyperliquid", sym)[0])
         if asset:
             rates["hl"] = {
                 "hourly": asset.funding_rate, "annualized_pct": asset.funding_rate * 8760 * 100,

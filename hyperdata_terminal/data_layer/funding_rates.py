@@ -31,6 +31,8 @@ from dataclasses import dataclass
 
 import aiohttp
 
+from hyperdata_terminal.symbols import canonical
+
 logger = logging.getLogger(__name__)
 
 BINANCE_PREMIUM_INDEX_URL = "https://fapi.binance.com/fapi/v1/premiumIndex"
@@ -47,9 +49,13 @@ BINANCE_DEFAULT_INTERVAL_HOURS = 8.0
 HOURS_PER_YEAR = 8760
 
 
-def normalise_fr_symbol(raw: str) -> str:
-    """Strip common exchange suffixes to return a bare symbol like 'BTC'."""
+def normalise_fr_symbol(raw: str, venue: str = "binance") -> str:
+    """The canonical coin for a venue's perp name (1000PEPEUSDT -> PEPE).
+    Funding rates are unitless, so the contract multiplier does not matter."""
     raw = raw.upper()
+    mapped, mult = canonical(venue, raw)
+    if mult != 1:
+        return mapped
     for suffix in ("USDT", "USD", "PERP", "BUSD"):
         if raw.endswith(suffix):
             return raw[: -len(suffix)]
@@ -205,7 +211,7 @@ class FundingRateCollector:
         for item in items:
             try:
                 raw = str(item["symbol"])
-                symbol = normalise_fr_symbol(raw)
+                symbol = normalise_fr_symbol(raw, "bybit")
                 if not symbol:
                     continue
                 rate = float(item["fundingRate"])

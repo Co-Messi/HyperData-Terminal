@@ -14,7 +14,7 @@ report a `coverage` block plus a per-exchange `method` tag:
 | Exchange | Method | What it means |
 |---|---|---|
 | **OKX** | `confirmed` | Real `liquidation-orders` feed across all SWAP instruments. OKX reports size in contracts (BTC-USDT-SWAP is 0.01 BTC, DOGE-USDT-SWAP 1000 DOGE, inverse BTC-USD-SWAP $100), converted with each swap's contract value from OKX's instrument list; a swap not in the list is dropped (counted in `unsized_drops`), not guessed. Builds before this fix multiplied contracts by price, so OKX rows stored by them are wrong (BTC 100x too large). |
-| **Bybit** | `confirmed` | Real `allLiquidation` v5 feed across the tracked symbols (those with a Bybit linear perp). Subscriptions are batched because Bybit caps args per request. `S` is the side of the liquidated position (`Buy` = a long was liquidated); 1.0.0 and earlier read it the other way round, so their stored Bybit rows have long and short swapped. |
+| **Bybit** | `confirmed` | Real `allLiquidation` v5 feed across the tracked symbols Bybit lists, under Bybit's names (PEPE, BONK and FLOKI are `1000PEPEUSDT` and so on). Each topic is its own subscribe request: Bybit fails a whole request when one of its topics does not exist, which used to drop every symbol batched with PEPE, BONK or FLOKI; rejected topics are listed in `/v1/health` → `liquidation_venues.bybit.rejected_topics`. `S` is the side of the liquidated position (`Buy` = a long was liquidated); 1.0.0 and earlier read it the other way round, so their stored Bybit rows have long and short swapped. |
 | **Binance** | `sampled` | The `!forceOrder` stream is **throttled by Binance to ~1 liquidation per symbol per second**. Large cascades are undercounted *at the source* — this cannot be fixed client-side, only disclosed. |
 | **Hyperliquid** | `partial` | Hyperliquid has **no public liquidation feed**. *Confirmed* events are liquidations an HLP vault took the other side of: Hyperliquid marks those fills with a `liquidation` object (`method: market` or `backstop`), and the HLP tracker polls every child vault's fills (~2 min delay). In practice most are `market` fills by Strategy A/B when HLP happened to be the book counterparty (several per hour in a live check), grouped by transaction hash so a liquidation both vaults filled counts once; Liquidator backstops are rarer. Liquidations filled by other traders are invisible. |
 
@@ -79,9 +79,9 @@ they happen (the HLP fill poll), so the newest two minutes undercount them.
   cumulative CVD.
 - Hyperliquid drops a WebSocket (close code 1006, no error message) when it
   receives a `trades` subscription for a coin it does not list. Subscriptions
-  are therefore filtered against the live `meta` universe (refreshed hourly);
-  an unlisted default symbol is skipped with one WARNING naming it and the
-  alias Hyperliquid uses (`PEPE` → `kPEPE`). Symbols are also spread across
+  are therefore filtered against the live `meta` universe (refreshed hourly),
+  under Hyperliquid's own names (`PEPE` is subscribed as `kPEPE`); an
+  unlisted default symbol is skipped with one WARNING naming it. Symbols are also spread across
   sockets of at most 25 subscriptions (two for the default list) so a coin
   delisted between refreshes takes down one shard, not the venue. A socket the server closes shortly
   after connecting is retried with backoff (1s doubling to 15s), never in a
@@ -101,6 +101,22 @@ window under 95% covered, the aggregate reads `WARMING_UP` until the 1h
 window is half covered (`OrderFlowEngine.display_signal`), and
 `/v1/orderflow/{symbol}` returns `coverage` per timeframe. The raw
 `get_multi_timeframe_signal()` used by strategies is unchanged.
+
+## 1000-unit contracts
+
+Binance and Bybit list low priced coins as 1000-unit contracts
+(`1000PEPEUSDT`: the price is per 1000 PEPE and one unit of quantity is 1000
+PEPE), and Hyperliquid as k-coins (`kPEPE`). `hyperdata_terminal/symbols.py`
+maps each venue's names to the coin and its multiplier (checked against the
+venues' live symbol lists; a prefix is never stripped blindly, since Binance
+lists both `CATUSDT` and `1000CATUSDT`). Liquidations and order flow from
+these contracts are reported under the coin (PEPE) with the per-coin price
+and coin quantity (the notional is unchanged), funding rates under the coin,
+and the Binance order flow leg subscribes to `1000pepeusdt@aggTrade` (it
+used to ask for a `pepeusdt` stream that does not exist). Hyperliquid's own
+market and position views keep Hyperliquid's names (`kPEPE`, priced per
+1000); MCP `get_asset("PEPE")` finds it and joins it with the other venues'
+PEPE funding.
 
 ## Funding rates: per symbol intervals
 

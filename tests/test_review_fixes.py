@@ -2007,11 +2007,12 @@ class TestHLSharding:
         e = OrderFlowEngine(symbols=["BTC", "PEPE", "ETH", "BONK"])
         universe = {"BTC", "ETH", "kPEPE", "SOL"}
         with caplog.at_level("WARNING"):
-            assert e._hl_listed(["BTC", "PEPE", "ETH", "BONK"], universe) == ["BTC", "ETH"]
-            assert e._hl_listed(["BTC", "PEPE", "ETH", "BONK"], universe) == ["BTC", "ETH"]
-        assert caplog.text.count("PEPE is not listed") == 1          # once, not per reconnect
-        assert "Hyperliquid lists it as kPEPE" in caplog.text
-        assert caplog.text.count("BONK is not listed") == 1
+            # PEPE is subscribed under Hyperliquid's own name, kPEPE (symbols.py);
+            # BONK's kBONK is absent from this universe, so BONK is skipped.
+            assert e._hl_listed(["BTC", "PEPE", "ETH", "BONK"], universe) == ["BTC", "PEPE", "ETH"]
+            assert e._hl_listed(["BTC", "PEPE", "ETH", "BONK"], universe) == ["BTC", "PEPE", "ETH"]
+        assert "PEPE is not listed" not in caplog.text
+        assert caplog.text.count("BONK is not listed") == 1          # once, not per reconnect
         assert "lists it as kBONK" not in caplog.text                # no alias -> no hint
         # No universe (fetch failed): subscribe unfiltered, never go dark.
         assert e._hl_listed(["BTC", "PEPE"], None) == ["BTC", "PEPE"]

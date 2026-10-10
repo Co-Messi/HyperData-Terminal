@@ -1,0 +1,59 @@
+{
+ "_meta": {
+  "source": "wss://fstream.binance.com/market/stream?streams=1000pepeusdt@aggTrade/1000bonkusdt@aggTrade",
+  "captured": "2026-10-10"
+ },
+ "payload": [
+  {
+   "stream": "1000pepeusdt@aggTrade",
+   "data": {
+    "e": "aggTrade",
+    "E": 1791599853981,
+    "a": 1147196601,
+    "s": "1000PEPEUSDT",
+    "p": "0.0040269",
+    "q": "820171",
+    "nq": "820171",
+    "f": 2823254793,
+    "l": 2823254820,
+    "T": 1791599853979,
+    "m": true,
+    "st": 1
+   }
+  },
+  {
+   "stream": "1000pepeusdt@aggTrade",
+   "data": {
+    "e": "aggTrade",
+    "E": 1791599853982,
+    "a": 1147196602,
+    "s": "1000PEPEUSDT",
+    "p": "0.0040268",
+    "q": "244244",
+    "nq": "244244",
+    "f": 2823254821,
+    "l": 2823254833,
+    "T": 1791599853980,
+    "m": true,
+    "st": 1
+   }
+  },
+  {
+   "stream": "1000pepeusdt@aggTrade",
+   "data": {
+    "e": "aggTrade",
+    "E": 1791599853985,
+    "a": 1147196603,
+    "s": "1000PEPEUSDT",
+    "p": "0.0040267",
+    "q": "43421",
+    "nq": "43421",
+    "f": 2823254834,
+    "l": 2823254838,
+    "T": 1791599853982,
+    "m": true,
+    "st": 1
+   }
+  }
+ ]
+}

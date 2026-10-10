@@ -21,6 +21,7 @@ from rich.table import Table
 from rich.text import Text
 
 from hyperdata_terminal.data_layer.hub import HyperDataHub
+from hyperdata_terminal.symbols import canonical
 from hyperdata_terminal.utils.helpers import format_distance_pct as fmt_distance
 from hyperdata_terminal.utils.helpers import format_pct as fmt_pct
 from hyperdata_terminal.utils.helpers import format_price as fmt_price
@@ -823,9 +824,8 @@ class HubMarketIntel:
         for sym, asset in list(self.hub.market.assets.items())[:30]:
             ann = asset.funding_rate * 8760 * 100
             if abs(ann) > 1.0:
-                if sym not in all_funding:
-                    all_funding[sym] = {}
-                all_funding[sym]["hl"] = ann
+                coin = canonical("hyperliquid", sym)[0]  # kPEPE joins PEPE
+                all_funding.setdefault(coin, {})["hl"] = ann
 
         # Sort by max absolute funding across any exchange
         top_funding = sorted(

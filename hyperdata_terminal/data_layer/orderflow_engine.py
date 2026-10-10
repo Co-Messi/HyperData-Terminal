@@ -19,6 +19,7 @@ import aiohttp
 
 from hyperdata_terminal.config.settings import DEFAULT_SYMBOLS
 from hyperdata_terminal.data_layer.hl_rate import get_governor, hl_info
+from hyperdata_terminal.symbols import canonical, venue_contract
 
 logger = logging.getLogger(__name__)
 
@@ -437,14 +438,15 @@ class OrderFlowEngine:
             return self._hl_universe
 
     def _hl_listed(self, symbols: list[str], universe: set[str] | None) -> list[str]:
-        """Drop symbols Hyperliquid does not list — one such subscription
-        closes the socket — and say so once per symbol, with the alias HL
-        uses when there is an obvious one (PEPE -> kPEPE)."""
+        """Drop symbols Hyperliquid does not list under their Hyperliquid
+        name (PEPE trades as kPEPE; see symbols.py); one unlisted
+        subscription closes the socket. Say so once per symbol, with the
+        alias when there is an obvious one."""
         if universe is None:
             return list(symbols)
-        listed = [s for s in symbols if s in universe]
+        listed = [s for s in symbols if venue_contract("hyperliquid", s)[0] in universe]
         for s in symbols:
-            if s in universe or s in self._hl_unlisted_warned:
+            if venue_contract("hyperliquid", s)[0] in universe or s in self._hl_unlisted_warned:
                 continue
             self._hl_unlisted_warned.add(s)
             alias = f"k{s}" if f"k{s}" in universe else None
@@ -919,7 +921,7 @@ class OrderFlowEngine:
             for sym in symbols:
                 await ws.send_json({
                     "method": "subscribe",
-                    "subscription": {"type": "trades", "coin": sym},
+                    "subscription": {"type": "trades", "coin": venue_contract("hyperliquid", sym)[0]},
                 })
                 logger.debug("[hl-%d] Subscribed to trades for %s", shard, sym)
 
@@ -1003,12 +1005,15 @@ class OrderFlowEngine:
                 price = float(t["px"])
                 size = float(t["sz"])
                 side = "buy" if t["side"] == "B" else "sell"
+                # kPEPE trades in units of 1000 PEPE: keep the notional,
+                # report the per-coin price and coin size under PEPE.
+                symbol, mult = canonical("hyperliquid", str(coin))
                 trade = Trade(
                     timestamp=t["time"] / 1000.0,  # ms -> seconds
-                    symbol=coin,
+                    symbol=symbol,
                     side=side,
-                    price=price,
-                    size=size,
+                    price=price / mult,
+                    size=size * mult,
                     size_usd=price * size,
                 )
                 self._process_trade(trade, venue="hyperliquid")
@@ -1023,14 +1028,14 @@ class OrderFlowEngine:
 
     # -- Binance trade stream (adds 10x volume to CVD) ---------------------
 
-    # Map Binance futures symbols back to our standard names
-    _BINANCE_SYMBOL_MAP = {
-        "BTCUSDT": "BTC", "ETHUSDT": "ETH", "SOLUSDT": "SOL",
-        "DOGEUSDT": "DOGE", "XRPUSDT": "XRP", "AVAXUSDT": "AVAX",
-        "LINKUSDT": "LINK", "ARBUSDT": "ARB", "SUIUSDT": "SUI",
-        "APTUSDT": "APT", "OPUSDT": "OP", "SEIUSDT": "SEI",
-        "PEPEUSDT": "PEPE", "WIFUSDT": "WIF", "INJUSDT": "INJ",
-    }
+    # The Binance leg's symbols, by their Binance USD-M names (PEPE trades as
+    # 1000PEPEUSDT; the old map subscribed to a pepeusdt stream that does
+    # not exist).
+    _BINANCE_SYMBOLS = (
+        "BTC", "ETH", "SOL", "DOGE", "XRP", "AVAX", "LINK", "ARB", "SUI",
+        "APT", "OP", "SEI", "PEPE", "WIF", "INJ",
+    )
+    _BINANCE_SYMBOL_MAP = {venue_contract("binance", s)[0]: s for s in _BINANCE_SYMBOLS}
 
     def binance_stream_url(self) -> str:
         """Combined aggTrade stream on Binance's /market route (the legacy
@@ -1146,13 +1151,14 @@ class OrderFlowEngine:
             qty = float(data["q"])
             # m=True means buyer is maker → taker is SELLER
             side = "sell" if data.get("m", False) else "buy"
+            mult = canonical("binance", binance_sym)[1]
 
             trade = Trade(
                 timestamp=data["T"] / 1000.0,
                 symbol=symbol,
                 side=side,
-                price=price,
-                size=qty,
+                price=price / mult,
+                size=qty * mult,
                 size_usd=price * qty,
             )
             self._process_trade(trade, venue="binance")

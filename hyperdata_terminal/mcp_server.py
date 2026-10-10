@@ -25,6 +25,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from hyperdata_terminal import __version__
+from hyperdata_terminal.symbols import canonical, venue_contract
 
 INSTRUCTIONS = """\
 Live crypto derivatives data from Hyperliquid, Binance, Bybit, OKX, Coinbase and
@@ -231,7 +232,10 @@ class HubTools:
     def asset(self, symbol: str) -> dict[str, Any]:
         sym = self._sym(symbol)
         hub = self.hub
-        a = hub.market.assets.get(sym)
+        # Hyperliquid lists PEPE as kPEPE (per 1000 coins): accept either.
+        a = hub.market.assets.get(sym) or hub.market.assets.get(venue_contract("hyperliquid", sym)[0])
+        if a is not None:
+            sym = canonical("hyperliquid", a.symbol)[0]
         if a is None:
             return self._with_meta({"symbol": sym, "error": f"{sym} is not listed on Hyperliquid (or not loaded yet)"})
         funding = {"hyperliquid_annualized_pct": _num(a.funding_rate * 8760 * 100, 1), "hyperliquid_interval_hours": 1}
@@ -242,6 +246,7 @@ class HubTools:
                 funding[f"{ex}_interval_hours"] = _num(getattr(snap, "interval_hours", None), 2)
         out: dict[str, Any] = {
             "symbol": sym,
+            "hyperliquid_symbol": a.symbol,
             "price": _num(a.price, 6),
             "change_24h_pct": _num(a.price_change_24h_pct * 100, 2),
             "open_interest_usd": _num(a.open_interest, 0),
@@ -483,9 +488,10 @@ class HubTools:
         threshold = min_annualized_pct / 100
         rows = []
         for a in self.hub.get_extreme_funding(threshold_annualized=threshold)[: max(1, min(limit, 100))]:
-            row = {"symbol": a.symbol, "hyperliquid_annualized_pct": _num(a.funding_rate * 8760 * 100, 1)}
+            coin = canonical("hyperliquid", a.symbol)[0]
+            row = {"symbol": coin, "hyperliquid_annualized_pct": _num(a.funding_rate * 8760 * 100, 1)}
             for ex, rates in self.hub.funding.rates.items():
-                snap = rates.get(a.symbol)
+                snap = rates.get(coin)
                 if snap is not None:
                     row[f"{ex}_annualized_pct"] = _num(snap.funding_rate_annualized * 100, 1)
                     row[f"{ex}_interval_hours"] = _num(getattr(snap, "interval_hours", None), 2)
