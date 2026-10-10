@@ -118,6 +118,11 @@ class ExchangeConnection:
     # permanently kills itself during a long venue outage never recovers,
     # and one handshake per minute is negligible load.
     FAILURE_ESCALATION_THRESHOLD = 20
+    # A connection must stay up this long before the backoff resets. A venue
+    # that accepts the handshake and then drops the socket (a rejected
+    # subscription, a regional edge) used to reset it on every connect and
+    # so reconnected every second forever, logging a warning each time.
+    HEALTHY_AFTER_SECONDS = 30.0
 
     def __init__(self, name: str, ws_url: str, feed: LiquidationFeed):
         self.name = name
@@ -183,50 +188,67 @@ class ExchangeConnection:
 
     async def _run_loop(self) -> None:
         while self._running:
+            opened_at = 0.0
+            error: Exception | None = None
             try:
-                logger.info("[%s] connecting to %s", self.name, self.ws_url)
+                logger.debug("[%s] connecting to %s", self.name, self.ws_url)
                 async with self._session.ws_connect(self.ws_url, heartbeat=20) as ws:
                     self._ws = ws
-                    self._backoff = 1.0
-                    self.consecutive_failures = 0
+                    opened_at = time.time()
                     self.connected = True
-                    self.connected_at = time.time()
+                    self.connected_at = opened_at
                     self.connects += 1
                     self.last_error = ""
-                    logger.info("[%s] connected", self.name)
+                    if self.consecutive_failures < self.FAILURE_ESCALATION_THRESHOLD:
+                        logger.info("[%s] connected", self.name)
                     await self._on_connected(ws)
                     async for msg in ws:
                         if msg.type == aiohttp.WSMsgType.TEXT:
                             self.frames += 1
                             self.last_frame_at = time.time()
-                            await self._on_message(json.loads(msg.data))
+                            # One malformed frame is counted and skipped; it
+                            # must not tear down a healthy socket.
+                            try:
+                                payload = json.loads(msg.data)
+                            except ValueError:
+                                self.feed.record_parse_error(self.name, msg.data)
+                                continue
+                            await self._on_message(payload)
                         elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                             break
                 self._mark_disconnected("closed by server")
-                logger.warning("[%s] connection closed, reconnecting...", self.name)
             except asyncio.CancelledError:
                 self._mark_disconnected("stopped")
                 return
             except Exception as exc:
+                error = exc
                 self._mark_disconnected(self._describe(exc))
+
+            if opened_at and time.time() - opened_at >= self.HEALTHY_AFTER_SECONDS:
+                # It stayed up: server side churn, reconnect promptly.
+                self._backoff = 1.0
+                self.consecutive_failures = 0
+            else:
                 self.consecutive_failures += 1
-                if self.consecutive_failures == self.FAILURE_ESCALATION_THRESHOLD:
-                    logger.error(
-                        "[%s] %d consecutive connection failures — endpoint looks "
-                        "dead/deprecated; will keep retrying every %.0fs quietly",
-                        self.name, self.consecutive_failures, self.MAX_BACKOFF,
-                    )
-                elif self.consecutive_failures < self.FAILURE_ESCALATION_THRESHOLD:
-                    logger.exception("[%s] connection error", self.name)
-                else:
-                    logger.debug("[%s] connection error (%d consecutive)",
-                                 self.name, self.consecutive_failures)
+            self._log_disconnect(error)
 
             if self._running:
-                if self.consecutive_failures < self.FAILURE_ESCALATION_THRESHOLD:
-                    logger.info("[%s] reconnecting in %.1fs", self.name, self._backoff)
                 await asyncio.sleep(self._backoff)
                 self._backoff = min(self._backoff * 2, self.MAX_BACKOFF)
+
+    def _log_disconnect(self, error: Exception | None) -> None:
+        """Warn while it might be transient, escalate once, then go quiet."""
+        n = self.consecutive_failures
+        what = f"connection error ({self._describe(error)})" if error else "connection closed"
+        if n == self.FAILURE_ESCALATION_THRESHOLD:
+            logger.error(
+                "[%s] %d failed or short lived connections in a row; the endpoint looks "
+                "dead or blocked. Retrying every %.0fs quietly", self.name, n, self.MAX_BACKOFF,
+            )
+        elif n < self.FAILURE_ESCALATION_THRESHOLD:
+            logger.warning("[%s] %s, reconnecting in %.1fs", self.name, what, self._backoff)
+        else:
+            logger.debug("[%s] %s (%d in a row)", self.name, what, n)
 
     def _mark_disconnected(self, reason: str) -> None:
         if self.connected:

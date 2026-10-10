@@ -928,7 +928,13 @@ class OrderFlowEngine:
                 if not self._running:
                     break
                 if ws_msg.type == aiohttp.WSMsgType.TEXT:
-                    self._handle_message(ws_msg.json())
+                    try:
+                        payload = ws_msg.json()
+                    except ValueError as exc:
+                        self._venue_frame("hyperliquid")
+                        self._venue_parse_error("hyperliquid", exc, ws_msg.data)
+                        continue
+                    self._handle_message(payload)
                 elif ws_msg.type in (
                     aiohttp.WSMsgType.CLOSED,
                     aiohttp.WSMsgType.ERROR,
@@ -1048,10 +1054,11 @@ class OrderFlowEngine:
         backoff = 1.0
         while self._running:
             close_code = None
+            opened_at = 0.0
             try:
                 async with aiohttp.ClientSession() as session:
                     async with session.ws_connect(url, heartbeat=20) as ws:
-                        backoff = 1.0
+                        opened_at = time.time()
                         self._venue_connected("binance")
                         # A successful handshake is NOT liveness: in some
                         # regions this socket connects and never delivers a
@@ -1065,7 +1072,12 @@ class OrderFlowEngine:
                             if not self._running:
                                 break
                             if msg.type == aiohttp.WSMsgType.TEXT:
-                                data = _json.loads(msg.data)
+                                try:
+                                    data = _json.loads(msg.data)
+                                except ValueError as exc:
+                                    self._venue_frame("binance")
+                                    self._venue_parse_error("binance", exc, msg.data)
+                                    continue
                                 self._handle_binance_trade(data)
                             elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                                 break
@@ -1087,6 +1099,10 @@ class OrderFlowEngine:
             finally:
                 self._venue_disconnected("binance")
 
+            # Reset only after a connection that stayed up: one that is
+            # accepted and dropped at once must back off, not spin at 1s.
+            if opened_at and time.time() - opened_at >= STALE_AFTER_SECONDS:
+                backoff = 1.0
             if self._running:
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60.0)

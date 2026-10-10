@@ -244,15 +244,24 @@ class OrderBookEngine:
     async def _run_forever(self) -> None:
         backoff = 1.0
         while self._running:
+            started = time.time()
             try:
                 await self._connect_and_listen()
-                backoff = 1.0
+                if time.time() - started >= STALE_AFTER_SECONDS:
+                    backoff = 1.0  # it stayed up: ordinary server side churn
+                    continue
+                if not self._running:
+                    break
+                # Closed right after connecting: back off instead of
+                # reconnecting in a tight loop.
+                logger.info("OrderBookEngine WS closed after %.1fs, reconnecting in %.1fs",
+                            time.time() - started, backoff)
             except asyncio.CancelledError:
                 break
             except Exception as exc:
                 logger.warning("OrderBookEngine WS error (%s), reconnecting in %.1fs", exc, backoff)
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 60.0)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60.0)
 
     async def _connect_and_listen(self) -> None:
         self._session = aiohttp.ClientSession()
@@ -278,7 +287,12 @@ class OrderBookEngine:
                 if not self._running:
                     break
                 if msg.type == aiohttp.WSMsgType.TEXT:
-                    self._handle_message(msg.json())
+                    try:
+                        payload = msg.json()
+                    except ValueError:
+                        logger.debug("[orderbook] dropped a malformed frame: %.200s", msg.data)
+                        continue
+                    self._handle_message(payload)
                 elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                     break
         finally:
