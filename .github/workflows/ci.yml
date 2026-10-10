@@ -12,12 +12,12 @@ jobs:
     strategy:
       matrix:
         python-version: ["3.12", "3.13"]
-        # "lock": the pinned set from requirements.lock (reproducible).
+        # "lock": requirements.lock, every package (the mcp extra and all
+        # transitive dependencies included) pinned and hash checked; the
+        # package itself goes on top without resolving, so a dependency the
+        # lock is missing fails `pip check` below instead of being fetched.
         # "pyproject": plain `pip install -e ".[mcp]"`, i.e. what a user gets
-        # from PyPI with the MCP extra. Both must pass. The lock leg used to
-        # install the package with dependency resolution disabled, which hid
-        # that the lock contradicted pyproject.toml; it now resolves, and
-        # `pip check` below fails on any conflict.
+        # from PyPI with the MCP extra. Both must pass.
         install: ["lock"]
         include:
           - python-version: "3.13"
@@ -37,8 +37,8 @@ jobs:
         # Test tooling is pinned so CI is deterministic.
         run: |
           if [ "${{ matrix.install }}" = "lock" ]; then
-            pip install -r requirements.lock
-            pip install -e .
+            pip install --require-hashes -r requirements.lock
+            pip install --no-deps -e .
           else
             pip install -e ".[mcp]"
           fi
@@ -55,7 +55,9 @@ jobs:
       - name: Dependency vulnerability audit
         # Blocking: a known CVE in a pinned runtime dep fails CI. Dependabot
         # (.github/dependabot.yml) keeps the lockfile and action SHAs fresh.
-        run: pip-audit -r requirements.lock
+        # The hashed lock is audited as pinned (no resolution at audit time),
+        # so what is audited is exactly what the lock leg installs.
+        run: pip-audit --require-hashes --disable-pip -r requirements.lock
 
       - name: Test imports
         run: |
