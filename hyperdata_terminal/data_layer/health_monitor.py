@@ -227,6 +227,15 @@ class DataHealthMonitor:
             f"{hub.orderbook.data_age():.0f}s since last book",
         ))
 
+        # Confirmed liquidation venues: a down venue is a coverage gap, not
+        # wrong data, so it warns (Binance answers 451 in some regions).
+        venues = getattr(getattr(hub, "liquidations", None), "venue_health", None)
+        health = venues(now) if callable(venues) else None
+        if isinstance(health, dict):
+            bad = {n: i for n, i in health.items() if i["status"] in ("down", "silent")}
+            detail = ", ".join(f"{n}: {i['status']} ({i['reason']})" for n, i in health.items()) or "no venues"
+            out.append(HealthCheck("freshness", "liquidation_venues", "warn" if bad else "pass", detail))
+
         # Position scanner (H4): liquidation distances are the highest-
         # consequence numbers on screen, so a scanner that has fallen behind
         # fails the freshness check rather than quietly serving old state.

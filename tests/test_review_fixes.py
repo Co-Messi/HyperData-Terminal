@@ -822,7 +822,17 @@ class TestM11ConnectingStatus:
             e._handle_binance_trade({"data": {"s": "BTCUSDT", "p": "1", "q": "1", "m": False,
                                               "T": 1700000000000, "a": 1}})
             hub.orderbook.last_message_at = __import__("time").time()
-            s.last_liq_event = 1.0
+            # Liquidations follow their venues' connections (one event no
+            # longer promotes the feed): every confirmed venue connected.
+            from hyperdata_terminal.data_layer.liquidation_feed import (
+                BinanceConnection,
+                BybitConnection,
+                OKXConnection,
+            )
+            for cls in (BinanceConnection, BybitConnection, OKXConnection):
+                conn = cls(hub.liquidations)
+                conn.connected, conn.connected_at = True, _t.time()
+                hub.liquidations._connections.append(conn)
             hub.hlp.snapshots.append(object())
             await hub._update_feed_staleness()
             assert s.orderflow_engine == "connected"

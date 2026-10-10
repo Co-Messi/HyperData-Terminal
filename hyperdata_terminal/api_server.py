@@ -100,6 +100,11 @@ def _serialize(obj: Any) -> Any:
     return obj
 
 
+def _plain_dict(value: Any) -> dict | None:
+    """value if it is a real dict (a component may not expose the field)."""
+    return value if isinstance(value, dict) else None
+
+
 def _host_header_is_loopback(host_header: str) -> bool:
     """True if an HTTP Host header names a loopback address.
 
@@ -871,6 +876,8 @@ class HyperDataAPI:
             "status": status,
             "failed_components": list(s.failed_components),
             "orderflow_venues": orderflow_venues,
+            # Confirmed liquidation venues: one down makes the feed 'partial'.
+            "liquidation_venues": _plain_dict(getattr(self.hub.liquidations, "venue_health", dict)()),
             # H4: how old the whale/danger-zone data actually is.
             "position_scan": self.hub.positions.freshness(),
             # Hyperliquid weight budget: this process's share, use, 429s.

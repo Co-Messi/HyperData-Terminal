@@ -306,8 +306,17 @@ raises and reconnects instead of silently freezing. On top of that:
 - The dashboard header badge reflects this: **✓ LIVE** / **⚠ PARTIAL** /
   **⚠ STALE** / **⚠ DRIFT**.
 
-Liquidations are intentionally *not* aged out — they are sporadic, so a quiet
-market is not a broken feed.
+Liquidation events are intentionally *not* aged out (they are sporadic, so a
+quiet market is not a broken feed). The liquidation feed's status follows its
+confirmed venues instead: each of Binance, Bybit and OKX reports `ok`,
+`connecting`, `down` (not connected for 2 minutes, with the reason, for
+example `HTTP 451`) or `silent` (connected, but no frame for 30 minutes;
+each all-market stream normally delivers several a minute). Every venue
+`ok` reads `connected`, some down or silent `partial`, all of them `error`.
+Hyperliquid large prints never promote it. `/v1/health` → `liquidation_venues`
+has the per-venue detail, the `liquidation_venues` health check warns (it
+never fails: Binance and Bybit are blocked in some regions), and MCP
+`meta.warnings` names a venue that is down.
 
 ## Continuous self-verification
 

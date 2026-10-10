@@ -100,6 +100,16 @@ def exchange_coverage() -> dict[str, dict[str, str]]:
     }
 
 
+# A confirmed venue that has not been connected for this long (never since
+# start, or since its socket dropped) counts as down: the liquidation feed
+# reads 'partial' and the health checks name it.
+VENUE_DOWN_AFTER_SECONDS = 120.0
+# Each venue's all-market liquidation stream normally delivers several
+# frames a minute; a socket that is open but has delivered nothing for this
+# long is 'silent' (a dead route, as Binance's legacy /ws path became).
+VENUE_SILENT_AFTER_SECONDS = 1800.0
+
+
 class ExchangeConnection:
     MAX_BACKOFF = 60.0
     # After this many consecutive failed connections, escalate once to ERROR
@@ -119,11 +129,44 @@ class ExchangeConnection:
         self._running = False
         self._backoff = 1.0
         self.consecutive_failures = 0
+        # Liveness, read by LiquidationFeed.venue_health().
+        self.started_at = 0.0
+        self.connected = False
+        self.connected_at = 0.0
+        self.disconnected_at = 0.0
+        self.last_frame_at = 0.0
+        self.last_event_at = 0.0
+        self.last_error = ""
+        self.connects = 0
+        self.frames = 0
 
     async def start(self) -> None:
         self._running = True
+        self.started_at = time.time()
         self._session = aiohttp.ClientSession()
         self._task = asyncio.create_task(self._run_loop(), name=f"ws-{self.name}")
+
+    def status(self, now: float | None = None) -> tuple[str, str]:
+        """(status, reason): ok, connecting, silent or down."""
+        now = time.time() if now is None else now
+        if self.connected:
+            quiet_since = max(self.last_frame_at, self.connected_at)
+            if now - quiet_since > VENUE_SILENT_AFTER_SECONDS:
+                return "silent", f"connected but no frame for {now - quiet_since:.0f}s"
+            return "ok", f"connected {now - self.connected_at:.0f}s"
+        down_since = self.disconnected_at or self.started_at
+        err = f" ({self.last_error})" if self.last_error else ""
+        if not down_since or now - down_since <= VENUE_DOWN_AFTER_SECONDS:
+            return "connecting", f"not connected yet{err}"
+        never = "never connected" if not self.connects else f"disconnected {now - down_since:.0f}s ago"
+        return "down", f"{never}{err}"
+
+    @staticmethod
+    def _describe(exc: BaseException) -> str:
+        status = getattr(exc, "status", None)
+        if isinstance(status, int):
+            return f"HTTP {status}"
+        return type(exc).__name__
 
     async def stop(self) -> None:
         self._running = False
@@ -146,17 +189,26 @@ class ExchangeConnection:
                     self._ws = ws
                     self._backoff = 1.0
                     self.consecutive_failures = 0
+                    self.connected = True
+                    self.connected_at = time.time()
+                    self.connects += 1
+                    self.last_error = ""
                     logger.info("[%s] connected", self.name)
                     await self._on_connected(ws)
                     async for msg in ws:
                         if msg.type == aiohttp.WSMsgType.TEXT:
+                            self.frames += 1
+                            self.last_frame_at = time.time()
                             await self._on_message(json.loads(msg.data))
                         elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                             break
+                self._mark_disconnected("closed by server")
                 logger.warning("[%s] connection closed, reconnecting...", self.name)
             except asyncio.CancelledError:
+                self._mark_disconnected("stopped")
                 return
-            except Exception:
+            except Exception as exc:
+                self._mark_disconnected(self._describe(exc))
                 self.consecutive_failures += 1
                 if self.consecutive_failures == self.FAILURE_ESCALATION_THRESHOLD:
                     logger.error(
@@ -175,6 +227,12 @@ class ExchangeConnection:
                     logger.info("[%s] reconnecting in %.1fs", self.name, self._backoff)
                 await asyncio.sleep(self._backoff)
                 self._backoff = min(self._backoff * 2, self.MAX_BACKOFF)
+
+    def _mark_disconnected(self, reason: str) -> None:
+        if self.connected:
+            self.disconnected_at = time.time()
+        self.connected = False
+        self.last_error = reason
 
     async def _on_connected(self, ws: aiohttp.ClientWebSocketResponse) -> None:
         pass
@@ -465,6 +523,51 @@ class LiquidationFeed:
         # from the instrument list), also surfaced via get_stats().
         self.unsized_drops: dict[str, int] = {}
 
+    # Venues whose real liquidation feeds this object runs (Hyperliquid's
+    # confirmed events come from the HLP tracker, tracked as hlp_status).
+    CONFIRMED_VENUES = ("binance", "bybit", "okx")
+
+    def venue_health(self, now: float | None = None) -> dict[str, dict]:
+        """Per-venue connection state of the confirmed liquidation feeds."""
+        now = time.time() if now is None else now
+        out: dict[str, dict] = {}
+        for conn in self._connections:
+            status, reason = conn.status(now)
+            out[conn.name] = {
+                "status": status,
+                "reason": reason,
+                "connected": conn.connected,
+                "connects": conn.connects,
+                "frames": conn.frames,
+                "last_frame_age_seconds": round(now - conn.last_frame_at, 1) if conn.last_frame_at else None,
+                "last_event_age_seconds": round(now - conn.last_event_at, 1) if conn.last_event_at else None,
+                "last_error": conn.last_error or None,
+            }
+        return out
+
+    def venues_down(self, now: float | None = None) -> list[str]:
+        """Confirmed venues that are down or silent, as 'name (reason)'."""
+        return [
+            f"{name} ({info['reason']})"
+            for name, info in self.venue_health(now).items()
+            if info["status"] in ("down", "silent")
+        ]
+
+    def feed_status(self, now: float | None = None) -> str | None:
+        """connecting / connected / partial / error, from the venues alone
+        (None before start(): no venue connections exist yet)."""
+        health = self.venue_health(now)
+        if not health:
+            return None
+        statuses = [info["status"] for info in health.values()]
+        if all(s == "ok" for s in statuses):
+            return "connected"
+        if any(s == "ok" for s in statuses):
+            return "connecting" if all(s in ("ok", "connecting") for s in statuses) else "partial"
+        if all(s == "connecting" for s in statuses):
+            return "connecting"
+        return "error" if all(s in ("down", "silent") for s in statuses) else "connecting"
+
     def record_unsized_drop(self, exchange: str) -> None:
         self.unsized_drops[exchange] = self.unsized_drops.get(exchange, 0) + 1
 
@@ -539,6 +642,9 @@ class LiquidationFeed:
         await self._dispatch(event)
 
     async def _dispatch(self, event: LiquidationEvent) -> None:
+        for conn in self._connections:
+            if conn.name == event.exchange:
+                conn.last_event_at = time.time()
         async with self._lock:
             if getattr(event, "confirmed", True):
                 if len(self.events) == self.events.maxlen:

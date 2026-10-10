@@ -264,9 +264,9 @@ class HyperDataHub:
     def _handle_liquidation(self, event: LiquidationEvent) -> None:
         if getattr(event, "confirmed", True):
             self.status.total_liquidations += 1
+            self.status.last_liq_event = time.time()
         else:
             self.status.total_estimated_liquidations += 1
-        self.status.last_liq_event = time.time()
         for cb in self._on_liquidation_cbs:
             try:
                 cb(event)
@@ -869,9 +869,11 @@ class HyperDataHub:
         if self.status.position_scanner in ("connected", "stale"):
             self.status.position_scanner = "stale" if self.positions.is_stale() else "connected"
 
-        # Liquidations: promote on the first real event, never age out.
-        if self.status.liquidation_feed == "connecting" and self.status.last_liq_event > 0:
-            self.status.liquidation_feed = "connected"
+        # Liquidations follow the confirmed venues' connections (a quiet
+        # market is not a broken feed, so events are not aged out): every
+        # venue up = connected, some down or silent = partial, none = error.
+        if self.status.liquidation_feed not in ("offline", "demo", "error"):
+            self.status.liquidation_feed = self.liquidations.feed_status() or self.status.liquidation_feed
 
         # HLP: promote once the first vault snapshot has landed.
         if self.status.hlp_status == "connecting" and self.hlp.snapshots:
