@@ -244,25 +244,29 @@ class BybitConnection(ExchangeConnection):
             return
         if not str(data.get("topic", "")).startswith("allLiquidation."):
             return
-        # Bybit v5 sends `data` as a list of records (older topics used a
-        # single dict) — accept both, and drop malformed records individually
-        # so schema drift can never raise out of the WS loop and reconnect.
+        # v5 sends `data` as a list of records; drop malformed records
+        # individually so schema drift can never raise out of the WS loop.
         payload = data["data"]
         records = payload if isinstance(payload, list) else [payload]
         for d in records:
             try:
-                # v5 allLiquidation uses short keys (p/v/S/s/T); the long
-                # names cover the legacy `liquidation` topic shape.
-                price = float(d.get("price") or d.get("p") or 0)
-                qty = float(d.get("qty") or d.get("size") or d.get("v") or 0)
-                side_raw = d.get("side") or d.get("S") or ""  # "Sell" = long liquidated
-                symbol_raw = d.get("symbol") or d.get("s") or ""
-                ts_ms = int(d.get("updatedTime") or d.get("T") or 0)
+                # allLiquidation keys only (this connection subscribes to
+                # nothing else): T time (ms), s symbol, S the side of the
+                # POSITION that was liquidated ("When you receive a Buy
+                # update, this means that a long position has been
+                # liquidated", Bybit's docs), v executed size, p bankruptcy
+                # price. Captured frames agree: every Buy executed below the
+                # mark (a long closed by a sell), every Sell above it.
+                side_raw = d["S"]
+                if side_raw not in ("Buy", "Sell"):
+                    raise ValueError(f"unknown side {side_raw!r}")
+                price = float(d["p"])
+                qty = float(d["v"])
                 event = LiquidationEvent(
-                    timestamp=ts_ms / 1000.0,
+                    timestamp=int(d["T"]) / 1000.0,
                     exchange="bybit",
-                    symbol=normalize_symbol(str(symbol_raw), "bybit"),
-                    side="long" if side_raw == "Sell" else "short",
+                    symbol=normalize_symbol(str(d["s"]), "bybit"),
+                    side="long" if side_raw == "Buy" else "short",
                     size_usd=price * qty,
                     price=price,
                     quantity=qty,

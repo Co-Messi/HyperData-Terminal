@@ -800,7 +800,9 @@ class TestFeedsRound2:
         })
         assert len(received) == 1
         assert received[0].symbol == "BTC"
-        assert received[0].side == "long"
+        # S is the liquidated position's side: Sell = a short was liquidated
+        # (see the captured frames in tests/fixtures/bybit).
+        assert received[0].side == "short"
         assert feed.parse_errors["bybit"] == 1
 
     @pytest.mark.asyncio

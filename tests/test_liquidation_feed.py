@@ -12,6 +12,7 @@ from hyperdata_terminal.data_layer.liquidation_feed import (
     LiquidationFeed,
     normalize_symbol,
 )
+from tests.fixture_data import load_fixture
 
 
 def test_normalize_symbol() -> None:
@@ -117,59 +118,72 @@ def test_deque_max_size() -> None:
     assert feed.events[0].size_usd == 5000
 
 
-def test_bybit_liquidation_parsing() -> None:
-    """BybitConnection parses allLiquidation v5 messages correctly."""
-    feed = LiquidationFeed(max_events=100)
+def _bybit_records_and_events():
+    """Feed every captured allLiquidation frame through BybitConnection."""
+    captured = load_fixture("bybit/allLiquidation_frames.json")
+    feed = LiquidationFeed(max_events=1000)
+    feed.started_at = 0.0
     conn = BybitConnection(feed)
     received: list[LiquidationEvent] = []
-    feed.on_liquidation(lambda ev: received.append(ev))
+    feed.on_liquidation(received.append)
+    records = []
 
-    # "Sell" side = long position was liquidated
-    sell_msg = {
-        "topic": "allLiquidation.BTCUSDT",
-        "data": {
-            "symbol": "BTCUSDT",
-            "side": "Sell",
-            "price": "65000.00",
-            "qty": "0.5",
-            "updatedTime": "1711000000000",
-        },
-    }
-    asyncio.run(conn._on_message(sell_msg))
+    async def run() -> None:
+        for item in captured:
+            await conn._on_message(item["frame"])
+            for rec in item["frame"]["data"]:
+                records.append((rec, item["mark_price_at_receipt"].get(rec["s"])))
 
-    assert len(received) == 1
-    ev = received[0]
-    assert ev.exchange == "bybit"
-    assert ev.symbol == "BTC"
-    assert ev.side == "long"
-    assert ev.size_usd == 65000.0 * 0.5
-    assert ev.price == 65000.0
-    assert ev.quantity == 0.5
-    assert ev.confirmed is True
+    asyncio.run(run())
+    return records, received, feed
 
-    # "Buy" side = short position was liquidated
-    buy_msg = {
-        "topic": "allLiquidation.ETHUSDT",
-        "data": {
-            "symbol": "ETHUSDT",
-            "side": "Buy",
-            "price": "3500.00",
-            "qty": "2.0",
-            "updatedTime": "1711000001000",
-        },
-    }
-    asyncio.run(conn._on_message(buy_msg))
 
-    assert len(received) == 2
-    ev2 = received[1]
-    assert ev2.symbol == "ETH"
-    assert ev2.side == "short"
-    assert ev2.confirmed is True
+def test_bybit_captured_frames_map_buy_to_long_liquidated() -> None:
+    """Bybit v5 allLiquidation: `S` is the side of the POSITION that was
+    liquidated ("When you receive a Buy update, this means that a long
+    position has been liquidated"). Captured frames, not a hand-written
+    shape: the old test fed a hand-written payload with the retired
+    `liquidation` topic's keys and asserted Sell = long, locking the
+    inversion in."""
+    records, received, feed = _bybit_records_and_events()
+    assert len(received) == len(records) >= 40
+    assert feed.parse_errors == {}
+    for (rec, _mark), ev in zip(records, received):
+        assert ev.exchange == "bybit" and ev.confirmed is True
+        assert ev.side == ("long" if rec["S"] == "Buy" else "short")
+        assert ev.size_usd == pytest.approx(float(rec["p"]) * float(rec["v"]))
+        assert ev.timestamp == rec["T"] / 1000.0
 
-    # Non-liquidation topic should be ignored
-    other_msg = {"topic": "publicTrade.BTCUSDT", "data": []}
-    asyncio.run(conn._on_message(other_msg))
-    assert len(received) == 2
+
+def test_bybit_side_agrees_with_where_the_order_executed() -> None:
+    """Independent of the docs: a liquidated long is closed by a sell at its
+    bankruptcy price, below the mark; a liquidated short by a buy above it.
+    Every captured frame with a mark at receipt must agree with the side
+    the parser assigns."""
+    records, received, _ = _bybit_records_and_events()
+    checked = 0
+    for (rec, mark), ev in zip(records, received):
+        if mark is None:
+            continue
+        checked += 1
+        if ev.side == "long":
+            assert float(rec["p"]) < mark, rec
+        else:
+            assert float(rec["p"]) > mark, rec
+    assert checked >= 40
+
+
+def test_bybit_ignores_other_topics_and_counts_malformed_records() -> None:
+    feed = LiquidationFeed(max_events=10)
+    conn = BybitConnection(feed)
+    asyncio.run(conn._on_message({"topic": "publicTrade.BTCUSDT", "data": []}))
+    # A record without the allLiquidation keys (for example the retired
+    # `liquidation` topic's shape) is dropped and counted, never guessed at.
+    asyncio.run(conn._on_message({"topic": "allLiquidation.BTCUSDT", "data": [
+        {"symbol": "BTCUSDT", "side": "Sell", "price": "65000", "qty": "0.5", "updatedTime": "1711000000000"},
+    ]}))
+    assert len(feed.events) == 0
+    assert feed.parse_errors == {"bybit": 1}
 
 
 @pytest.mark.live

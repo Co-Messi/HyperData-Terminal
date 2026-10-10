@@ -1,0 +1,937 @@
+{
+ "_meta": {
+  "source": "wss://stream.bybit.com/v5/public/linear topic allLiquidation.{symbol}; mark from the tickers.{symbol} topic on the same socket at receipt",
+  "captured": "2026-10-10",
+  "note": "frames verbatim; S=Buy frames all executed below mark (a long closed by a sell), S=Sell above mark"
+ },
+ "payload": [
+  {
+   "frame": {
+    "topic": "allLiquidation.AVAXUSDT",
+    "type": "snapshot",
+    "ts": 1791594535432,
+    "data": [
+     {
+      "T": 1791594534957,
+      "s": "AVAXUSDT",
+      "S": "Buy",
+      "v": "12.3",
+      "p": "10.284"
+     }
+    ]
+   },
+   "mark_price_at_receipt": {
+    "AVAXUSDT": 10.347
+   }
+  },
+  {
+   "frame": {
+    "topic": "allLiquidation.AVAXUSDT",
+    "type": "snapshot",
+    "ts": 1791594602932,
+    "data": [
+     {
+      "T": 1791594602908,
+      "s": "AVAXUSDT",
+      "S": "Sell",
+      "v": "19.6",
+      "p": "10.425"
+     }
+    ]
+   },
+   "mark_price_at_receipt": {
+    "AVAXUSDT": 10.358
+   }
+  },
+  {
+   "frame": {
+    "topic": "allLiquidation.SOLUSDT",
+    "type": "snapshot",
+    "ts": 1791594602979,
+    "data": [
+     {
+      "T": 1791594602908,
+      "s": "SOLUSDT",
+      "S": "Sell",
+      "v": "11.5",
+      "p": "110.020"
+     }
+    ]
+   },
+   "mark_price_at_receipt": {
+    "SOLUSDT": 109.49
+   }
+  },
+  {
+   "frame": {
+    "topic": "allLiquidation.BTCUSDT",
+    "type": "snapshot",
+    "ts": 1791594602982,
+    "data": [
+     {
+      "T": 1791594602908,
+      "s": "BTCUSDT",
+      "S": "Sell",
+      "v": "0.024",
+      "p": "82843.00"
+     }
+    ]
+   },
+   "mark_price_at_receipt": {
+    "BTCUSDT": 82573.0
+   }
+  },
+  {
+   "frame": {
+    "topic": "allLiquidation.XRPUSDT",
+    "type": "snapshot",
+    "ts": 1791594603253,
+    "data": [
+     {
+      "T": 1791594602908,
+      "s": "XRPUSDT",
+      "S": "Sell",
+      "v": "1084.9",
+      "p": "1.4083"
+     }
+    ]
+   },
+   "mark_price_at_receipt": {
+    "XRPUSDT": 1.4015
+   }
+  },
+  {
+   "frame": {
+    "topic": "allLiquidation.ADAUSDT",
+    "type": "snapshot",
+    "ts": 1791594603330,
+    "data": [
+     {
+      "T": 1791594602908,
+      "s": "ADAUSDT",
+      "S": "Sell",
+      "v": "843",
+      "p": "0.2472"
+     }
+    ]
+   },
+   "mark_price_at_receipt": {
+    "ADAUSDT": 0.2455
+   }
+  },
+  {
+   "frame": {
+    "topic": "allLiquidation.DOGEUSDT",
+    "type": "snapshot",
+    "ts": 1791594603330,
+    "data": [
+     {
+      "T": 1791594602908,
+      "s": "DOGEUSDT",
+      "S": "Sell",
+      "v": "2364",
+      "p": "0.08640"
+     }
+    ]
+   },
+   "mark_price_at_receipt": {
+    "DOGEUSDT": 0.08578
+   }
+  },
+  {
+   "frame": {
+    "topic": "allLiquidation.1000PEPEUSDT",
+    "type": "snapshot",
+    "ts": 1791594603330,
+    "data": [
+     {
+      "T": 1791594602908,
+      "s": "1000PEPEUSDT",
+      "S": "Sell",
+      "v": "102600",
+      "p": "0.0040420"
+     }
+    ]
+   },
+   "mark_price_at_receipt": {
+    "1000PEPEUSDT": 0.004004
+   }
+  },
+  {
+   "frame": {
+    "topic": "allLiquidation.SUIUSDT",
+    "type": "snapshot",
+    "ts": 1791594603409,
+    "data": [
+     {
+      "T": 1791594602908,
+      "s": "SUIUSDT",
+      "S": "Sell",
+      "v": "180",
+      "p": "1.08560"
+     }
+    ]
+   },
+   "mark_price_at_receipt": {
+    "SUIUSDT": 1.0752
+   }
+  },
+  {
+   "frame": {
+    "topic": "allLiquidation.ADAUSDT",
+    "type": "snapshot",
+    "ts": 1791594617330,
+    "data": [
+     {
+      "T": 1791594616980,
+      "s": "ADAUSDT",
+      "S": "Sell",
+      "v": "14500",
+      "p": "0.2476"
+     }
+    ]
+   },
+   "mark_price_at_receipt": {
+    "ADAUSDT": 0.2458
+   }
+  },
+  {
+   "frame": {
+    "topic": "allLiquidation.SOLUSDT",
+    "type": "snapshot",
+    "ts": 1791594619978,
+    "data": [
+     {
+      "T": 1791594619740,
+      "s": "SOLUSDT",
+      "S": "Sell",
+      "v": "0.1",
+      "p": "110.110"
+     }
+    ]
+   },
+   "mark_price_at_receipt": {
+    "SOLUSDT": 109.58
+   }
+  },
+  {
+   "frame": {
+    "topic": "allLiquidation.KAIAUSDT",
+    "type": "snapshot",
+    "ts": 1791594642741,
+    "data": [
+     {
+      "T": 1791594642266,
+      "s": "KAIAUSDT",
+      "S": "Sell",
+      "v": "128",
+      "p": "0.05989"
+     }
+    ]
+   },
+   "mark_price_at_receipt": {
+    "KAIAUSDT": 0.05903
+   }
+  },
+  {
+   "frame": {
+    "topic": "allLiquidation.MAGICUSDT",
+    "type": "snapshot",
+    "ts": 1791594647052,
+    "data": [
+     {
+      "T": 1791594646632,
+      "s": "MAGICUSDT",
+      "S": "Buy",
+      "v": "380",
+      "p": "0.11974"
+     }
+    ]
+   },
+   "mark_price_at_receipt": {
+    "MAGICUSDT": 0.12188
+   }
+  },
+  {
+   "frame": {
+    "topic": "allLiquidation.MAGICUSDT",
+    "type": "snapshot",
+    "ts": 1791594661051,
+    "data": [
+     {
+      "T": 1791594660859,
+      "s": "MAGICUSDT",
+      "S": "Buy",
+      "v": "4762",
+      "p": "0.11905"
+     }
+    ]
+   },
+   "mark_price_at_receipt": {
+    "MAGICUSDT": 0.12125
+   }
+  },
+  {
+   "frame": {
+    "topic": "allLiquidation.GMTUSDT",
+    "type": "snapshot",
+    "ts": 1791594723051,
+    "data": [
+     {
+      "T": 1791594723041,
+      "s": "GMTUSDT",
+      "S": "Buy",
+      "v": "2432",
+      "p": "0.009432"
+     }
+    ]
+   },
+   "mark_price_at_receipt": {
+    "GMTUSDT": 0.009528
+   }
+  },
+  {
+   "frame": {
+    "topic": "allLiquidation.MAGICUSDT",
+    "type": "snapshot",
+    "ts": 1791594739551,
+    "data": [
+     {
+      "T": 1791594739420,
+      "s": "MAGICUSDT",
+      "S": "Buy",
+      "v": "18312",
+      "p": "0.11808"
+     }
+    ]
+   },
+   "mark_price_at_receipt": {
+    "MAGICUSDT": 0.11916
+   }
+  },
+  {
+   "frame": {
+    "topic": "allLiquidation.MAGICUSDT",
+    "type": "snapshot",
+    "ts": 1791594740051,
+    "data": [
+     {
+      "T": 1791594739755,
+      "s": "MAGICUSDT",
+      "S": "Buy",
+      "v": "43",
+      "p": "0.11793"
+     },
+     {
+      "T": 1791594739797,
+      "s": "MAGICUSDT",
+      "S": "Buy",
+      "v": "5574",
+      "p": "0.11773"
+     }
+    ]
+   },
+   "mark_price_at_receipt": {
+    "MAGICUSDT": 0.11916
+   }
+  },
+  {
+   "frame": {
+    "topic": "allLiquidation.MAGICUSDT",
+    "type": "snapshot",
+    "ts": 1791594740551,
+    "data": [
+     {
+      "T": 1791594740140,
+      "s": "MAGICUSDT",
+      "S": "Buy",
+      "v": "3700",
+      "p": "0.11859"
+     },
+     {
+      "T": 1791594740163,
+      "s": "MAGICUSDT",
+      "S": "Buy",
+      "v": "11882",
+      "p": "0.11805"
+     },
+     {
+      "T": 1791594740315,
+      "s": "MAGICUSDT",
+      "S": "Buy",
+      "v": "3154",
+      "p": "0.11873"
+     },
+     {
+      "T": 1791594740321,
+      "s": "MAGICUSDT",
+      "S": "Buy",
+      "v": "41",
+      "p": "0.11854"
+     }
+    ]
+   },
+   "mark_price_at_receipt": {
+    "MAGICUSDT": 0.11913
+   }
+  },
+  {
+   "frame": {
+    "topic": "allLiquidation.WUSDT",
+    "type": "snapshot",
+    "ts": 1791594747903,
+    "data": [
+     {
+      "T": 1791594747565,
+      "s": "WUSDT",
+      "S": "Sell",
+      "v": "11510.9",
+      "p": "0.017995"
+     }
+    ]
+   },
+   "mark_price_at_receipt": {
+    "WUSDT": 0.017735
+   }
+  },
+  {
+   "frame": {
+    "topic": "allLiquidation.ADAUSDT",
+    "type": "snapshot",
+    "ts": 1791594765830,
+    "data": [
+     {
+      "T": 1791594765634,
+      "s": "ADAUSDT",
+      "S": "Sell",
+      "v": "221",
+      "p": "0.2484"
+     },
+     {
+      "T": 1791594765769,
+      "s": "ADAUSDT",
+      "S": "Sell",
+      "v": "401",
+      "p": "0.2484"
+     }
+    ]
+   },
+   "mark_price_at_receipt": {
+    "ADAUSDT": 0.2466
+   }
+  },
+  {
+   "frame": {
+    "topic": "allLiquidation.NEARUSDT",
+    "type": "snapshot",
+    "ts": 1791594779432,
+    "data": [
+     {
+      "T": 1791594779381,
+      "s": "NEARUSDT",
+      "S": "Sell",
+      "v": "6.1",
+      "p": "4.9930"
+     }
+    ]
+   },
+   "mark_price_at_receipt": {
+    "NEARUSDT": 4.96
+   }
+  },
+  {
+   "frame": {
+    "topic": "allLiquidation.ATOMUSDT",
+    "type": "snapshot",
+    "ts": 1791594821432,
+    "data": [
+     {
+      "T": 1791594821185,
+      "s": "ATOMUSDT",
+      "S": "Sell",
+      "v": "2477.7",
+      "p": "2.0200"
+     }
+    ]
+   },
+   "mark_price_at_receipt": {
+    "ATOMUSDT": 2.0073
+   }
+  },
+  {
+   "frame": {
+    "topic": "allLiquidation.STRKUSDT",
+    "type": "snapshot",
+    "ts": 1791594822052,
+    "data": [
+     {
+      "T": 1791594821968,
+      "s": "STRKUSDT",
+      "S": "Buy",
+      "v": "1525.5",
+      "p": "0.07216"
+     }
+    ]
+   },
+   "mark_price_at_receipt": {
+    "STRKUSDT": 0.07324
+   }
+  },
+  {
+   "frame": {
+    "topic": "allLiquidation.ATOMUSDT",
+    "type": "snapshot",
+    "ts": 1791594843433,
+    "data": [
+     {
+      "T": 1791594843283,
+      "s": "ATOMUSDT",
+      "S": "Sell",
+      "v": "247.7",
+      "p": "2.0230"
+     }
+    ]
+   },
+   "mark_price_at_receipt": {
+    "ATOMUSDT": 2.009
+   }
+  },
+  {
+   "frame": {
+    "topic": "allLiquidation.JCTUSDT",
+    "type": "snapshot",
+    "ts": 1791594924745,
+    "data": [
+     {
+      "T": 1791594924478,
+      "s": "JCTUSDT",
+      "S": "Sell",
+      "v": "564400",
+      "p": "0.0028010"
+     }
+    ]
+   },
+   "mark_price_at_receipt": {
+    "JCTUSDT": 0.0027326
+   }
+  },
+  {
+   "frame": {
+    "topic": "allLiquidation.ATOMUSDT",
+    "type": "snapshot",
+    "ts": 1791594928932,
+    "data": [
+     {
+      "T": 1791594928598,
+      "s": "ATOMUSDT",
+      "S": "Sell",
+      "v": "494.3",
+      "p": "2.0230"
+     }
+    ]
+   },
+   "mark_price_at_receipt": {
+    "ATOMUSDT": 2.01
+   }
+  },
+  {
+   "frame": {
+    "topic": "allLiquidation.METUSDT",
+    "type": "snapshot",
+    "ts": 1791595006230,
+    "data": [
+     {
+      "T": 1791595005932,
+      "s": "METUSDT",
+      "S": "Sell",
+      "v": "45.7",
+      "p": "0.42320"
+     }
+    ]
+   },
+   "mark_price_at_receipt": {
+    "METUSDT": 0.41504
+   }
+  },
+  {
+   "frame": {
+    "topic": "allLiquidation.OPUSDT",
+    "type": "snapshot",
+    "ts": 1791595030408,
+    "data": [
+     {
+      "T": 1791595030290,
+      "s": "OPUSDT",
+      "S": "Buy",
+      "v": "93.1",
+      "p": "0.13459"
+     }
+    ]
+   },
+   "mark_price_at_receipt": {
+    "OPUSDT": 0.13595
+   }
+  },
+  {
+   "frame": {
+    "topic": "allLiquidation.ATOMUSDT",
+    "type": "snapshot",
+    "ts": 1791595090433,
+    "data": [
+     {
+      "T": 1791595090290,
+      "s": "ATOMUSDT",
+      "S": "Sell",
+      "v": "483.6",
+      "p": "2.0240"
+     }
+    ]
+   },
+   "mark_price_at_receipt": {
+    "ATOMUSDT": 2.01
+   }
+  },
+  {
+   "frame": {
+    "topic": "allLiquidation.STRKUSDT",
+    "type": "snapshot",
+    "ts": 1791595206552,
+    "data": [
+     {
+      "T": 1791595206435,
+      "s": "STRKUSDT",
+      "S": "Sell",
+      "v": "1772.6",
+      "p": "0.07445"
+     }
+    ]
+   },
+   "mark_price_at_receipt": {
+    "STRKUSDT": 0.07337
+   }
+  },
+  {
+   "frame": {
+    "topic": "allLiquidation.JUPUSDT",
+    "type": "snapshot",
+    "ts": 1791595206824,
+    "data": [
+     {
+      "T": 1791595206435,
+      "s": "JUPUSDT",
+      "S": "Sell",
+      "v": "294",
+      "p": "0.38380"
+     }
+    ]
+   },
+   "mark_price_at_receipt": {
+    "JUPUSDT": 0.3801
+   }
+  },
+  {
+   "frame": {
+    "topic": "allLiquidation.RLCUSDT",
+    "type": "snapshot",
+    "ts": 1791595220912,
+    "data": [
+     {
+      "T": 1791595220439,
+      "s": "RLCUSDT",
+      "S": "Sell",
+      "v": "175.9",
+      "p": "1.1143"
+     }
+    ]
+   },
+   "mark_price_at_receipt": {
+    "RLCUSDT": 1.0873
+   }
+  },
+  {
+   "frame": {
+    "topic": "allLiquidation.RLCUSDT",
+    "type": "snapshot",
+    "ts": 1791595221412,
+    "data": [
+     {
+      "T": 1791595221378,
+      "s": "RLCUSDT",
+      "S": "Sell",
+      "v": "93.0",
+      "p": "1.1178"
+     }
+    ]
+   },
+   "mark_price_at_receipt": {
+    "RLCUSDT": 1.093
+   }
+  },
+  {
+   "frame": {
+    "topic": "allLiquidation.RLCUSDT",
+    "type": "snapshot",
+    "ts": 1791595222413,
+    "data": [
+     {
+      "T": 1791595221969,
+      "s": "RLCUSDT",
+      "S": "Sell",
+      "v": "4596.2",
+      "p": "1.1173"
+     }
+    ]
+   },
+   "mark_price_at_receipt": {
+    "RLCUSDT": 1.093
+   }
+  },
+  {
+   "frame": {
+    "topic": "allLiquidation.RLCUSDT",
+    "type": "snapshot",
+    "ts": 1791595222913,
+    "data": [
+     {
+      "T": 1791595222574,
+      "s": "RLCUSDT",
+      "S": "Sell",
+      "v": "126.0",
+      "p": "1.1238"
+     }
+    ]
+   },
+   "mark_price_at_receipt": {
+    "RLCUSDT": 1.0971
+   }
+  },
+  {
+   "frame": {
+    "topic": "allLiquidation.RLCUSDT",
+    "type": "snapshot",
+    "ts": 1791595230413,
+    "data": [
+     {
+      "T": 1791595229967,
+      "s": "RLCUSDT",
+      "S": "Sell",
+      "v": "75.2",
+      "p": "1.1254"
+     }
+    ]
+   },
+   "mark_price_at_receipt": {
+    "RLCUSDT": 1.099
+   }
+  },
+  {
+   "frame": {
+    "topic": "allLiquidation.KAIAUSDT",
+    "type": "snapshot",
+    "ts": 1791595247742,
+    "data": [
+     {
+      "T": 1791595247521,
+      "s": "KAIAUSDT",
+      "S": "Sell",
+      "v": "650",
+      "p": "0.06077"
+     }
+    ]
+   },
+   "mark_price_at_receipt": {
+    "KAIAUSDT": 0.05984
+   }
+  },
+  {
+   "frame": {
+    "topic": "allLiquidation.RLCUSDT",
+    "type": "snapshot",
+    "ts": 1791595255912,
+    "data": [
+     {
+      "T": 1791595255561,
+      "s": "RLCUSDT",
+      "S": "Sell",
+      "v": "5430.4",
+      "p": "1.1288"
+     }
+    ]
+   },
+   "mark_price_at_receipt": {
+    "RLCUSDT": 1.1017
+   }
+  },
+  {
+   "frame": {
+    "topic": "allLiquidation.NEARUSDT",
+    "type": "snapshot",
+    "ts": 1791595255932,
+    "data": [
+     {
+      "T": 1791595255561,
+      "s": "NEARUSDT",
+      "S": "Sell",
+      "v": "1449.1",
+      "p": "4.9850"
+     }
+    ]
+   },
+   "mark_price_at_receipt": {
+    "NEARUSDT": 4.9532
+   }
+  },
+  {
+   "frame": {
+    "topic": "allLiquidation.MAGICUSDT",
+    "type": "snapshot",
+    "ts": 1791595373051,
+    "data": [
+     {
+      "T": 1791595372938,
+      "s": "MAGICUSDT",
+      "S": "Sell",
+      "v": "396",
+      "p": "0.12572"
+     }
+    ]
+   },
+   "mark_price_at_receipt": {
+    "MAGICUSDT": 0.12346
+   }
+  },
+  {
+   "frame": {
+    "topic": "allLiquidation.RLCUSDT",
+    "type": "snapshot",
+    "ts": 1791595412913,
+    "data": [
+     {
+      "T": 1791595412770,
+      "s": "RLCUSDT",
+      "S": "Sell",
+      "v": "3021.6",
+      "p": "1.1389"
+     }
+    ]
+   },
+   "mark_price_at_receipt": {
+    "RLCUSDT": 1.1113
+   }
+  },
+  {
+   "frame": {
+    "topic": "allLiquidation.RLCUSDT",
+    "type": "snapshot",
+    "ts": 1791595443412,
+    "data": [
+     {
+      "T": 1791595442961,
+      "s": "RLCUSDT",
+      "S": "Sell",
+      "v": "8.3",
+      "p": "1.1399"
+     }
+    ]
+   },
+   "mark_price_at_receipt": {
+    "RLCUSDT": 1.1123
+   }
+  },
+  {
+   "frame": {
+    "topic": "allLiquidation.RLCUSDT",
+    "type": "snapshot",
+    "ts": 1791595449413,
+    "data": [
+     {
+      "T": 1791595449261,
+      "s": "RLCUSDT",
+      "S": "Sell",
+      "v": "7.0",
+      "p": "1.1416"
+     }
+    ]
+   },
+   "mark_price_at_receipt": {
+    "RLCUSDT": 1.1159
+   }
+  },
+  {
+   "frame": {
+    "topic": "allLiquidation.RLCUSDT",
+    "type": "snapshot",
+    "ts": 1791595451912,
+    "data": [
+     {
+      "T": 1791595451676,
+      "s": "RLCUSDT",
+      "S": "Sell",
+      "v": "1092.1",
+      "p": "1.1451"
+     }
+    ]
+   },
+   "mark_price_at_receipt": {
+    "RLCUSDT": 1.1182
+   }
+  },
+  {
+   "frame": {
+    "topic": "allLiquidation.RLCUSDT",
+    "type": "snapshot",
+    "ts": 1791595453413,
+    "data": [
+     {
+      "T": 1791595453194,
+      "s": "RLCUSDT",
+      "S": "Sell",
+      "v": "1813.2",
+      "p": "1.1465"
+     }
+    ]
+   },
+   "mark_price_at_receipt": {
+    "RLCUSDT": 1.1185
+   }
+  },
+  {
+   "frame": {
+    "topic": "allLiquidation.RLCUSDT",
+    "type": "snapshot",
+    "ts": 1791595455913,
+    "data": [
+     {
+      "T": 1791595455900,
+      "s": "RLCUSDT",
+      "S": "Sell",
+      "v": "287.1",
+      "p": "1.1485"
+     }
+    ]
+   },
+   "mark_price_at_receipt": {
+    "RLCUSDT": 1.1232
+   }
+  },
+  {
+   "frame": {
+    "topic": "allLiquidation.RLCUSDT",
+    "type": "snapshot",
+    "ts": 1791595456912,
+    "data": [
+     {
+      "T": 1791595456645,
+      "s": "RLCUSDT",
+      "S": "Sell",
+      "v": "850.0",
+      "p": "1.1549"
+     }
+    ]
+   },
+   "mark_price_at_receipt": {
+    "RLCUSDT": 1.127
+   }
+  }
+ ]
+}
