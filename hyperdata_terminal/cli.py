@@ -87,6 +87,17 @@ def _positive(kind: type) -> Callable[[str], float]:
     return parse
 
 
+def _non_negative(text: str) -> float:
+    """argparse type: a finite number, zero or more."""
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {text!r}") from None
+    if not (math.isfinite(value) and value >= 0):
+        raise argparse.ArgumentTypeError(f"must be a finite number, zero or more, got {text}")
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     from hyperdata_terminal.paths import DATA_DIR
 
@@ -132,6 +143,10 @@ def build_parser() -> argparse.ArgumentParser:
     paper.add_argument("--balance", type=_positive(float), default=10_000.0, help="starting paper balance in USD")
     paper.add_argument("--reverse", action="store_true", help="an opposite signal closes AND reverses")
     paper.add_argument("--minutes", type=_positive(float), default=None, help="stop after this many minutes")
+    paper.add_argument("--fee-bps", type=_non_negative, default=None,
+                       help="taker fee per fill in basis points (default 4.5, Hyperliquid's base rate)")
+    paper.add_argument("--slippage-bps", type=_non_negative, default=None,
+                       help="slippage per fill in basis points against you (default 2)")
 
     verify = sub.add_parser("verify", help="one-shot data integrity report (exit 1 on failure)")
     verify.add_argument("--wait", type=int, default=15, help="seconds to collect before checking")
@@ -196,9 +211,14 @@ async def _run_paper(args: argparse.Namespace) -> int:
     console.print("[bright_cyan]Connecting to exchanges... strategies run every "
                   f"{args.interval}s once data arrives. Ctrl+C prints the portfolio and exits.[/]")
     await hub.start()
+    costs = {}
+    if getattr(args, "fee_bps", None) is not None:
+        costs["fee_bps"] = args.fee_bps
+    if getattr(args, "slippage_bps", None) is not None:
+        costs["slippage_bps"] = args.slippage_bps
     trader = PaperTrader(
         hub, strategies, check_interval=args.interval,
-        starting_balance=args.balance, reverse_on_opposite_signal=args.reverse,
+        starting_balance=args.balance, reverse_on_opposite_signal=args.reverse, **costs,
     )
     await trader.start()
     try:
@@ -209,8 +229,10 @@ async def _run_paper(args: argparse.Namespace) -> int:
     except asyncio.CancelledError:
         pass
     finally:
-        portfolio = trader.get_portfolio()
+        # stop() closes every open position at the current price (logged as
+        # "session end"), so the summary below is the final, flat result.
         await trader.stop()
+        portfolio = trader.get_portfolio()
         await hub.stop()
 
         table = Table(title="Paper portfolio", show_header=False)
@@ -218,7 +240,9 @@ async def _run_paper(args: argparse.Namespace) -> int:
         table.add_row("Open positions", str(len(portfolio["positions"])))
         table.add_row("Total value", f"${portfolio['total_value']:,.2f}")
         table.add_row("Total PnL", f"${portfolio['total_pnl']:+,.2f} ({portfolio['total_pnl_pct']:+.2f}%)")
+        table.add_row("Fees paid", f"${portfolio['fees_paid']:,.2f}")
         table.add_row("Trades this run", str(len(trader.trades)))
+        table.add_row("Fill model", portfolio["fill_model"])
         table.add_row("Trade log", str(trader.db_path))
         console.print(table)
     return 0

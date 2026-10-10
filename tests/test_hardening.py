@@ -446,6 +446,10 @@ def _trader_with_db(price=100.0, balance=10_000.0, **kw) -> PaperTrader:
     from hyperdata_terminal.strategies.paper_trader import CREATE_TABLE_SQL
     hub = MagicMock()
     hub.market.assets = {"BTC": SimpleNamespace(price=price)}
+    # Frictionless fills so the arithmetic below stays exact; fees and
+    # slippage are covered in tests/test_paper_trader.py.
+    kw.setdefault("fee_bps", 0.0)
+    kw.setdefault("slippage_bps", 0.0)
     trader = PaperTrader(hub, [], starting_balance=balance, **kw)
     trader._db = sqlite3.connect(":memory:")
     trader._db.execute(CREATE_TABLE_SQL)
@@ -463,7 +467,7 @@ class TestPaperTraderAccounting:
         # Second same-direction BUY exceeds the remaining balance -> rejected.
         trader._execute_trade("t", Signal("BTC", "BUY", size_usd=6_000.0))
         assert trader.balance == 4_000.0
-        assert trader.positions["BTC"]["size_usd"] == 6_000.0
+        assert trader.positions[("t", "BTC")]["size_usd"] == 6_000.0
         assert trader.balance >= 0
 
     def test_repeated_buys_never_go_negative(self):
@@ -471,16 +475,18 @@ class TestPaperTraderAccounting:
         for _ in range(50):
             trader._execute_trade("t", Signal("BTC", "BUY", size_usd=400.0))
             assert trader.balance >= 0
-        assert trader.positions["BTC"]["size_usd"] == 800.0
+        assert trader.positions[("t", "BTC")]["size_usd"] == 800.0
 
     def test_weighted_average_entry_price(self):
         trader = self._trader(price=100.0)
         trader._execute_trade("t", Signal("BTC", "BUY", size_usd=1_000.0))
         trader.hub.market.assets["BTC"].price = 200.0
         trader._execute_trade("t", Signal("BTC", "BUY", size_usd=1_000.0))
-        pos = trader.positions["BTC"]
-        # (100*1000 + 200*1000) / 2000 = 150
-        assert abs(pos["entry_price"] - 150.0) < 1e-9
+        pos = trader.positions[("t", "BTC")]
+        # Notional over coins: 2000 / (10 + 5) = 133.33. The old
+        # dollar-weighted (100*1000 + 200*1000) / 2000 = 150 was wrong for a
+        # position holding a fixed number of coins.
+        assert abs(pos["entry_price"] - 2_000.0 / 15.0) < 1e-9
         assert pos["size_usd"] == 2_000.0
 
     def test_close_realizes_pnl(self):
@@ -490,7 +496,7 @@ class TestPaperTraderAccounting:
         trader._execute_trade("t", Signal("BTC", "SELL", size_usd=500.0))
         # +10% on 500 = +50
         assert abs(trader.balance - 1_050.0) < 1e-9
-        assert "BTC" not in trader.positions
+        assert ("t", "BTC") not in trader.positions
 
     def test_invalid_signals_rejected(self):
         trader = self._trader()
@@ -702,15 +708,16 @@ class TestPaperTraderRound2:
     def _trader(self, price=100.0, balance=10_000.0) -> PaperTrader:
         return _trader_with_db(price=price, balance=balance)
 
-    def test_catastrophic_close_floors_at_zero(self):
-        """A short losing far more than the posted margin must not drive
-        the account balance negative."""
+    def test_catastrophic_close_is_not_floored(self):
+        """A short losing far more than the posted margin takes the balance
+        negative, as the trade log says; flooring it at zero hid the loss and
+        made total_pnl disagree with the log."""
         trader = self._trader(price=100.0, balance=1_000.0)
         trader._execute_trade("t", Signal("BTC", "SELL", size_usd=1_000.0))  # short
         trader.hub.market.assets["BTC"].price = 10_000.0  # +9900% against us
         trader._execute_trade("t", Signal("BTC", "BUY", size_usd=1_000.0))   # close
-        assert trader.balance == 0.0
-        assert "BTC" not in trader.positions
+        assert trader.balance == -98_000.0
+        assert ("t", "BTC") not in trader.positions
 
     def test_db_error_means_trade_not_executed(self):
         """Persist-first: a trade that cannot be logged must not mutate the

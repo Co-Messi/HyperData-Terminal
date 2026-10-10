@@ -164,7 +164,16 @@ class CvdBreakout(Strategy):
 hyperdata paper -s ./my_strategy.py -s funding_rate_arb --interval 30
 ```
 
-Helper modules next to your strategy file can be imported, at the top of the file. Trades print as they happen and are logged to SQLite; `Ctrl+C` prints the portfolio. Built in strategies: `cvd_momentum`, `funding_rate_arb`, `liquidation_cascade`, `whale_follow`, and `llm_agent`, which asks any OpenAI compatible model (OpenAI, Ollama, LM Studio, Groq, Together) for a decision. The full list of what `hub` exposes is in [`strategies/base.py`](hyperdata_terminal/strategies/base.py).
+Helper modules next to your strategy file can be imported, at the top of the file. Trades print as they happen and are logged to SQLite; `Ctrl+C` prints the portfolio.
+
+How fills work, so the paper result means something:
+
+- Every strategy has its own book. Two strategies on BTC never close each other's positions, and each trade is logged under the strategy that made it.
+- A buy fills at the Hyperliquid price plus 2 bps of slippage and a sell at it minus 2 bps, and every fill pays a 4.5 bps taker fee (Hyperliquid's base rate). Change them with `--slippage-bps` and `--fee-bps`.
+- Positions are 1x: the full size is posted from the balance. Adding to a position averages the entry by coins. A loss larger than what was posted takes the balance below zero; it is not hidden.
+- Funding is not paid or collected, so `funding_rate_arb` shows only its price moves. Nothing is ever liquidated.
+- An opposite signal closes the position; `--reverse` also opens the other side.
+- Each run starts flat, and positions still open at exit are closed at the current price (logged as `session end`), so the trade log always adds up. Built in strategies: `cvd_momentum`, `funding_rate_arb`, `liquidation_cascade`, `whale_follow`, and `llm_agent`, which asks any OpenAI compatible model (OpenAI, Ollama, LM Studio, Groq, Together) for a decision. The full list of what `hub` exposes is in [`strategies/base.py`](hyperdata_terminal/strategies/base.py).
 
 ## Data sources
 

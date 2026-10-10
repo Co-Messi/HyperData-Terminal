@@ -1007,6 +1007,8 @@ def _paper_trader(price=100.0, balance=10_000.0, with_db=True, **kw):
     from hyperdata_terminal.strategies.paper_trader import CREATE_TABLE_SQL, PaperTrader
     hub = MagicMock()
     hub.market.assets = {"BTC": SimpleNamespace(price=price)}
+    kw.setdefault("fee_bps", 0.0)
+    kw.setdefault("slippage_bps", 0.0)
     trader = PaperTrader(hub, [], starting_balance=balance, **kw)
     if with_db:
         trader._db = sqlite3.connect(":memory:")
@@ -1035,7 +1037,7 @@ class TestM2PersistFirst:
         from hyperdata_terminal.strategies.base import Signal
         trader = _paper_trader()
         trader._execute_trade("t", Signal("BTC", "BUY", size_usd=1_000.0))
-        assert trader.positions["BTC"]["size_usd"] == 1_000.0
+        assert trader.positions[("t", "BTC")]["size_usd"] == 1_000.0
         assert trader._db.execute("SELECT COUNT(*) FROM paper_trades").fetchone()[0] == 1
 
 
@@ -1048,7 +1050,7 @@ class TestM3ReverseSemantics:
         trader._execute_trade("t", Signal("BTC", "BUY", size_usd=500.0))
         with caplog.at_level("WARNING"):
             trader._execute_trade("t", Signal("BTC", "SELL", size_usd=500.0))
-        assert "BTC" not in trader.positions
+        assert ("t", "BTC") not in trader.positions
         assert "closing only" in caplog.text
         assert len(trader.trades) == 1 + 1
 
@@ -1060,7 +1062,7 @@ class TestM3ReverseSemantics:
         trader._execute_trade("t", Signal("BTC", "BUY", size_usd=500.0))
         trader.hub.market.assets["BTC"].price = 110.0
         trader._execute_trade("t", Signal("BTC", "SELL", size_usd=500.0))
-        pos = trader.positions["BTC"]
+        pos = trader.positions[("t", "BTC")]
         assert pos["side"] == "short"
         assert pos["size_usd"] == 500.0
         assert pos["entry_price"] == 110.0
@@ -1077,7 +1079,7 @@ class TestM3ReverseSemantics:
         trader._execute_trade("t", Signal("BTC", "BUY", size_usd=500.0))
         trader.hub.market.assets["BTC"].price = 10.0     # -90%: close credits 50
         trader._execute_trade("t", Signal("BTC", "SELL", size_usd=500.0))
-        assert "BTC" not in trader.positions
+        assert ("t", "BTC") not in trader.positions
         assert trader.balance == pytest.approx(50.0)
 
     @pytest.mark.asyncio
@@ -1277,7 +1279,7 @@ class TestM9MarkupSafety:
         trader.hub.market.assets = {UNBALANCED: SimpleNamespace(price=100.0)}
         trader._execute_trade("[bold]strat", Signal(UNBALANCED, "BUY", size_usd=10.0,
                                                     reason=f"{STYLED} because [oops"))
-        assert UNBALANCED in trader.positions
+        assert ("[bold]strat", UNBALANCED) in trader.positions
         out = recorder.export_text()
         assert "[bold red]PUMP[/] because [oops" in out
         assert "[bold]strat" in out
